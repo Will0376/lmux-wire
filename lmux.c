@@ -343,7 +343,7 @@ static void on_signal(int sig)
 static void usage(FILE *f)
 {
     fprintf(f,
-        "lmux %s\n"
+        "lmux %s (%s)\n"
         "Usage:\n"
         "  lmux connect SOCKET\n"
         "  lmux term [-v|--verbose] [--remote-dir DIR] [--channel 1|2] [1|2|SOCKET]\n"
@@ -372,7 +372,7 @@ static void usage(FILE *f)
         "  Ctrl-T Ctrl-T   send literal Ctrl-T\n"
         "  Ctrl-T p        upload file   HOST -> TARGET\n"
         "  Ctrl-T g        download file TARGET -> HOST\n",
-        LMUX_BUILD_VERSION);
+        LMUX_BUILD_VERSION, LMUX_PROJECT_NAME);
 }
 
 static int connect_unix_mode(const char *path, int quiet)
@@ -1343,7 +1343,7 @@ int main(int argc, char **argv)
     init_host_cwd();
 
     if (argc >= 2 && strcmp(argv[1], "--version") == 0) {
-        printf("lmux %s\n", LMUX_BUILD_VERSION);
+        printf("lmux %s (%s)\n", LMUX_BUILD_VERSION, LMUX_PROJECT_NAME);
         return 0;
     }
     if (argc < 2 || strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {

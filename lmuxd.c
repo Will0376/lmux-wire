@@ -1471,11 +1471,11 @@ static int parse_ch_path(const char *s, int *idx, char *path, size_t path_cap)
 static void usage(FILE *f)
 {
     fprintf(f,
-        "lmuxd %s\n"
+        "lmuxd %s (%s)\n"
         "Usage: lmuxd --carrier PATH [--pty N:SYMLINK] [--shell N:SYMLINK] [--socket N:PATH] [--file N] [--verbose]\n"
         "       lmuxd --help\n"
         "       lmuxd --version\n",
-        LMUX_BUILD_VERSION);
+        LMUX_BUILD_VERSION, LMUX_PROJECT_NAME);
 }
 
 static int parse_args(struct app *a, int argc, char **argv)
@@ -1526,7 +1526,7 @@ static int parse_args(struct app *a, int argc, char **argv)
             usage(stdout);
             exit(0);
         } else if (strcmp(argv[i], "--version") == 0) {
-            printf("lmuxd %s\n", LMUX_BUILD_VERSION);
+            printf("lmuxd %s (%s)\n", LMUX_BUILD_VERSION, LMUX_PROJECT_NAME);
             exit(0);
         } else {
             return -1;
@@ -1585,7 +1585,7 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
     global_app = &a;
     make_session(&a);
-    fprintf(stderr, "lmuxd %s\n", LMUX_BUILD_VERSION);
+    fprintf(stderr, "lmuxd %s (%s)\n", LMUX_BUILD_VERSION, LMUX_PROJECT_NAME);
 
     for (i = 0; i < LMUX_CHANNELS; i++) {
         if (a.ch[i].ep.type == EP_PTY || a.ch[i].ep.type == EP_SHELL) {

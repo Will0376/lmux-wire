@@ -1,6 +1,8 @@
-# lmux
+# LMUX Wire
 
-`lmux` is a small userspace multiplexer over one bidirectional tty carrier. The same `lmuxd` binary runs on host and target, uses one `poll()` event loop, and keeps the LMUX/1 wire protocol as numbered reliable byte streams.
+LMUX Wire is a lightweight userspace multiplexer for carrying multiple logical byte streams over one serial-like transport. The CLI client is `lmux`, the foreground daemon is `lmuxd`, the transport protocol is LMUX/1, and the channel-4 file-transfer protocol is LXF/1.
+
+Current features include supervised interactive PTY consoles, raw stream channels for uses such as GDB, built-in file transfer with HOST/TARGET path semantics, Ctrl-T terminal controls, TARGET shell cwd awareness, and transfer progress reporting.
 
 ## Channel Layout
 
@@ -185,6 +187,8 @@ lmuxd --version
 ```
 
 Version strings use `BASE+build.N`, for example `0.1.0+build.37`. `BASE` comes from `VERSION`; `N` is a persistent monotonic build number shared by `lmux`, `lmuxd`, and the host/target binaries from the same build cycle.
+
+Human-facing version output includes the project name, for example `lmux 0.1.0+build.37 (LMUX Wire)`.
 
 ## Reconnect And Reset
 

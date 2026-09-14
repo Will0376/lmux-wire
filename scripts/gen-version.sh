@@ -42,6 +42,7 @@ cat >build/generated/version.h.tmp <<EOF
 #define LMUX_BUILD_VERSION "$version"
 #define LMUX_BUILD_BASE_VERSION "$base"
 #define LMUX_BUILD_NUMBER $new
+#define LMUX_PROJECT_NAME "LMUX Wire"
 
 #endif
 EOF
