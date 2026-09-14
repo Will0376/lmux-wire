@@ -1,0 +1,5 @@
+# Build output
+/build/
+
+# Local monotonically increasing build counter
+/.build-number
