@@ -1322,7 +1322,7 @@ static int cmd_exec(int argc, char **argv)
         usage(stderr);
         return 1;
     }
-    fd = connect_unix(argv[1]);
+    fd = connect_unix(argv[0]);
     if (fd < 0)
         return 1;
     if (dup2(fd, STDIN_FILENO) < 0 || dup2(fd, STDOUT_FILENO) < 0) {
