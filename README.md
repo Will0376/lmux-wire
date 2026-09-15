@@ -17,6 +17,7 @@ LMUX/1 still uses COBS framing, CRC-16/CCITT-FALSE, HELLO/OPEN/CLOSE/DATA/CREDIT
 
 - `lmuxd`: foreground daemon owning the physical carrier.
 - `lmux term [-v|--verbose] [--remote-dir DIR] [--channel 1|2] [1|2|SOCKET]`: raw terminal client with local Ctrl-T prefix controls. With no argument it uses `/run/lmux/console1.sock`; `1` and `2` select the default console sockets.
+- `lmux status [--control SOCKET]`: query the local host daemon status/control socket.
 - `lmux connect SOCKET`: binary-clean stdin/stdout socket bridge.
 - `lmux exec SOCKET -- PROGRAM [ARGS...]`: dup2s a socket to child stdin/stdout and execs directly.
 - `lmux put [OPTIONS] HOST_SRC [TARGET_DST]`: upload, HOST -> TARGET.
@@ -57,6 +58,7 @@ No separate getty or console scripts are needed for normal deployment. `--pty` r
 mkdir -p /run/lmux
 /mnt/linfiles/SourceCode/lmux/build/host/lmuxd \
   --carrier /dev/ttyACM0 \
+  --control /run/lmux/control.sock \
   --socket 1:/run/lmux/console1.sock \
   --socket 2:/run/lmux/console2.sock \
   --socket 3:/run/lmux/gdb.sock \
@@ -89,6 +91,29 @@ lmux term --channel 2 /custom/console.sock
 
 Ctrl-T PUT/GET display the HOST current working directory and the TARGET base directory. The TARGET base comes from `--remote-dir DIR`, then absolute `LMUX_REMOTE_DIR`, then the supervised TARGET shell cwd queried through channel 4, then `/root`.
 
+`lmux term` sends the initial terminal size and later SIGWINCH changes as LMUX channel metadata. The target daemon applies those sizes to the supervised PTY with `TIOCSWINSZ`; resize metadata is not injected into the shell byte stream.
+
+## Status
+
+Host `lmuxd` can expose a local-only control socket, normally `/run/lmux/control.sock` when started by `start-host.sh`.
+
+```sh
+lmux status
+```
+
+Example output:
+
+```text
+LMUX Wire
+local:  0.1.0+build.N
+peer:   0.1.0+build.M
+wire:   LMUX/1
+link:   established
+features: FILE CWD WINSIZE STREAM_GEN
+peer-features: FILE CWD WINSIZE STREAM_GEN
+ch1 socket active local=open peer=open tx=0 rx=0 session=1 peer_session=1
+```
+
 ## GDB
 
 Target:
@@ -103,7 +128,30 @@ Host GDB:
 target remote /run/lmux/gdb.sock
 ```
 
-Channel 3 remains a generic raw stream; there is no GDB-specific daemon logic.
+Real-world attach example:
+
+```sh
+# TARGET
+PID=$(pidof phoenix)
+lmux exec /tmp/lmux-gdb.sock -- gdbserver --attach stdio "$PID"
+
+# HOST
+gdb-multiarch phoenix
+```
+
+Inside GDB:
+
+```text
+target remote /run/lmux/gdb.sock
+info threads
+info registers
+continue
+detach
+```
+
+Channel 3 remains a generic raw stream; there is no GDB-specific daemon logic. GDB's raw all-stop interrupt byte, `0x03`, is transported as ordinary channel data, so Ctrl-C should stop the inferior while it is running.
+
+Generic Unix socket channels are rendezvous streams. Either side may connect first and wait for the peer application later. Each accepted application stream has its own session generation so a stale CLOSE from an older stream cannot terminate a newly accepted client; configured listeners remain alive for repeated sessions.
 
 ## File Transfer
 

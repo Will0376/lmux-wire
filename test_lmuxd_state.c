@@ -21,11 +21,16 @@ static void init_app(struct app *a)
     int i;
     memset(a, 0, sizeof(*a));
     a->carrier_fd = 0;
+    a->control_listen_fd = -1;
+    a->control_fd = -1;
     a->local_session = 0x11111111u;
+    a->local_features = LMUX_FEATURE_FILE | LMUX_FEATURE_CWD_QUERY |
+                        LMUX_FEATURE_WINSIZE | LMUX_FEATURE_STREAM_GEN;
     a->link_state = LINK_WAIT_HELLO;
     for (i = 0; i < LMUX_CHANNELS; i++) {
         a->ch[i].ep.fd = -1;
         a->ch[i].ep.listen_fd = -1;
+        a->ch[i].file.fd = -1;
     }
 }
 
@@ -43,6 +48,18 @@ static void make_hello(struct lmux_frame *fr, uint32_t sid)
     fr->payload_len = 8;
     memcpy(fr->payload, "LMX1", 4);
     lmux_put_le32(fr->payload + 4, sid);
+}
+
+static void make_hello_features(struct lmux_frame *fr, uint32_t sid, uint32_t features)
+{
+    const char v[] = "test-peer";
+    make_frame(fr, LMUX_T_HELLO, 0);
+    fr->payload_len = 13 + sizeof(v) - 1;
+    memcpy(fr->payload, "LMX1", 4);
+    lmux_put_le32(fr->payload + 4, sid);
+    lmux_put_le32(fr->payload + 8, features);
+    fr->payload[12] = sizeof(v) - 1;
+    memcpy(fr->payload + 13, v, sizeof(v) - 1);
 }
 
 static int feed_encoded(struct app *a, const struct lmux_frame *fr)
@@ -67,6 +84,83 @@ static int pop_output_frame(struct app *a, struct lmux_frame *fr)
     a->out_len = 0;
     a->out_pos = 0;
     return 0;
+}
+
+static int pump_one_frame(struct app *from, struct app *to, struct lmux_frame *out)
+{
+    struct lmux_frame fr;
+    if (!out)
+        out = &fr;
+    if (pop_output_frame(from, out) < 0)
+        return -1;
+    handle_frame(to, out);
+    return 0;
+}
+
+static int pump_until_frame(struct app *from, struct app *to, uint8_t type, uint8_t channel,
+                            struct lmux_frame *out)
+{
+    int i;
+    for (i = 0; i < 8; i++) {
+        if (pump_one_frame(from, to, out) < 0)
+            return -1;
+        if (out->type == type && out->channel == channel)
+            return 0;
+    }
+    return -1;
+}
+
+static int legacy_accepts_frame(const struct lmux_frame *fr)
+{
+    if (fr->version != LMUX_VERSION || fr->flags != 0)
+        return 0;
+    if (fr->type < LMUX_T_HELLO || fr->type > LMUX_T_RESET)
+        return 0;
+    if ((fr->type == LMUX_T_HELLO || fr->type == LMUX_T_RESET) && fr->channel != 0)
+        return 0;
+    if (fr->type != LMUX_T_HELLO && fr->type != LMUX_T_RESET &&
+        (fr->channel < 1 || fr->channel > LMUX_CHANNELS))
+        return 0;
+    if (fr->type == LMUX_T_HELLO &&
+        (fr->payload_len != 8 || memcmp(fr->payload, "LMX1", 4) != 0))
+        return 0;
+    if ((fr->type == LMUX_T_OPEN || fr->type == LMUX_T_CLOSE) && fr->payload_len != 0)
+        return 0;
+    return 1;
+}
+
+static void setup_established_pair(struct app *a, struct app *b)
+{
+    struct lmux_frame fr;
+    init_app(a);
+    init_app(b);
+    make_hello_features(&fr, 0xaaaabbbb,
+                        LMUX_FEATURE_FILE | LMUX_FEATURE_CWD_QUERY |
+                        LMUX_FEATURE_WINSIZE | LMUX_FEATURE_STREAM_GEN);
+    handle_frame(a, &fr);
+    make_hello_features(&fr, 0xbbbbcccc,
+                        LMUX_FEATURE_FILE | LMUX_FEATURE_CWD_QUERY |
+                        LMUX_FEATURE_WINSIZE | LMUX_FEATURE_STREAM_GEN);
+    handle_frame(b, &fr);
+    a->pending_hello = 0;
+    b->pending_hello = 0;
+    a->out_len = a->out_pos = 0;
+    b->out_len = b->out_pos = 0;
+}
+
+static void setup_legacy_established_pair(struct app *a, struct app *b)
+{
+    struct lmux_frame fr;
+    init_app(a);
+    init_app(b);
+    make_hello(&fr, 0xaaaabbbbu);
+    handle_frame(a, &fr);
+    make_hello(&fr, 0xbbbbccccu);
+    handle_frame(b, &fr);
+    a->pending_hello = 0;
+    b->pending_hello = 0;
+    a->out_len = a->out_pos = 0;
+    b->out_len = b->out_pos = 0;
 }
 
 static int test_garbage_before_hello(void)
@@ -282,6 +376,523 @@ static int test_simultaneous_startup_hello_response_no_loop(void)
         return fail("duplicate HELLO responses created loop/reset");
     if (build_next_output(&a) != 0 || build_next_output(&b) != 0)
         return fail("unexpected extra HELLO after duplicate responses");
+    return 0;
+}
+
+static void setup_socket_channel(struct app *a, int idx, int fd)
+{
+    a->ch[idx].ep.type = EP_SOCKET;
+    a->ch[idx].ep.fd = fd;
+    a->ch[idx].local_open = 1;
+    a->ch[idx].remote_open = 1;
+    a->ch[idx].local_generation++;
+    if (a->ch[idx].local_generation == 0)
+        a->ch[idx].local_generation = 1;
+    a->ch[idx].remote_generation = 1;
+    activate_channel(a, idx);
+    a->ch[idx].credit_pending = 0;
+    a->ch[idx].remote_credit = LMUX_RX_RING;
+}
+
+static int test_legacy_wire_compatibility(void)
+{
+    struct app a, old_side;
+    struct lmux_frame fr;
+
+    init_app(&a);
+    if (pop_output_frame(&a, &fr) < 0 || fr.type != LMUX_T_HELLO ||
+        fr.payload_len != 8 || !legacy_accepts_frame(&fr))
+        return fail("current initial HELLO is not legacy-compatible");
+
+    make_hello_features(&fr, 0x1234u, LMUX_FEATURE_STREAM_GEN);
+    if (legacy_accepts_frame(&fr))
+        return fail("legacy fixture accepted extended HELLO unexpectedly");
+    make_frame(&fr, LMUX_T_OPEN, 3);
+    fr.payload_len = 4;
+    lmux_put_le32(fr.payload, 7);
+    if (legacy_accepts_frame(&fr))
+        return fail("legacy fixture accepted extended OPEN unexpectedly");
+
+    init_app(&a);
+    make_hello(&fr, 0x4567u);
+    handle_frame(&a, &fr);
+    if (a.link_state != LINK_ESTABLISHED || a.pending_reset || !a.pending_hello)
+        return fail("current side did not establish with legacy HELLO");
+    if (pop_output_frame(&a, &fr) < 0 || fr.type != LMUX_T_HELLO ||
+        fr.payload_len != 8 || !legacy_accepts_frame(&fr))
+        return fail("HELLO response to legacy peer is not legacy-compatible");
+
+    setup_legacy_established_pair(&a, &old_side);
+    a.ch[2].ep.type = EP_SOCKET;
+    a.ch[2].local_open = 1;
+    a.ch[2].local_generation = 11;
+    a.ch[2].pending_open = 1;
+    if (pop_output_frame(&a, &fr) < 0 || fr.type != LMUX_T_OPEN ||
+        fr.payload_len != 0 || !legacy_accepts_frame(&fr))
+        return fail("current OPEN is not legacy-compatible");
+    a.ch[2].pending_close = 1;
+    a.ch[2].pending_close_generation = 11;
+    if (pop_output_frame(&a, &fr) < 0 || fr.type != LMUX_T_CLOSE ||
+        fr.payload_len != 0 || !legacy_accepts_frame(&fr))
+        return fail("current CLOSE is not legacy-compatible");
+    return 0;
+}
+
+static int test_pending_socket_ignores_peer_close(void)
+{
+    struct app a;
+    struct lmux_frame fr;
+    int sp[2];
+    uint32_t peer_session;
+    unsigned long long resets;
+
+    init_app(&a);
+    make_hello(&fr, 0x7777u);
+    handle_frame(&a, &fr);
+    peer_session = a.peer_session;
+    resets = a.resets;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) < 0)
+        return fail("pending socketpair");
+    set_nonblock(sp[0]); set_nonblock(sp[1]);
+    a.ch[2].ep.type = EP_SOCKET;
+    a.ch[2].ep.fd = sp[0];
+    a.ch[2].local_open = 1;
+    a.ch[2].local_generation = 1;
+    make_frame(&fr, LMUX_T_CLOSE, 3);
+    handle_frame(&a, &fr);
+    if (a.ch[2].ep.fd < 0 || !a.ch[2].local_open || a.ch[2].active)
+        return fail("peer CLOSE killed pending socket client");
+    if (a.resets != resets || a.peer_session != peer_session || a.pending_reset)
+        return fail("pending socket peer CLOSE changed link state");
+    close(sp[1]);
+    close_fd(&a.ch[2].ep.fd);
+    return 0;
+}
+
+static int send_app_bytes(struct app *from, struct app *to, int idx, int app_write_fd,
+                          int app_read_fd, const uint8_t *data, size_t len)
+{
+    struct lmux_frame fr;
+    uint8_t got[512];
+    ssize_t r;
+    if (write(app_write_fd, data, len) != (ssize_t)len)
+        return -1;
+    collect_tx(from, idx);
+    while (from->ch[idx].tx.len) {
+        if (pump_one_frame(from, to, &fr) < 0)
+            return -1;
+        if (fr.type == LMUX_T_CREDIT)
+            continue;
+        if (fr.type != LMUX_T_DATA)
+            return -1;
+        deliver_rx(to, idx);
+    }
+    r = read(app_read_fd, got, sizeof(got));
+    if (r != (ssize_t)len || memcmp(got, data, len) != 0)
+        return -1;
+    return 0;
+}
+
+static int test_socket_pending_and_binary_stream(void)
+{
+    struct app a, b;
+    int ap[2], bp[2];
+    uint8_t data1[] = { 0x03 };
+    uint8_t data2[] = { 0x00, 0x03, 0x14, 0xff, 0x41, 0x42 };
+    struct lmux_frame fr;
+
+    setup_established_pair(&a, &b);
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, ap) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, bp) < 0)
+        return fail("socketpair stream");
+    set_nonblock(ap[0]); set_nonblock(ap[1]);
+    set_nonblock(bp[0]); set_nonblock(bp[1]);
+
+    a.ch[2].ep.type = EP_SOCKET;
+    a.ch[2].ep.fd = ap[0];
+    a.ch[2].local_open = 1;
+    a.ch[2].local_generation = 1;
+    a.ch[2].pending_open = 1;
+    if (pump_one_frame(&a, &b, &fr) < 0 || fr.type != LMUX_T_OPEN)
+        return fail("target-first OPEN");
+    if (a.ch[2].ep.fd < 0 || a.ch[2].active || !b.ch[2].remote_open)
+        return fail("target-first pending did not wait");
+
+    b.ch[2].ep.type = EP_SOCKET;
+    b.ch[2].ep.fd = bp[0];
+    b.ch[2].local_open = 1;
+    b.ch[2].local_generation = 1;
+    b.ch[2].pending_open = 1;
+    update_channel_active(&b, 2);
+    if (pump_one_frame(&b, &a, &fr) < 0 || fr.type != LMUX_T_OPEN)
+        return fail("host-later OPEN");
+    if (!a.ch[2].active || !b.ch[2].active)
+        return fail("socket session did not activate");
+    a.ch[2].credit_pending = 0;
+    b.ch[2].credit_pending = 0;
+    a.ch[2].remote_credit = LMUX_RX_RING;
+    b.ch[2].remote_credit = LMUX_RX_RING;
+
+    if (send_app_bytes(&a, &b, 2, ap[1], bp[1], data1, sizeof(data1)) < 0)
+        return fail("raw 0x03 did not cross stream");
+    if (send_app_bytes(&b, &a, 2, bp[1], ap[1], data2, sizeof(data2)) < 0)
+        return fail("binary control bytes did not cross stream");
+
+    close(ap[1]); close(bp[1]);
+    close_fd(&a.ch[2].ep.fd);
+    close_fd(&b.ch[2].ep.fd);
+    return 0;
+}
+
+static int test_socket_host_first_pending(void)
+{
+    struct app a, b;
+    int ap[2], bp[2];
+    uint8_t data[] = { 'h', 'o', 's', 't', 0x03 };
+    struct lmux_frame fr;
+
+    setup_established_pair(&a, &b);
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, ap) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, bp) < 0)
+        return fail("socketpair host-first");
+    set_nonblock(ap[0]); set_nonblock(ap[1]);
+    set_nonblock(bp[0]); set_nonblock(bp[1]);
+
+    b.ch[2].ep.type = EP_SOCKET;
+    b.ch[2].ep.fd = bp[0];
+    b.ch[2].local_open = 1;
+    b.ch[2].local_generation = 1;
+    b.ch[2].pending_open = 1;
+    if (pump_one_frame(&b, &a, &fr) < 0 || fr.type != LMUX_T_OPEN)
+        return fail("host-first OPEN");
+    if (b.ch[2].ep.fd < 0 || b.ch[2].active || !a.ch[2].remote_open)
+        return fail("host-first pending did not wait");
+
+    a.ch[2].ep.type = EP_SOCKET;
+    a.ch[2].ep.fd = ap[0];
+    a.ch[2].local_open = 1;
+    a.ch[2].local_generation = 1;
+    a.ch[2].pending_open = 1;
+    update_channel_active(&a, 2);
+    if (pump_one_frame(&a, &b, &fr) < 0 || fr.type != LMUX_T_OPEN)
+        return fail("target-later OPEN");
+    if (!a.ch[2].active || !b.ch[2].active)
+        return fail("host-first session did not activate");
+    a.ch[2].credit_pending = 0;
+    b.ch[2].credit_pending = 0;
+    a.ch[2].remote_credit = LMUX_RX_RING;
+    b.ch[2].remote_credit = LMUX_RX_RING;
+    if (send_app_bytes(&b, &a, 2, bp[1], ap[1], data, sizeof(data)) < 0)
+        return fail("host-first binary data");
+    close(ap[1]); close(bp[1]);
+    close_fd(&a.ch[2].ep.fd);
+    close_fd(&b.ch[2].ep.fd);
+    return 0;
+}
+
+static int test_socket_stale_close_reconnect_and_isolation(void)
+{
+    struct app a, b;
+    struct lmux_frame fr;
+    int ap[2], bp[2], cp[2];
+
+    setup_established_pair(&a, &b);
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, ap) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, bp) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, cp) < 0)
+        return fail("socketpair stale close");
+    set_nonblock(ap[0]); set_nonblock(ap[1]);
+    set_nonblock(bp[0]); set_nonblock(bp[1]);
+    set_nonblock(cp[0]); set_nonblock(cp[1]);
+
+    setup_socket_channel(&a, 0, cp[0]);
+    setup_socket_channel(&b, 0, cp[1]);
+    setup_socket_channel(&a, 2, ap[0]);
+    setup_socket_channel(&b, 2, bp[0]);
+    a.ch[2].remote_generation = 2;
+    b.ch[2].remote_generation = 2;
+
+    make_frame(&fr, LMUX_T_CLOSE, 3);
+    fr.payload_len = 4;
+    lmux_put_le32(fr.payload, 1);
+    handle_frame(&a, &fr);
+    if (!a.ch[2].remote_open || a.ch[2].ep.fd < 0 || !a.ch[2].active)
+        return fail("stale CLOSE killed new session");
+    if (!a.ch[0].active || a.ch[0].ep.fd < 0)
+        return fail("channel teardown leaked to console channel");
+
+    lmux_put_le32(fr.payload, 2);
+    handle_frame(&a, &fr);
+    if (a.ch[2].remote_open || a.ch[2].ep.fd >= 0 || a.ch[2].active)
+        return fail("matching CLOSE did not end session");
+    if (!a.ch[0].active || a.ch[0].ep.fd < 0)
+        return fail("matching channel close isolated badly");
+
+    a.ch[2].ep.fd = ap[0];
+    a.ch[2].local_open = 1;
+    a.ch[2].local_generation = 3;
+    a.ch[2].pending_open = 1;
+    if (pump_one_frame(&a, &b, &fr) < 0 || fr.type != LMUX_T_OPEN)
+        return fail("immediate reconnect OPEN missing");
+    close(ap[1]); close(bp[1]);
+    close_fd(&a.ch[2].ep.fd);
+    close_fd(&b.ch[2].ep.fd);
+    close_fd(&a.ch[0].ep.fd);
+    close_fd(&b.ch[0].ep.fd);
+    return 0;
+}
+
+static int test_socket_sequential_sessions(void)
+{
+    struct app a, b;
+    struct lmux_frame fr;
+    int i;
+    setup_established_pair(&a, &b);
+    for (i = 0; i < 3; i++) {
+        int ap[2], bp[2];
+        uint8_t byte = (uint8_t)('a' + i);
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, ap) < 0 ||
+            socketpair(AF_UNIX, SOCK_STREAM, 0, bp) < 0)
+            return fail("sequential socketpair");
+        set_nonblock(ap[0]); set_nonblock(ap[1]);
+        set_nonblock(bp[0]); set_nonblock(bp[1]);
+        setup_socket_channel(&a, 2, ap[0]);
+        setup_socket_channel(&b, 2, bp[0]);
+        a.ch[2].pending_open = 1;
+        b.ch[2].pending_open = 1;
+        (void)pump_one_frame(&a, &b, &fr);
+        (void)pump_one_frame(&b, &a, &fr);
+        if (send_app_bytes(&a, &b, 2, ap[1], bp[1], &byte, 1) < 0)
+            return fail("sequential session data");
+        close_socket_client(&a, 2, 1);
+        if (pump_one_frame(&a, &b, &fr) < 0 || fr.type != LMUX_T_CLOSE)
+            return fail("sequential CLOSE");
+        close(ap[1]); close(bp[1]);
+        close_fd(&b.ch[2].ep.fd);
+    }
+    return 0;
+}
+
+static int test_socket_lifecycle_no_link_reset_100(void)
+{
+    struct app a, b;
+    struct lmux_frame fr;
+    uint32_t a_session, b_session;
+    unsigned long long a_resets, b_resets;
+    int i;
+
+    setup_legacy_established_pair(&a, &b);
+    a_session = a.peer_session;
+    b_session = b.peer_session;
+    a_resets = a.resets;
+    b_resets = b.resets;
+    for (i = 0; i < 100; i++) {
+        int ap[2], bp[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, ap) < 0 ||
+            socketpair(AF_UNIX, SOCK_STREAM, 0, bp) < 0)
+            return fail("100-cycle socketpair");
+        set_nonblock(ap[0]); set_nonblock(ap[1]);
+        set_nonblock(bp[0]); set_nonblock(bp[1]);
+
+        a.ch[2].ep.type = EP_SOCKET;
+        a.ch[2].ep.fd = ap[0];
+        a.ch[2].local_open = 1;
+        a.ch[2].local_generation++;
+        a.ch[2].pending_open = 1;
+        if (pump_one_frame(&a, &b, &fr) < 0 || fr.type != LMUX_T_OPEN)
+            return fail("100-cycle first OPEN");
+        if (a.ch[2].active || a.ch[2].local_paired)
+            return fail("100-cycle first side did not remain pending");
+
+        b.ch[2].ep.type = EP_SOCKET;
+        b.ch[2].ep.fd = bp[0];
+        b.ch[2].local_open = 1;
+        b.ch[2].local_generation++;
+        b.ch[2].pending_open = 1;
+        update_channel_active(&b, 2);
+        if (pump_one_frame(&b, &a, &fr) < 0 || fr.type != LMUX_T_OPEN)
+            return fail("100-cycle second OPEN");
+        if (!a.ch[2].active || !b.ch[2].active ||
+            !a.ch[2].local_paired || !b.ch[2].local_paired)
+            return fail("100-cycle session did not pair");
+
+        close_socket_client(&a, 2, 1);
+        if (pump_one_frame(&a, &b, &fr) < 0 || fr.type != LMUX_T_CLOSE)
+            return fail("100-cycle CLOSE");
+        if (a.resets != a_resets || b.resets != b_resets ||
+            a.peer_session != a_session || b.peer_session != b_session)
+            return fail("100-cycle app lifecycle changed link state");
+        close(ap[1]);
+        close(bp[1]);
+    }
+    return 0;
+}
+
+static int test_heterogeneous_lifecycle_no_reset(void)
+{
+    struct app host, target;
+    struct lmux_frame fr;
+    int sp[2], fp[2];
+    uint32_t host_session, target_session;
+    unsigned long long host_resets, target_resets;
+
+    setup_legacy_established_pair(&host, &target);
+    host_session = host.peer_session;
+    target_session = target.peer_session;
+    host_resets = host.resets;
+    target_resets = target.resets;
+
+    target.ch[0].ep.type = EP_SHELL;
+    target.ch[0].local_open = 1;
+    target.ch[0].pending_open = 1;
+    if (pump_one_frame(&target, &host, &fr) < 0 || fr.type != LMUX_T_OPEN)
+        return fail("shell endpoint OPEN");
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) < 0)
+        return fail("shell/socket socketpair");
+    set_nonblock(sp[0]); set_nonblock(sp[1]);
+    host.ch[0].ep.type = EP_SOCKET;
+    host.ch[0].ep.fd = sp[0];
+    host.ch[0].local_open = 1;
+    host.ch[0].local_generation = 1;
+    host.ch[0].pending_open = 1;
+    update_channel_active(&host, 0);
+    if (!host.ch[0].active)
+        return fail("first socket<->shell connection did not activate");
+    if (pump_one_frame(&host, &target, &fr) < 0 || fr.type != LMUX_T_OPEN)
+        return fail("socket endpoint OPEN to shell");
+    close_socket_client(&host, 0, 1);
+    if (pump_one_frame(&host, &target, &fr) < 0 || fr.type != LMUX_T_CLOSE)
+        return fail("socket<->shell CLOSE");
+    close(sp[1]);
+
+    target.ch[3].ep.type = EP_FILE;
+    target.ch[3].local_open = 1;
+    target.ch[3].pending_open = 1;
+    if (pump_until_frame(&target, &host, LMUX_T_OPEN, 4, &fr) < 0)
+        return fail("file endpoint OPEN");
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fp) < 0)
+        return fail("file/socket socketpair");
+    set_nonblock(fp[0]); set_nonblock(fp[1]);
+    host.ch[3].ep.type = EP_SOCKET;
+    host.ch[3].ep.fd = fp[0];
+    host.ch[3].local_open = 1;
+    host.ch[3].local_generation = 1;
+    host.ch[3].pending_open = 1;
+    update_channel_active(&host, 3);
+    if (!host.ch[3].active)
+        return fail("socket<->file connection did not activate");
+    if (pump_one_frame(&host, &target, &fr) < 0 || fr.type != LMUX_T_OPEN)
+        return fail("socket endpoint OPEN to file");
+    close_socket_client(&host, 3, 1);
+    if (pump_one_frame(&host, &target, &fr) < 0 || fr.type != LMUX_T_CLOSE)
+        return fail("socket<->file CLOSE");
+    close(fp[1]);
+
+    if (host.resets != host_resets || target.resets != target_resets ||
+        host.peer_session != host_session || target.peer_session != target_session)
+        return fail("heterogeneous lifecycle changed link state");
+    return 0;
+}
+
+static int test_protocol_fault_still_resets(void)
+{
+    struct app a;
+    struct lmux_frame fr;
+
+    init_app(&a);
+    make_hello(&fr, 0x12345678u);
+    handle_frame(&a, &fr);
+    a.ch[0].local_open = 1;
+    a.ch[0].remote_open = 1;
+    a.ch[0].active = 1;
+    make_frame(&fr, LMUX_T_DATA, 1);
+    fr.sequence = 9;
+    fr.payload_len = 1;
+    fr.payload[0] = 0xaa;
+    handle_frame(&a, &fr);
+    if (!a.pending_reset || a.resets != 1 || a.local_resets != 1 ||
+        strstr(a.last_reset, "DATA sequence mismatch") == NULL)
+        return fail("genuine protocol fault did not reset");
+    return 0;
+}
+
+static int test_late_data_credit_inactive_no_reset(void)
+{
+    struct app a;
+    struct lmux_frame fr;
+    uint32_t peer_session;
+
+    init_app(&a);
+    make_hello(&fr, 0x91919191u);
+    handle_frame(&a, &fr);
+    peer_session = a.peer_session;
+    make_frame(&fr, LMUX_T_CREDIT, 3);
+    fr.payload_len = 2;
+    lmux_put_le16(fr.payload, 16);
+    handle_frame(&a, &fr);
+    if (a.pending_reset || a.resets || a.peer_session != peer_session)
+        return fail("inactive CREDIT caused link reset");
+    make_frame(&fr, LMUX_T_DATA, 3);
+    fr.sequence = 7;
+    fr.payload_len = 3;
+    fr.payload[0] = 'o';
+    fr.payload[1] = 'l';
+    fr.payload[2] = 'd';
+    handle_frame(&a, &fr);
+    if (a.pending_reset || a.resets || a.peer_session != peer_session)
+        return fail("inactive DATA caused link reset");
+    return 0;
+}
+
+static int test_winsize_frame(void)
+{
+    struct app a;
+    struct lmux_frame fr;
+    struct winsize ws;
+    char p1[128], p2[128];
+
+    init_app(&a);
+    a.link_state = LINK_ESTABLISHED;
+    snprintf(p1, sizeof(p1), "/tmp/lmux-ws1-%ld", (long)getpid());
+    snprintf(p2, sizeof(p2), "/tmp/lmux-ws2-%ld", (long)getpid());
+    a.ch[0].ep.type = EP_PTY;
+    strcpy(a.ch[0].ep.path, p1);
+    a.ch[1].ep.type = EP_PTY;
+    strcpy(a.ch[1].ep.path, p2);
+    if (create_pty(&a, 0) < 0 || create_pty(&a, 1) < 0)
+        return fail("create PTY for winsize");
+
+    make_frame(&fr, LMUX_T_WINSIZE, 1);
+    fr.payload_len = 8;
+    lmux_put_le16(fr.payload, 24);
+    lmux_put_le16(fr.payload + 2, 80);
+    lmux_put_le16(fr.payload + 4, 0);
+    lmux_put_le16(fr.payload + 6, 0);
+    handle_frame(&a, &fr);
+    memset(&ws, 0, sizeof(ws));
+    if (ioctl(a.ch[0].ep.fd, TIOCGWINSZ, &ws) < 0 || ws.ws_row != 24 || ws.ws_col != 80)
+        return fail("80x24 winsize not applied");
+
+    lmux_put_le16(fr.payload, 40);
+    lmux_put_le16(fr.payload + 2, 120);
+    handle_frame(&a, &fr);
+    memset(&ws, 0, sizeof(ws));
+    if (ioctl(a.ch[0].ep.fd, TIOCGWINSZ, &ws) < 0 || ws.ws_row != 40 || ws.ws_col != 120)
+        return fail("120x40 winsize not applied");
+    memset(&ws, 0, sizeof(ws));
+    if (ioctl(a.ch[1].ep.fd, TIOCGWINSZ, &ws) < 0 || (ws.ws_row == 40 && ws.ws_col == 120))
+        return fail("winsize leaked to channel 2");
+
+    fr.payload_len = 8;
+    lmux_put_le16(fr.payload, 0);
+    lmux_put_le16(fr.payload + 2, 80);
+    handle_frame(&a, &fr);
+    if (a.pending_reset)
+        return fail("malformed winsize caused protocol reset");
+    close_fd(&a.ch[0].ep.fd);
+    close_fd(&a.ch[1].ep.fd);
+    unlink(p1);
+    unlink(p2);
     return 0;
 }
 
@@ -779,6 +1390,17 @@ int main(void)
         test_empty_cobs_record() ||
         test_lost_first_hello_converges() ||
         test_simultaneous_startup_hello_response_no_loop() ||
+        test_legacy_wire_compatibility() ||
+        test_pending_socket_ignores_peer_close() ||
+        test_socket_pending_and_binary_stream() ||
+        test_socket_host_first_pending() ||
+        test_socket_stale_close_reconnect_and_isolation() ||
+        test_socket_sequential_sessions() ||
+        test_socket_lifecycle_no_link_reset_100() ||
+        test_heterogeneous_lifecycle_no_reset() ||
+        test_protocol_fault_still_resets() ||
+        test_late_data_credit_inactive_no_reset() ||
+        test_winsize_frame() ||
         test_shell_lifecycle_smoke() ||
         test_file_zero_put() ||
         test_file_bad_hash_preserves_existing() ||

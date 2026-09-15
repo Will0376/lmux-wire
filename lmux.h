@@ -14,6 +14,10 @@
 #define LMUX_MAX_DECODED (LMUX_HEADER_LEN + LMUX_MAX_PAYLOAD + LMUX_CRC_LEN)
 #define LMUX_MAX_ENCODED (LMUX_MAX_DECODED + (LMUX_MAX_DECODED / 254) + 2)
 #define LMUX_PATH_MAX 256
+#define LMUX_FEATURE_FILE       0x00000001u
+#define LMUX_FEATURE_CWD_QUERY  0x00000002u
+#define LMUX_FEATURE_WINSIZE    0x00000004u
+#define LMUX_FEATURE_STREAM_GEN 0x00000008u
 
 enum lmux_type {
     LMUX_T_HELLO = 1,
@@ -21,7 +25,8 @@ enum lmux_type {
     LMUX_T_CLOSE = 3,
     LMUX_T_DATA = 4,
     LMUX_T_CREDIT = 5,
-    LMUX_T_RESET = 6
+    LMUX_T_RESET = 6,
+    LMUX_T_WINSIZE = 7
 };
 
 struct lmux_frame {

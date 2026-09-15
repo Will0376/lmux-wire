@@ -15,19 +15,20 @@ HOST_DIR := build/host
 TARGET_DIR := build/target
 
 COMMON_SRC := protocol.c lxf.c
-VERSION_INPUTS := VERSION Makefile lmux.c lmuxd.c lmux.h lxf.c lxf.h protocol.c test_protocol.c test_lmuxd_state.c test_lmux_client.c
+VERSION_INPUTS := VERSION Makefile lmux.c lmuxd.c lmux.h lxf.c lxf.h protocol.c test_protocol.c test_lmuxd_state.c test_lmuxd_integration.c test_lmux_client.c
 
 .PHONY: all host target strip-target clean selftest new-build bump-version
 
 all: host target
 
-host: $(HOST_DIR)/lmuxd $(HOST_DIR)/lmux $(HOST_DIR)/test_protocol $(HOST_DIR)/test_lmuxd_state $(HOST_DIR)/test_lmux_client
+host: $(HOST_DIR)/lmuxd $(HOST_DIR)/lmux $(HOST_DIR)/test_protocol $(HOST_DIR)/test_lmuxd_state $(HOST_DIR)/test_lmuxd_integration $(HOST_DIR)/test_lmux_client
 
 target: $(TARGET_DIR)/lmuxd $(TARGET_DIR)/lmux
 
-selftest: $(HOST_DIR)/lmuxd $(HOST_DIR)/lmux $(HOST_DIR)/test_protocol $(HOST_DIR)/test_lmuxd_state $(HOST_DIR)/test_lmux_client
+selftest: $(HOST_DIR)/lmuxd $(HOST_DIR)/lmux $(HOST_DIR)/test_protocol $(HOST_DIR)/test_lmuxd_state $(HOST_DIR)/test_lmuxd_integration $(HOST_DIR)/test_lmux_client
 	$(HOST_DIR)/test_protocol
 	$(HOST_DIR)/test_lmuxd_state
+	$(HOST_DIR)/test_lmuxd_integration
 	$(HOST_DIR)/test_lmux_client
 	test "$$($(HOST_DIR)/lmux --version | sed 's/^lmux //')" = "$$($(HOST_DIR)/lmuxd --version | sed 's/^lmuxd //')"
 	grep -F -q "$$($(HOST_DIR)/lmux --version | sed 's/^lmux //' | sed 's/ (LMUX Wire)//')" $(GEN_DIR)/version.h
@@ -55,6 +56,9 @@ $(HOST_DIR)/test_protocol: test_protocol.c $(COMMON_SRC) lmux.h lxf.h $(GEN_VERS
 
 $(HOST_DIR)/test_lmuxd_state: test_lmuxd_state.c lmuxd.c $(COMMON_SRC) lmux.h lxf.h $(GEN_VERSION) | $(HOST_DIR)
 	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ test_lmuxd_state.c $(COMMON_SRC)
+
+$(HOST_DIR)/test_lmuxd_integration: test_lmuxd_integration.c lmuxd.c $(COMMON_SRC) lmux.h lxf.h $(GEN_VERSION) | $(HOST_DIR)
+	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ test_lmuxd_integration.c $(COMMON_SRC)
 
 $(HOST_DIR)/test_lmux_client: test_lmux_client.c lmux.c $(COMMON_SRC) lmux.h lxf.h $(GEN_VERSION) | $(HOST_DIR)
 	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ test_lmux_client.c $(COMMON_SRC)

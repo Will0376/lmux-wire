@@ -165,7 +165,7 @@ int lmux_decode_frame(const uint8_t *encoded, size_t encoded_len, struct lmux_fr
         return -1;
     if (decoded_len != (size_t)LMUX_HEADER_LEN + fr->payload_len + LMUX_CRC_LEN)
         return -1;
-    if (fr->type < LMUX_T_HELLO || fr->type > LMUX_T_RESET)
+    if (fr->type < LMUX_T_HELLO || fr->type > LMUX_T_WINSIZE)
         return -1;
     if ((fr->type == LMUX_T_HELLO || fr->type == LMUX_T_RESET) && fr->channel != 0)
         return -1;

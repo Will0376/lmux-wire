@@ -17,6 +17,7 @@
 #include <sys/un.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
+#include <sys/utsname.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -86,11 +87,29 @@ struct channel {
     struct endpoint ep;
     struct ring rx;
     struct ring tx;
+    /*
+     * Three lifetimes are intentionally separate:
+     * - the physical LMUX link is app.link_state/session;
+     * - ep.type/path/listen_fd are the configured endpoint lifetime;
+     * - local_open/remote_open/local_paired describe one transient app stream.
+     * A stream EOF/CLOSE can tear down only that app stream; it is not a
+     * protocol fault and must not reset the physical link.
+     */
     int local_open;
     int remote_open;
     int active;
+    int local_paired;
+    int ignore_peer_close;
     int pending_open;
     int pending_close;
+    int pending_winsize;
+    uint32_t local_generation;
+    uint32_t remote_generation;
+    uint32_t pending_close_generation;
+    uint16_t winsize_rows;
+    uint16_t winsize_cols;
+    uint16_t winsize_xpixel;
+    uint16_t winsize_ypixel;
     uint16_t tx_seq;
     uint16_t rx_seq;
     unsigned int remote_credit;
@@ -100,11 +119,19 @@ struct channel {
 
 struct app {
     const char *carrier_path;
+    const char *control_path;
     int verbose;
     int carrier_fd;
+    int control_listen_fd;
+    int control_fd;
+    char control_in[256];
+    size_t control_in_len;
     int stop;
     uint32_t local_session;
     uint32_t peer_session;
+    uint32_t local_features;
+    uint32_t peer_features;
+    char peer_version[64];
     enum link_state link_state;
     long long last_carrier_try_ms;
     long long last_hello_ms;
@@ -117,6 +144,18 @@ struct app {
     int pending_reset;
     int pending_hello;
     int rr_next;
+    unsigned long long frames_tx;
+    unsigned long long frames_rx;
+    unsigned long long bytes_tx;
+    unsigned long long bytes_rx;
+    unsigned long long crc_errors;
+    unsigned long long malformed_frames;
+    unsigned long long sequence_errors;
+    unsigned long long resets;
+    unsigned long long local_resets;
+    unsigned long long peer_resets;
+    unsigned long long reconnects;
+    char last_reset[96];
     struct channel ch[LMUX_CHANNELS];
 };
 
@@ -225,6 +264,7 @@ static void deactivate_channel(struct channel *c);
 static void spawn_shell(struct app *a, int idx);
 static void file_reset(struct channel *c);
 static int file_service_step(struct app *a, int idx);
+static int queue_winsize_frame(struct app *a, int idx);
 
 static void child_close_daemon_fds(void)
 {
@@ -273,21 +313,32 @@ static void terminate_shell(struct app *a, int idx)
 static void close_socket_client(struct app *a, int idx, int send_close)
 {
     struct channel *c = &a->ch[idx];
+    int was_paired;
     if (c->ep.type != EP_SOCKET || c->ep.fd < 0)
         return;
+    was_paired = c->local_paired || c->active;
     close_fd(&c->ep.fd);
     c->local_open = 0;
+    c->local_paired = 0;
+    c->remote_open = 0;
+    c->remote_generation = 0;
     c->pending_open = 0;
-    if (send_close && a->link_state == LINK_ESTABLISHED)
+    if (send_close && a->link_state == LINK_ESTABLISHED) {
         c->pending_close = 1;
+        c->pending_close_generation = c->local_generation;
+        if (was_paired)
+            c->ignore_peer_close = 1;
+    }
     if (c->active)
         deactivate_channel(c);
-    log_msg(a, 1, "channel %d local socket disconnected", idx + 1);
+    log_msg(a, 1, "channel %d local socket disconnected session=%u", idx + 1,
+            c->pending_close_generation);
 }
 
 static void deactivate_channel(struct channel *c)
 {
     c->active = 0;
+    c->local_paired = 0;
     ring_clear(&c->rx);
     ring_clear(&c->tx);
     c->tx_seq = 0;
@@ -306,6 +357,8 @@ static void activate_channel(struct app *a, int idx)
     c->remote_credit = 0;
     c->credit_pending = LMUX_RX_RING;
     c->active = 1;
+    if (c->ep.type == EP_SOCKET)
+        c->local_paired = 1;
     log_msg(a, 1, "channel %d active", idx + 1);
 }
 
@@ -335,13 +388,19 @@ static void reset_transport(struct app *a, int disconnect_sockets)
         c->remote_open = 0;
         c->pending_open = 0;
         c->pending_close = 0;
+        c->pending_winsize = 0;
+        c->remote_generation = 0;
+        c->pending_close_generation = 0;
+        c->local_paired = 0;
+        c->ignore_peer_close = 0;
         if (c->ep.type == EP_FILE)
             file_reset(c);
         deactivate_channel(c);
         if (disconnect_sockets && c->ep.type == EP_SOCKET && c->ep.fd >= 0) {
             close_fd(&c->ep.fd);
             c->local_open = 0;
-            log_msg(a, 1, "channel %d local socket disconnected", i + 1);
+            log_msg(a, 1, "channel %d local socket disconnected session=%u", i + 1,
+                    c->local_generation);
         }
     }
 }
@@ -349,6 +408,10 @@ static void reset_transport(struct app *a, int disconnect_sockets)
 static void protocol_fault(struct app *a, const char *why)
 {
     log_msg(a, 0, "protocol fault: %s", why);
+    log_msg(a, 1, "sending RESET: %s", why);
+    snprintf(a->last_reset, sizeof(a->last_reset), "local protocol=%s", why);
+    a->resets++;
+    a->local_resets++;
     reset_transport(a, 1);
     make_session(a);
     a->pending_reset = 1;
@@ -384,6 +447,8 @@ static void try_open_carrier(struct app *a)
 {
     long long t = now_ms();
     int fd;
+    if (!a->carrier_path)
+        return;
     if (a->carrier_fd >= 0 || t - a->last_carrier_try_ms < 1000)
         return;
     a->last_carrier_try_ms = t;
@@ -414,6 +479,8 @@ static int queue_frame(struct app *a, struct lmux_frame *fr)
     a->out_len = a->out_pos = 0;
     if (lmux_encode_frame(fr, a->out, sizeof(a->out), &a->out_len) < 0)
         return -1;
+    a->frames_tx++;
+    a->bytes_tx += fr->payload_len;
     return 1;
 }
 
@@ -424,6 +491,17 @@ static int queue_simple(struct app *a, uint8_t type, uint8_t ch)
     fr.version = LMUX_VERSION;
     fr.type = type;
     fr.channel = ch;
+    return queue_frame(a, &fr);
+}
+
+static int queue_openclose(struct app *a, uint8_t type, int idx, uint32_t generation)
+{
+    struct lmux_frame fr;
+    (void)generation;
+    memset(&fr, 0, sizeof(fr));
+    fr.version = LMUX_VERSION;
+    fr.type = type;
+    fr.channel = (uint8_t)(idx + 1);
     return queue_frame(a, &fr);
 }
 
@@ -467,14 +545,18 @@ static int build_next_output(struct app *a)
     for (i = 0; i < LMUX_CHANNELS; i++) {
         if (a->ch[i].pending_close) {
             a->ch[i].pending_close = 0;
-            return queue_simple(a, LMUX_T_CLOSE, (uint8_t)(i + 1));
+            return queue_openclose(a, LMUX_T_CLOSE, i, a->ch[i].pending_close_generation);
         }
     }
     for (i = 0; i < LMUX_CHANNELS; i++) {
         if (a->ch[i].pending_open) {
             a->ch[i].pending_open = 0;
-            return queue_simple(a, LMUX_T_OPEN, (uint8_t)(i + 1));
+            return queue_openclose(a, LMUX_T_OPEN, i, a->ch[i].local_generation);
         }
+    }
+    for (i = 0; i < LMUX_CHANNELS; i++) {
+        if (a->ch[i].pending_winsize)
+            return queue_winsize_frame(a, i);
     }
     for (i = 0; i < LMUX_CHANNELS; i++) {
         struct channel *c = &a->ch[i];
@@ -535,6 +617,82 @@ static void advertise_local_open(struct app *a)
             a->ch[i].pending_open = 1;
 }
 
+static int frame_generation_ok(const struct lmux_frame *fr, uint32_t *gen)
+{
+    if (fr->payload_len == 0) {
+        *gen = 0;
+        return 1;
+    }
+    if (fr->payload_len == 4) {
+        *gen = lmux_get_le32(fr->payload);
+        return *gen != 0;
+    }
+    return 0;
+}
+
+static void apply_winsize(struct app *a, int idx, const uint8_t *p, uint16_t len)
+{
+    struct winsize ws;
+    struct endpoint *e = &a->ch[idx].ep;
+    if (len != 8) {
+        protocol_fault(a, "bad WINSIZE length");
+        return;
+    }
+    memset(&ws, 0, sizeof(ws));
+    ws.ws_row = lmux_get_le16(p);
+    ws.ws_col = lmux_get_le16(p + 2);
+    ws.ws_xpixel = lmux_get_le16(p + 4);
+    ws.ws_ypixel = lmux_get_le16(p + 6);
+    if (ws.ws_row == 0 || ws.ws_col == 0 || ws.ws_row > 1000 || ws.ws_col > 1000) {
+        log_msg(a, 1, "discard malformed WINSIZE ch%d rows=%u cols=%u",
+                idx + 1, ws.ws_row, ws.ws_col);
+        return;
+    }
+    if ((e->type == EP_PTY || e->type == EP_SHELL) && e->fd >= 0) {
+        if (ioctl(e->fd, TIOCSWINSZ, &ws) < 0)
+            log_msg(a, 1, "channel %d TIOCSWINSZ failed: %s", idx + 1, strerror(errno));
+        else
+            log_msg(a, 1, "channel %d winsize %ux%u", idx + 1, ws.ws_col, ws.ws_row);
+    }
+}
+
+static int queue_winsize(struct app *a, int idx, unsigned int rows, unsigned int cols,
+                         unsigned int xpixel, unsigned int ypixel)
+{
+    struct channel *c;
+    if (idx < 0 || idx >= LMUX_CHANNELS || rows == 0 || cols == 0 || rows > 1000 || cols > 1000)
+        return -1;
+    if (a->link_state != LINK_ESTABLISHED || !(a->peer_features & LMUX_FEATURE_WINSIZE))
+        return -1;
+    c = &a->ch[idx];
+    c->winsize_rows = (uint16_t)rows;
+    c->winsize_cols = (uint16_t)cols;
+    c->winsize_xpixel = (uint16_t)xpixel;
+    c->winsize_ypixel = (uint16_t)ypixel;
+    c->pending_winsize = 1;
+    return 0;
+}
+
+static int queue_winsize_frame(struct app *a, int idx)
+{
+    struct channel *c = &a->ch[idx];
+    struct lmux_frame fr;
+    memset(&fr, 0, sizeof(fr));
+    fr.version = LMUX_VERSION;
+    fr.type = LMUX_T_WINSIZE;
+    fr.channel = (uint8_t)(idx + 1);
+    fr.payload_len = 8;
+    lmux_put_le16(fr.payload, c->winsize_rows);
+    lmux_put_le16(fr.payload + 2, c->winsize_cols);
+    lmux_put_le16(fr.payload + 4, c->winsize_xpixel);
+    lmux_put_le16(fr.payload + 6, c->winsize_ypixel);
+    if (queue_frame(a, &fr) > 0) {
+        c->pending_winsize = 0;
+        return 1;
+    }
+    return -1;
+}
+
 static void handle_frame(struct app *a, const struct lmux_frame *fr)
 {
     int idx = fr->channel ? fr->channel - 1 : -1;
@@ -542,13 +700,16 @@ static void handle_frame(struct app *a, const struct lmux_frame *fr)
 
     if (fr->type == LMUX_T_RESET) {
         log_msg(a, 1, "peer RESET");
+        a->resets++;
+        a->peer_resets++;
+        snprintf(a->last_reset, sizeof(a->last_reset), "peer");
         reset_transport(a, 1);
         make_session(a);
         return;
     }
     if (fr->type == LMUX_T_HELLO) {
         uint32_t sid;
-        if (fr->payload_len != 8 || memcmp(fr->payload, "LMX1", 4) != 0) {
+        if (fr->payload_len < 8 || memcmp(fr->payload, "LMX1", 4) != 0) {
             if (a->link_state == LINK_WAIT_HELLO)
                 log_msg(a, 1, "discard malformed HELLO before session");
             else
@@ -556,10 +717,26 @@ static void handle_frame(struct app *a, const struct lmux_frame *fr)
             return;
         }
         sid = lmux_get_le32(fr->payload + 4);
+        a->peer_features = 0;
+        a->peer_version[0] = 0;
+        if (fr->payload_len >= 13) {
+            uint8_t vlen;
+            a->peer_features = lmux_get_le32(fr->payload + 8);
+            vlen = fr->payload[12];
+            if ((uint16_t)(13 + vlen) <= fr->payload_len) {
+                size_t n = vlen;
+                if (n >= sizeof(a->peer_version))
+                    n = sizeof(a->peer_version) - 1;
+                memcpy(a->peer_version, fr->payload + 13, n);
+                a->peer_version[n] = 0;
+            }
+        }
         if (a->link_state == LINK_ESTABLISHED && sid == a->peer_session)
             return;
 
         log_msg(a, 1, "peer HELLO session %08x", sid);
+        if (a->link_state != LINK_ESTABLISHED)
+            a->reconnects++;
         reset_transport(a, 0);
         a->link_state = LINK_ESTABLISHED;
         a->peer_session = sid;
@@ -573,28 +750,64 @@ static void handle_frame(struct app *a, const struct lmux_frame *fr)
     }
 
     switch (fr->type) {
-    case LMUX_T_OPEN:
-        if (fr->payload_len != 0) {
+    case LMUX_T_OPEN: {
+        uint32_t gen;
+        if (!frame_generation_ok(fr, &gen)) {
             protocol_fault(a, "OPEN payload");
             return;
         }
+        if (gen && c->remote_generation && gen < c->remote_generation) {
+            log_msg(a, 1, "channel %d discard stale peer OPEN session=%u current=%u",
+                    idx + 1, gen, c->remote_generation);
+            return;
+        }
+        if (gen)
+            c->remote_generation = gen;
+        c->ignore_peer_close = 0;
         if (!c->remote_open)
-            log_msg(a, 1, "channel %d remote OPEN", idx + 1);
+            log_msg(a, 1, "channel %d peer client ready session=%u", idx + 1,
+                    gen ? gen : c->remote_generation);
         c->remote_open = 1;
         update_channel_active(a, idx);
+        if (c->active)
+            log_msg(a, 1, "channel %d session active", idx + 1);
         break;
-    case LMUX_T_CLOSE:
-        if (fr->payload_len != 0) {
+    }
+    case LMUX_T_CLOSE: {
+        uint32_t gen;
+        int was_paired;
+        if (!frame_generation_ok(fr, &gen)) {
             protocol_fault(a, "CLOSE payload");
             return;
         }
+        if (gen && c->remote_open && c->remote_generation != gen) {
+            log_msg(a, 1, "channel %d discard stale peer CLOSE session=%u current=%u",
+                    idx + 1, gen, c->remote_generation);
+            return;
+        }
+        if (c->ignore_peer_close) {
+            c->ignore_peer_close = 0;
+            c->remote_open = 0;
+            c->remote_generation = 0;
+            update_channel_active(a, idx);
+            log_msg(a, 1, "channel %d discard expected peer CLOSE for previous app stream",
+                    idx + 1);
+            break;
+        }
         if (c->remote_open)
-            log_msg(a, 1, "channel %d remote CLOSE", idx + 1);
+            log_msg(a, 1, "channel %d peer EOF session=%u", idx + 1,
+                    gen ? gen : c->remote_generation);
+        was_paired = c->local_paired;
         c->remote_open = 0;
-        if (c->ep.type == EP_SOCKET)
+        c->remote_generation = 0;
+        if (c->ep.type == EP_SOCKET && was_paired)
             close_socket_client(a, idx, 0);
         update_channel_active(a, idx);
+        if (c->local_open && c->ep.type != EP_SOCKET)
+            c->pending_open = 1;
+        log_msg(a, 1, "channel %d session closed", idx + 1);
         break;
+    }
     case LMUX_T_CREDIT: {
         uint16_t delta;
         if (fr->payload_len != 2) {
@@ -602,7 +815,11 @@ static void handle_frame(struct app *a, const struct lmux_frame *fr)
             return;
         }
         delta = lmux_get_le16(fr->payload);
-        if (!c->active || delta == 0 || c->remote_credit + delta > LMUX_RX_RING) {
+        if (!c->active) {
+            log_msg(a, 1, "channel %d discard CREDIT for inactive app stream", idx + 1);
+            return;
+        }
+        if (delta == 0 || c->remote_credit + delta > LMUX_RX_RING) {
             protocol_fault(a, "bad CREDIT accounting");
             return;
         }
@@ -610,11 +827,16 @@ static void handle_frame(struct app *a, const struct lmux_frame *fr)
         break;
     }
     case LMUX_T_DATA:
-        if (!c->active || fr->payload_len == 0) {
-            protocol_fault(a, "DATA for inactive channel");
+        if (fr->payload_len == 0) {
+            protocol_fault(a, "empty DATA");
+            return;
+        }
+        if (!c->active) {
+            log_msg(a, 1, "channel %d discard DATA for inactive app stream", idx + 1);
             return;
         }
         if (fr->sequence != c->rx_seq) {
+            a->sequence_errors++;
             protocol_fault(a, "DATA sequence mismatch");
             return;
         }
@@ -624,6 +846,9 @@ static void handle_frame(struct app *a, const struct lmux_frame *fr)
         }
         ring_write(&c->rx, fr->payload, fr->payload_len);
         c->rx_seq++;
+        break;
+    case LMUX_T_WINSIZE:
+        apply_winsize(a, idx, fr->payload, fr->payload_len);
         break;
     default:
         protocol_fault(a, "unknown frame");
@@ -638,12 +863,16 @@ static void process_encoded_record(struct app *a, const uint8_t *buf, size_t len
     if (len == 0)
         return;
     if (lmux_decode_frame(buf, len, &fr) < 0) {
+        a->malformed_frames++;
+        a->crc_errors++;
         if (a->link_state == LINK_WAIT_HELLO)
             log_msg(a, 1, "discard malformed frame before HELLO");
         else
             protocol_fault(a, "bad frame");
         return;
     }
+    a->frames_rx++;
+    a->bytes_rx += fr.payload_len;
     handle_frame(a, &fr);
 }
 
@@ -938,6 +1167,215 @@ static int create_socket_listener(struct app *a, int idx)
     return 0;
 }
 
+static int create_control_listener(struct app *a)
+{
+    struct sockaddr_un sa;
+    struct stat st;
+
+    if (!a->control_path)
+        return 0;
+    if (strlen(a->control_path) >= sizeof(sa.sun_path)) {
+        fprintf(stderr, "control socket path too long: %s\n", a->control_path);
+        return -1;
+    }
+    if (lstat(a->control_path, &st) == 0) {
+        if (!S_ISSOCK(st.st_mode)) {
+            fprintf(stderr, "%s exists and is not a socket\n", a->control_path);
+            return -1;
+        }
+        if (unlink(a->control_path) < 0) {
+            perror(a->control_path);
+            return -1;
+        }
+    } else if (errno != ENOENT) {
+        perror(a->control_path);
+        return -1;
+    }
+    a->control_listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (a->control_listen_fd < 0) {
+        perror("control socket");
+        return -1;
+    }
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    strcpy(sa.sun_path, a->control_path);
+    if (bind(a->control_listen_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        perror(a->control_path);
+        return -1;
+    }
+    if (listen(a->control_listen_fd, 4) < 0) {
+        perror("control listen");
+        return -1;
+    }
+    log_msg(a, 1, "control socket %s", a->control_path);
+    return 0;
+}
+
+static void append_feature(char *buf, size_t cap, const char *name)
+{
+    if (buf[0] && strlen(buf) + 1 < cap)
+        strncat(buf, " ", cap - strlen(buf) - 1);
+    strncat(buf, name, cap - strlen(buf) - 1);
+}
+
+static void feature_string(uint32_t f, char *buf, size_t cap)
+{
+    buf[0] = 0;
+    if (f & LMUX_FEATURE_FILE)
+        append_feature(buf, cap, "FILE");
+    if (f & LMUX_FEATURE_CWD_QUERY)
+        append_feature(buf, cap, "CWD");
+    if (f & LMUX_FEATURE_WINSIZE)
+        append_feature(buf, cap, "WINSIZE");
+    if (f & LMUX_FEATURE_STREAM_GEN)
+        append_feature(buf, cap, "STREAM_GEN");
+    if (!buf[0])
+        strncpy(buf, "-", cap);
+    buf[cap - 1] = 0;
+}
+
+static const char *endpoint_name(const struct channel *c)
+{
+    switch (c->ep.type) {
+    case EP_PTY: return "pty";
+    case EP_SOCKET: return "socket";
+    case EP_SHELL: return "shell";
+    case EP_FILE: return "file";
+    default: return "none";
+    }
+}
+
+static const char *local_client_state(const struct channel *c)
+{
+    if (!c->local_open)
+        return "none";
+    if (c->ep.type == EP_SOCKET)
+        return c->local_paired ? "active" : "pending";
+    return "persistent";
+}
+
+static const char *peer_client_state(const struct channel *c)
+{
+    if (!c->remote_open)
+        return "none";
+    if (c->active)
+        return "active";
+    return "pending";
+}
+
+static void control_status(struct app *a, int fd)
+{
+    char lf[96], pf[96], line[512];
+    int i;
+    feature_string(a->local_features, lf, sizeof(lf));
+    feature_string(a->peer_features, pf, sizeof(pf));
+    snprintf(line, sizeof(line),
+             "%s\nlocal:  %s\npeer:   %s\nwire:   LMUX/%d\nmode:   %s\nlink:   %s\nfeatures: %s\npeer-features: %s\n",
+             LMUX_PROJECT_NAME, LMUX_BUILD_VERSION,
+             a->peer_version[0] ? a->peer_version : "-", LMUX_VERSION,
+             a->peer_features ? "extended" : "legacy",
+             a->link_state == LINK_ESTABLISHED ? "established" : "wait-hello",
+             lf, pf);
+    (void)write(fd, line, strlen(line));
+    snprintf(line, sizeof(line),
+             "counters: tx_frames=%llu rx_frames=%llu tx_bytes=%llu rx_bytes=%llu crc_errors=%llu malformed=%llu seq_errors=%llu resets=%llu local_resets=%llu peer_resets=%llu sessions=%llu\n",
+             a->frames_tx, a->frames_rx, a->bytes_tx, a->bytes_rx, a->crc_errors,
+             a->malformed_frames, a->sequence_errors, a->resets, a->local_resets,
+             a->peer_resets, a->reconnects);
+    (void)write(fd, line, strlen(line));
+    snprintf(line, sizeof(line), "last_reset: %s\n",
+             a->last_reset[0] ? a->last_reset : "-");
+    (void)write(fd, line, strlen(line));
+    for (i = 0; i < LMUX_CHANNELS; i++) {
+        struct channel *c = &a->ch[i];
+        snprintf(line, sizeof(line),
+                 "ch%d %-6s configured=%s link=%s client=%s peer_client=%s tx=%zu rx=%zu generation=%u peer_generation=%u\n",
+                 i + 1, endpoint_name(c),
+                 c->ep.type == EP_NONE ? "no" : "yes",
+                 c->active ? "active" : "idle",
+                 local_client_state(c), peer_client_state(c),
+                 c->tx.len, c->rx.len, c->local_generation, c->remote_generation);
+        (void)write(fd, line, strlen(line));
+    }
+}
+
+static void control_handle_line(struct app *a, char *line)
+{
+    char cmd[16];
+    if (sscanf(line, "%15s", cmd) != 1)
+        return;
+    if (strcmp(cmd, "STATUS") == 0) {
+        control_status(a, a->control_fd);
+    } else if (strcmp(cmd, "WINSIZE") == 0) {
+        unsigned int ch, rows, cols, xp = 0, yp = 0;
+        if (sscanf(line, "%*s %u %u %u %u %u", &ch, &rows, &cols, &xp, &yp) < 3 ||
+            ch < 1 || ch > LMUX_CHANNELS) {
+            (void)write(a->control_fd, "ERR bad WINSIZE\n", 16);
+        } else if (queue_winsize(a, (int)ch - 1, rows, cols, xp, yp) < 0) {
+            (void)write(a->control_fd, "ERR WINSIZE unavailable\n", 23);
+        } else {
+            (void)write(a->control_fd, "OK\n", 3);
+        }
+    } else {
+        (void)write(a->control_fd, "ERR unknown command\n", 20);
+    }
+}
+
+static void accept_control(struct app *a)
+{
+    int fd;
+    for (;;) {
+        fd = accept(a->control_listen_fd, NULL, NULL);
+        if (fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                return;
+            log_msg(a, 0, "control accept: %s", strerror(errno));
+            return;
+        }
+        if (a->control_fd >= 0) {
+            close(fd);
+            continue;
+        }
+        if (set_nonblock(fd) < 0) {
+            close(fd);
+            continue;
+        }
+        a->control_fd = fd;
+        a->control_in_len = 0;
+    }
+}
+
+static void service_control(struct app *a)
+{
+    char *nl;
+    ssize_t r;
+    if (a->control_fd < 0)
+        return;
+    r = read(a->control_fd, a->control_in + a->control_in_len,
+             sizeof(a->control_in) - 1 - a->control_in_len);
+    if (r > 0) {
+        a->control_in_len += (size_t)r;
+        a->control_in[a->control_in_len] = 0;
+        nl = strchr(a->control_in, '\n');
+        if (nl) {
+            *nl = 0;
+            control_handle_line(a, a->control_in);
+            close_fd(&a->control_fd);
+            a->control_in_len = 0;
+        } else if (a->control_in_len >= sizeof(a->control_in) - 1) {
+            (void)write(a->control_fd, "ERR request too long\n", 21);
+            close_fd(&a->control_fd);
+            a->control_in_len = 0;
+        }
+    } else if (r == 0) {
+        close_fd(&a->control_fd);
+        a->control_in_len = 0;
+    } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        close_fd(&a->control_fd);
+        a->control_in_len = 0;
+    }
+}
+
 static void accept_client(struct app *a, int idx)
 {
     struct endpoint *e = &a->ch[idx].ep;
@@ -959,11 +1397,17 @@ static void accept_client(struct app *a, int idx)
             continue;
         }
         e->fd = fd;
+        a->ch[idx].local_generation++;
+        if (a->ch[idx].local_generation == 0)
+            a->ch[idx].local_generation = 1;
         a->ch[idx].local_open = 1;
         if (a->link_state == LINK_ESTABLISHED)
             a->ch[idx].pending_open = 1;
         update_channel_active(a, idx);
-        log_msg(a, 1, "channel %d local socket connected", idx + 1);
+        log_msg(a, 1, "channel %d local client connected session=%u", idx + 1,
+                a->ch[idx].local_generation);
+        if (!a->ch[idx].remote_open)
+            log_msg(a, 1, "channel %d waiting for peer", idx + 1);
     }
 }
 
@@ -1404,17 +1848,23 @@ static void run_loop(struct app *a)
                 ev |= POLLOUT;
             add_poll(pfds, kind, chan, &n, a->carrier_fd, ev, 1, -1);
         }
+        if (a->control_listen_fd >= 0)
+            add_poll(pfds, kind, chan, &n, a->control_listen_fd, POLLIN, 4, -1);
+        if (a->control_fd >= 0)
+            add_poll(pfds, kind, chan, &n, a->control_fd, POLLIN, 5, -1);
         for (i = 0; i < LMUX_CHANNELS; i++) {
             struct channel *c = &a->ch[i];
             if (c->ep.type == EP_SOCKET && c->ep.listen_fd >= 0)
                 add_poll(pfds, kind, chan, &n, c->ep.listen_fd, POLLIN, 2, (int)i);
-            if (c->ep.fd >= 0 && c->active && c->ep.type != EP_FILE) {
+            if (c->ep.fd >= 0 && c->ep.type != EP_FILE) {
                 short ev = 0;
-                if (ring_free(&c->tx) > 0)
-                    ev |= POLLIN;
-                if (c->rx.len > 0)
-                    ev |= POLLOUT;
-                if (ev)
+                if (c->active) {
+                    if (ring_free(&c->tx) > 0)
+                        ev |= POLLIN;
+                    if (c->rx.len > 0)
+                        ev |= POLLOUT;
+                }
+                if (ev || c->ep.type == EP_SOCKET)
                     add_poll(pfds, kind, chan, &n, c->ep.fd, ev, 3, (int)i);
             }
         }
@@ -1445,9 +1895,22 @@ static void run_loop(struct app *a)
                 if (pfds[i].revents & POLLIN)
                     collect_tx(a, chan[i]);
                 if (pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL)) {
-                    if (a->ch[chan[i]].ep.type == EP_SOCKET)
+                    if (a->ch[chan[i]].ep.type == EP_SOCKET) {
+                        if (!a->ch[chan[i]].active && a->ch[chan[i]].local_open)
+                            log_msg(a, 1, "channel %d pending local client hangup",
+                                    chan[i] + 1);
                         close_socket_client(a, chan[i], 1);
+                        log_msg(a, 1, "channel %d waiting state cleared", chan[i] + 1);
+                    }
                 }
+            } else if (kind[i] == 4) {
+                if (pfds[i].revents & POLLIN)
+                    accept_control(a);
+            } else if (kind[i] == 5) {
+                if (pfds[i].revents & POLLIN)
+                    service_control(a);
+                if (pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL))
+                    close_fd(&a->control_fd);
             }
         }
         flush_carrier(a);
@@ -1472,7 +1935,7 @@ static void usage(FILE *f)
 {
     fprintf(f,
         "lmuxd %s (%s)\n"
-        "Usage: lmuxd --carrier PATH [--pty N:SYMLINK] [--shell N:SYMLINK] [--socket N:PATH] [--file N] [--verbose]\n"
+        "Usage: lmuxd --carrier PATH [--control PATH] [--pty N:SYMLINK] [--shell N:SYMLINK] [--socket N:PATH] [--file N] [--verbose]\n"
         "       lmuxd --help\n"
         "       lmuxd --version\n",
         LMUX_BUILD_VERSION, LMUX_PROJECT_NAME);
@@ -1486,6 +1949,10 @@ static int parse_args(struct app *a, int argc, char **argv)
             if (++i >= argc)
                 return -1;
             a->carrier_path = argv[i];
+        } else if (strcmp(argv[i], "--control") == 0) {
+            if (++i >= argc)
+                return -1;
+            a->control_path = argv[i];
         } else if (strcmp(argv[i], "--pty") == 0 || strcmp(argv[i], "--shell") == 0 ||
                    strcmp(argv[i], "--socket") == 0) {
             int idx;
@@ -1545,6 +2012,10 @@ static void cleanup(struct app *a)
         if (a->ch[i].ep.type == EP_SHELL)
             terminate_shell(a, i);
     close_fd(&a->carrier_fd);
+    close_fd(&a->control_fd);
+    close_fd(&a->control_listen_fd);
+    if (a->control_path)
+        unlink(a->control_path);
     for (i = 0; i < LMUX_CHANNELS; i++) {
         struct endpoint *e = &a->ch[i].ep;
         if (e->type == EP_FILE)
@@ -1554,6 +2025,15 @@ static void cleanup(struct app *a)
         if (e->created_path)
             unlink(e->path);
     }
+}
+
+static void compute_local_features(struct app *a)
+{
+    int i;
+    a->local_features = LMUX_FEATURE_CWD_QUERY | LMUX_FEATURE_WINSIZE | LMUX_FEATURE_STREAM_GEN;
+    for (i = 0; i < LMUX_CHANNELS; i++)
+        if (a->ch[i].ep.type == EP_FILE)
+            a->local_features |= LMUX_FEATURE_FILE;
 }
 
 static void on_signal(int sig)
@@ -1571,6 +2051,8 @@ int main(int argc, char **argv)
 
     memset(&a, 0, sizeof(a));
     a.carrier_fd = -1;
+    a.control_listen_fd = -1;
+    a.control_fd = -1;
     for (i = 0; i < LMUX_CHANNELS; i++) {
         a.ch[i].ep.fd = -1;
         a.ch[i].ep.listen_fd = -1;
@@ -1584,6 +2066,7 @@ int main(int argc, char **argv)
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
     global_app = &a;
+    compute_local_features(&a);
     make_session(&a);
     fprintf(stderr, "lmuxd %s (%s)\n", LMUX_BUILD_VERSION, LMUX_PROJECT_NAME);
 
@@ -1601,6 +2084,10 @@ int main(int argc, char **argv)
                 return 1;
             }
         }
+    }
+    if (create_control_listener(&a) < 0) {
+        cleanup(&a);
+        return 1;
     }
 
     run_loop(&a);

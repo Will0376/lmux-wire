@@ -22,6 +22,9 @@ static int saved_termios_valid;
 static int term_detach;
 static int term_modal;
 static char host_cwd[LXF_PATH_MAX] = ".";
+static volatile sig_atomic_t term_winch_pending;
+
+#define LMUX_DEFAULT_CONTROL_SOCKET "/run/lmux/control.sock"
 
 struct transfer_config {
     const char *sock_path;
@@ -50,6 +53,8 @@ enum target_base_source {
     TARGET_BASE_CWD,
     TARGET_BASE_FALLBACK
 };
+
+static int full_write(int fd, const uint8_t *buf, size_t len);
 
 static void restore_termios(void)
 {
@@ -340,12 +345,19 @@ static void on_signal(int sig)
     raise(sig);
 }
 
+static void on_winch(int sig)
+{
+    (void)sig;
+    term_winch_pending = 1;
+}
+
 static void usage(FILE *f)
 {
     fprintf(f,
         "lmux %s (%s)\n"
         "Usage:\n"
         "  lmux connect SOCKET\n"
+        "  lmux status [--control SOCKET]\n"
         "  lmux term [-v|--verbose] [--remote-dir DIR] [--channel 1|2] [1|2|SOCKET]\n"
         "  lmux exec SOCKET -- PROGRAM [ARGS...]\n"
         "  lmux put [OPTIONS] HOST_SRC [TARGET_DST]\n"
@@ -407,6 +419,42 @@ static int connect_unix_mode(const char *path, int quiet)
 static int connect_unix(const char *path)
 {
     return connect_unix_mode(path, 0);
+}
+
+static int control_request(const char *path, const char *req, int print_reply, int quiet)
+{
+    int fd;
+    fd = connect_unix_mode(path ? path : LMUX_DEFAULT_CONTROL_SOCKET, quiet);
+    if (fd < 0)
+        return -1;
+    if (full_write(fd, (const uint8_t *)req, strlen(req)) < 0) {
+        if (!quiet)
+            perror("control write");
+        close(fd);
+        return -1;
+    }
+    if (print_reply) {
+        uint8_t buf[512];
+        ssize_t r;
+        while ((r = read(fd, buf, sizeof(buf))) > 0)
+            (void)full_write(STDOUT_FILENO, buf, (size_t)r);
+    }
+    close(fd);
+    return 0;
+}
+
+static int send_winsize_control(int channel)
+{
+    struct winsize ws;
+    char req[96];
+    if (channel < 1 || channel > 2 || !isatty(STDIN_FILENO))
+        return 0;
+    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) < 0 || ws.ws_row == 0 || ws.ws_col == 0)
+        return -1;
+    snprintf(req, sizeof(req), "WINSIZE %d %u %u %u %u\n", channel,
+             (unsigned int)ws.ws_row, (unsigned int)ws.ws_col,
+             (unsigned int)ws.ws_xpixel, (unsigned int)ws.ws_ypixel);
+    return control_request(LMUX_DEFAULT_CONTROL_SOCKET, req, 0, 1);
 }
 
 static int set_nonblock(int fd)
@@ -705,6 +753,7 @@ static int term_bridge_loop(int sock, const char *remote_dir, int channel, int v
     memset(&b, 0, sizeof(b));
     term_detach = 0;
     term_modal = 0;
+    term_winch_pending = 1;
     if (set_nonblock(STDIN_FILENO) < 0 || set_nonblock(STDOUT_FILENO) < 0 || set_nonblock(sock) < 0) {
         perror("fcntl");
         return 1;
@@ -715,6 +764,11 @@ static int term_bridge_loop(int sock, const char *remote_dir, int channel, int v
         nfds_t n = 0;
         int stdin_idx = -1, sock_idx = -1, out_idx = -1;
         short sock_events = 0;
+
+        if (term_winch_pending) {
+            term_winch_pending = 0;
+            (void)send_winsize_control(channel);
+        }
 
         if (term_modal) {
             char modal = (char)term_modal;
@@ -818,6 +872,7 @@ static int cmd_connect(const char *path, int raw_term, const char *remote_dir, i
             signal(SIGINT, on_signal);
             signal(SIGTERM, on_signal);
             signal(SIGHUP, on_signal);
+            signal(SIGWINCH, on_winch);
         }
     }
     return raw_term ? term_bridge_loop(fd, remote_dir, channel, verbose) : bridge_loop(fd);
@@ -1336,6 +1391,22 @@ static int cmd_exec(int argc, char **argv)
     return 127;
 }
 
+static int cmd_status(int argc, char **argv)
+{
+    const char *control = LMUX_DEFAULT_CONTROL_SOCKET;
+    while (argc > 0) {
+        if (strcmp(argv[0], "--control") == 0 && argc >= 2) {
+            control = argv[1];
+            argv += 2;
+            argc -= 2;
+        } else {
+            usage(stderr);
+            return 1;
+        }
+    }
+    return control_request(control, "STATUS\n", 1, 0) < 0 ? 1 : 0;
+}
+
 #ifndef LMUX_NO_MAIN
 int main(int argc, char **argv)
 {
@@ -1357,6 +1428,8 @@ int main(int argc, char **argv)
         }
         return cmd_connect(argv[2], 0, NULL, 0, 0);
     }
+    if (strcmp(argv[1], "status") == 0)
+        return cmd_status(argc - 2, argv + 2);
     if (strcmp(argv[1], "term") == 0) {
         const char *remote_dir = NULL;
         const char *arg = NULL;

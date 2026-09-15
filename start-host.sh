@@ -45,23 +45,25 @@ fi
 killall lmuxd 2>/dev/null || true
 sleep 1
 
-rm -f
-"$RUNDIR/console1.sock"
-"$RUNDIR/console2.sock"
-"$RUNDIR/gdb.sock"
-"$RUNDIR/file.sock"
+rm -f \
+"$RUNDIR/console1.sock" \
+"$RUNDIR/console2.sock" \
+"$RUNDIR/gdb.sock" \
+"$RUNDIR/file.sock" \
+"$RUNDIR/control.sock"
 
 # Make host-side sockets connectable by the normal user.
 
 umask 000
 
-nohup "$LMUXD"
---carrier "$CARRIER"
---socket 1:"$RUNDIR/console1.sock"
---socket 2:"$RUNDIR/console2.sock"
---socket 3:"$RUNDIR/gdb.sock"
---socket 4:"$RUNDIR/file.sock"
---verbose
+nohup "$LMUXD" \
+--carrier "$CARRIER" \
+--control "$RUNDIR/control.sock" \
+--socket 1:"$RUNDIR/console1.sock" \
+--socket 2:"$RUNDIR/console2.sock" \
+--socket 3:"$RUNDIR/gdb.sock" \
+--socket 4:"$RUNDIR/file.sock" \
+--verbose \
 >"$LOG" 2>&1 &
 
 PID=$!
