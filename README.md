@@ -4,10 +4,10 @@ LMUX Wire is a lightweight userspace multiplexer for embedded Linux. The
 foreground daemon is `lmuxd`, the CLI client is `lmux`, and the runtime wire
 transport is LMUX/2.
 
-LMUX/2 carries services and transient byte streams over one full-duplex carrier.
-The transport knows about factories, services, streams, bytes, flow control,
-framing, and lifecycle. Application protocols such as LXF remain opaque bytes on
-top of streams.
+LMUX/2 carries transient byte streams over one ordered full-duplex byte-stream
+carrier. The transport core knows about frames, streams, bytes, flow control,
+and lifecycle; the daemon runtime routes the service/control plane above it.
+Application protocols such as LXF remain opaque bytes on top of streams.
 
 LMUX/1 was the historical fixed-channel predecessor and remains useful only as a
 git-history reference point.
@@ -51,6 +51,52 @@ stream-id namespace and old streams cannot be reused.
   and execs directly.
 - `lmux put [OPTIONS] HOST_SRC [TARGET_DST]`: upload, HOST to TARGET.
 - `lmux get [OPTIONS] TARGET_SRC [HOST_DST]`: download, TARGET to HOST.
+
+## Source Tree
+
+The source tree is split by coarse subsystem:
+
+```text
+src/
+  lmux.c                 CLI frontend
+  lxf.c, lxf.h           LXF file-transfer application protocol
+  carrier/               physical/inherited/test byte-stream backends
+  transport/             COBS/CRC helpers and LMUX/2 codec/core
+  host/                  host desired topology, local endpoints, control.sock
+  runtime/               lmuxd entry point and poll-loop orchestration
+  services/              target PTY, Unix rendezvous, and FILE adapters
+tests/
+  unit/                  helper/core/frontend/carrier unit tests
+  integration/           real two-daemon LMUX/2 integration tests
+```
+
+`src/transport/protocol.c` and `src/transport/lmux.h` retain the historical
+names for generic COBS/CRC/endian/path helpers used by both LMUX/2 and LXF.
+There is no public C library API or installed include hierarchy.
+
+The runtime owns the single `poll()` loop, carrier/session lifecycle, and
+generic LMUX/2 control-plane routing. The host subsystem owns host-daemon
+policy: desired topology, remote service reconciliation, local service
+listeners, pending/active local clients, and `control.sock`. Service modules
+own target-side durable service state and stream/application bindings; they do
+not parse raw LMUX frames.
+
+## Carriers
+
+A carrier is only the ordered full-duplex byte-stream substrate under LMUX/2.
+LMUX framing, CRC, HELLO/session convergence, stream lifecycle, flow control,
+services, PTY, rendezvous, and LXF live above it.
+
+Current carrier backends are:
+
+- TTY/path: `--carrier /dev/ttyACM0`, `--carrier /dev/ttyGS0`
+- inherited fd: `--carrier-fd FD`
+- Unix test carrier: `--carrier-listen PATH`, `--carrier-connect PATH`
+
+TTY/path carriers reopen the configured path after real loss. Inherited-fd
+carriers do not reopen by path; loss ends that carrier instance. Unix
+listen/connect is for integration tests and local development, not a production
+RPC listener.
 
 ## Target Startup
 
@@ -99,7 +145,7 @@ Ctrl-Z, go to the remote PTY. Local control uses Ctrl-T:
 
 ```text
 Ctrl-T ?       help
-Ctrl-T q/.     disconnect
+Ctrl-T q/.     detach
 Ctrl-T Ctrl-T  send literal Ctrl-T
 Ctrl-T p       upload file   HOST -> TARGET
 Ctrl-T g       download file TARGET -> HOST

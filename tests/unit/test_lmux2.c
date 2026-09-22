@@ -1,4 +1,6 @@
 #include "lmux2_core.h"
+#include "lmux2_control.h"
+#include "lmux2_service.h"
 #include "lmux.h"
 
 #include <stdio.h>
@@ -148,6 +150,130 @@ static int test_codec(void)
     if (lmux2_encode_frame(&fr, enc, sizeof(enc), &enc_len) < 0 ||
         lmux2_decode_frame(enc, enc_len - 1, &out) < 0 || out.type != 42)
         return fail("unknown non-critical codec handling");
+    return 0;
+}
+
+static int test_control_codec(void)
+{
+    struct lmux2_frame fr;
+    struct lmux2_control_view cv;
+    uint8_t tlv[128];
+    size_t off = 0;
+    const uint8_t *p;
+    uint16_t len;
+    uint8_t u8;
+    char name[V2_NAME_MAX];
+    static const uint8_t exact_ensure[] = {
+        0x01, 0x02, 0x00, 0x00,
+        0x78, 0x56, 0x34, 0x12,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x09, 0x00,
+        'c', 'o', 'n', 's', 'o', 'l', 'e', '1', 0x00,
+        0x02, 0x00, 0x01, 0x00,
+        0x02,
+        0x06, 0x00, 0x08, 0x00,
+        '/', 'b', 'i', 'n', '/', 's', 'h', 0x00,
+        0x07, 0x00, 0x01, 0x00,
+        0x01
+    };
+    static const uint8_t exact_ok[] = {
+        0x01, 0x03, 0x00, 0x00,
+        0x04, 0x00, 0x00, 0x00,
+        0xef, 0xcd, 0xab, 0x89,
+        0x67, 0x45, 0x23, 0x01,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x04, 0x00,
+        'g', 'd', 'b', 0x00,
+        0x02, 0x00, 0x01, 0x00,
+        0x01,
+        0x03, 0x00, 0x12, 0x00,
+        '/', 't', 'm', 'p', '/', 'l', 'm', 'u', 'x', '-',
+        'g', 'd', 'b', '.', 's', 'o', 'c', 'k'
+    };
+
+    if (lmux2_control_put_tlv(tlv, sizeof(tlv), &off, V2_TLV_NAME,
+                              "console1", 9) < 0 ||
+        lmux2_control_put_u8(tlv, sizeof(tlv), &off, V2_TLV_SERVICE_TYPE,
+                             V2_SERVICE_PTY) < 0 ||
+        lmux2_control_put_tlv(tlv, sizeof(tlv), &off, V2_TLV_ARGV,
+                              "/bin/sh", 8) < 0 ||
+        lmux2_control_put_u8(tlv, sizeof(tlv), &off, V2_TLV_SUPERVISED, 1) < 0)
+        return fail("CONTROL build SERVICE_ENSURE TLVs");
+    if (lmux2_control_make_frame(V2_CTRL_SERVICE_ENSURE, 0x12345678, 0, 0,
+                                 tlv, (uint16_t)off, &fr) < 0)
+        return fail("CONTROL make SERVICE_ENSURE");
+    if (fr.payload_len != sizeof(exact_ensure) ||
+        memcmp(fr.payload, exact_ensure, sizeof(exact_ensure)) != 0)
+        return fail("CONTROL SERVICE_ENSURE wire bytes");
+    if (lmux2_control_parse_frame(&fr, &cv) < 0 ||
+        cv.kind != V2_CTRL_SERVICE_ENSURE ||
+        cv.req_id != 0x12345678 ||
+        cv.service_id != 0 ||
+        cv.token != 0)
+        return fail("CONTROL parse valid envelope");
+    if (lmux2_control_tlv_string(&cv, V2_TLV_NAME, name, sizeof(name)) < 0 ||
+        strcmp(name, "console1") != 0 ||
+        lmux2_control_tlv_u8(&cv, V2_TLV_SERVICE_TYPE, &u8) < 0 ||
+        u8 != V2_SERVICE_PTY)
+        return fail("CONTROL TLV parse fields");
+
+    fr.payload_len = LMUX2_CONTROL_HEADER_LEN - 1;
+    if (lmux2_control_parse_frame(&fr, &cv) == 0)
+        return fail("CONTROL truncated envelope rejection");
+    fr.payload_len = sizeof(exact_ensure);
+    fr.payload[2] = 1;
+    if (lmux2_control_parse_frame(&fr, &cv) == 0)
+        return fail("CONTROL reserved field rejection");
+    fr.payload[2] = 0;
+
+    off = 0;
+    if (lmux2_control_put_tlv(tlv, sizeof(tlv), &off, 99, "x", 1) < 0 ||
+        lmux2_control_put_u8(tlv, sizeof(tlv), &off, V2_TLV_SERVICE_TYPE,
+                             V2_SERVICE_FILE) < 0 ||
+        lmux2_control_put_tlv(tlv, sizeof(tlv), &off, 100, "yz", 2) < 0 ||
+        lmux2_control_make_frame(V2_CTRL_FACTORY_REPORT, 0, 0, 0,
+                                 tlv, (uint16_t)off, &fr) < 0 ||
+        lmux2_control_parse_frame(&fr, &cv) < 0 ||
+        !lmux2_control_has_service_type(&cv, V2_SERVICE_FILE) ||
+        lmux2_control_tlv_find(&cv, V2_TLV_SERVICE_TYPE, &p, &len) != 1 ||
+        len != 1 || p[0] != V2_SERVICE_FILE)
+        return fail("CONTROL unknown TLV skip/multiple TLVs");
+    fr.payload[LMUX2_CONTROL_HEADER_LEN + 12] = 0xff;
+    if (lmux2_control_parse_frame(&fr, &cv) < 0 ||
+        lmux2_control_tlv_find(&cv, V2_TLV_WINSIZE, &p, &len) != -1)
+        return fail("CONTROL malformed TLV length rejection");
+
+    off = 0;
+    if (lmux2_control_put_tlv(tlv, sizeof(tlv), &off, V2_TLV_NAME,
+                              "gdb", 4) < 0 ||
+        lmux2_control_put_u8(tlv, sizeof(tlv), &off, V2_TLV_SERVICE_TYPE,
+                             V2_SERVICE_UNIX_RENDEZVOUS) < 0 ||
+        lmux2_control_put_tlv(tlv, sizeof(tlv), &off, V2_TLV_TARGET_PATH,
+                              "/tmp/lmux-gdb.sock", 18) < 0 ||
+        lmux2_control_make_frame(V2_CTRL_SERVICE_OK, 4,
+                                 0x0123456789abcdefULL, 0,
+                                 tlv, (uint16_t)off, &fr) < 0)
+        return fail("CONTROL build SERVICE_OK");
+    if (fr.payload_len != sizeof(exact_ok) ||
+        memcmp(fr.payload, exact_ok, sizeof(exact_ok)) != 0)
+        return fail("CONTROL SERVICE_OK wire bytes");
+
+    off = 0;
+    if (lmux2_control_put_u8(tlv, sizeof(tlv), &off, V2_TLV_EVENT,
+                             V2_EVENT_PENDING_CLIENT) < 0 ||
+        lmux2_control_make_frame(V2_CTRL_SERVICE_EVENT, 0, 55, 0xaabbccddULL,
+                                 tlv, (uint16_t)off, &fr) < 0 ||
+        lmux2_control_parse_frame(&fr, &cv) < 0 ||
+        cv.kind != V2_CTRL_SERVICE_EVENT ||
+        cv.service_id != 55 ||
+        cv.token != 0xaabbccddULL ||
+        lmux2_control_tlv_u8(&cv, V2_TLV_EVENT, &u8) < 0 ||
+        u8 != V2_EVENT_PENDING_CLIENT)
+        return fail("CONTROL SERVICE_EVENT token representation");
     return 0;
 }
 
@@ -630,6 +756,7 @@ static int test_unknown_frames(void)
 int main(void)
 {
     if (test_codec() ||
+        test_control_codec() ||
         test_handshake() ||
         test_stream_ids() ||
         test_stream_lifecycle() ||

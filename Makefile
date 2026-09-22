@@ -6,7 +6,16 @@ TARGET_STRIP := $(CROSS_COMPILE)strip
 GEN_DIR := build/generated
 GEN_VERSION := $(GEN_DIR)/version.h
 
-COMMON_CFLAGS := -std=c11 -D_GNU_SOURCE -Wall -Wextra -I$(GEN_DIR)
+SRC_DIR := src
+CARRIER_DIR := $(SRC_DIR)/carrier
+TRANSPORT_DIR := $(SRC_DIR)/transport
+RUNTIME_DIR := $(SRC_DIR)/runtime
+SERVICES_DIR := $(SRC_DIR)/services
+HOST_SUBSYS_DIR := $(SRC_DIR)/host
+UNIT_TEST_DIR := tests/unit
+INTEGRATION_TEST_DIR := tests/integration
+
+COMMON_CFLAGS := -std=c11 -D_GNU_SOURCE -Wall -Wextra -I$(GEN_DIR) -I$(SRC_DIR) -I$(CARRIER_DIR) -I$(TRANSPORT_DIR) -I$(RUNTIME_DIR) -I$(SERVICES_DIR) -I$(HOST_SUBSYS_DIR)
 HOST_CFLAGS ?= -O2
 TARGET_CFLAGS ?= -Os -march=armv5te -marm -mfloat-abi=soft
 TARGET_LDFLAGS := -static
@@ -14,22 +23,42 @@ TARGET_LDFLAGS := -static
 HOST_DIR := build/host
 TARGET_DIR := build/target
 
-COMMON_SRC := protocol.c lxf.c
-LMUX2_SRC := lmux2_protocol.c lmux2_core.c
-LMUX2_RUNTIME_SRC := lmux2_runtime.c
-VERSION_INPUTS := VERSION Makefile lmux.c lmuxd.c lmux.h lxf.c lxf.h protocol.c lmux2_protocol.c lmux2_protocol.h lmux2_core.c lmux2_core.h lmux2_runtime.c lmux2_runtime.h test_protocol.c test_lmux2.c test_lmux2_integration.c test_lmux2_pty_integration.c test_lmux2_file_integration.c test_lmux_client.c
+LMUX := $(SRC_DIR)/lmux.c
+LXF_SRC := $(SRC_DIR)/lxf.c
+LXF_HDR := $(SRC_DIR)/lxf.h
+LMUXD := $(RUNTIME_DIR)/lmuxd.c
+COMMON_SRC := $(TRANSPORT_DIR)/protocol.c $(LXF_SRC)
+LMUX2_SRC := $(TRANSPORT_DIR)/lmux2_protocol.c $(TRANSPORT_DIR)/lmux2_core.c $(TRANSPORT_DIR)/lmux2_control.c
+CARRIER_SRC := $(CARRIER_DIR)/carrier.c $(CARRIER_DIR)/carrier_tty.c $(CARRIER_DIR)/carrier_fd.c $(CARRIER_DIR)/carrier_unix.c
+SERVICES_SRC := $(SERVICES_DIR)/services.c $(SERVICES_DIR)/service_pty.c $(SERVICES_DIR)/service_unix.c $(SERVICES_DIR)/service_file.c
+HOST_SUBSYS_SRC := $(HOST_SUBSYS_DIR)/host_services.c $(HOST_SUBSYS_DIR)/host_endpoints.c $(HOST_SUBSYS_DIR)/host_control.c
+LMUX2_RUNTIME_SRC := $(RUNTIME_DIR)/lmux2_runtime.c
+CARRIER_HDRS := $(CARRIER_DIR)/carrier.h
+TRANSPORT_HDRS := $(TRANSPORT_DIR)/lmux.h $(TRANSPORT_DIR)/lmux2_protocol.h $(TRANSPORT_DIR)/lmux2_core.h $(TRANSPORT_DIR)/lmux2_control.h $(TRANSPORT_DIR)/lmux2_service.h
+SERVICES_HDRS := $(SERVICES_DIR)/services.h
+HOST_SUBSYS_HDRS := $(HOST_SUBSYS_DIR)/host.h
+RUNTIME_HDRS := $(RUNTIME_DIR)/lmux2_runtime.h
+TEST_PROTOCOL := $(UNIT_TEST_DIR)/test_protocol.c
+TEST_LMUX2 := $(UNIT_TEST_DIR)/test_lmux2.c
+TEST_LMUX_CLIENT := $(UNIT_TEST_DIR)/test_lmux_client.c
+TEST_CARRIER := $(UNIT_TEST_DIR)/test_carrier.c
+TEST_LMUX2_INTEGRATION := $(INTEGRATION_TEST_DIR)/test_lmux2_integration.c
+TEST_LMUX2_PTY_INTEGRATION := $(INTEGRATION_TEST_DIR)/test_lmux2_pty_integration.c
+TEST_LMUX2_FILE_INTEGRATION := $(INTEGRATION_TEST_DIR)/test_lmux2_file_integration.c
+VERSION_INPUTS := VERSION Makefile $(LMUX) $(LMUXD) $(TRANSPORT_HDRS) $(CARRIER_HDRS) $(SERVICES_HDRS) $(HOST_SUBSYS_HDRS) $(LXF_SRC) $(LXF_HDR) $(COMMON_SRC) $(LMUX2_SRC) $(CARRIER_SRC) $(SERVICES_SRC) $(HOST_SUBSYS_SRC) $(LMUX2_RUNTIME_SRC) $(RUNTIME_HDRS) $(TEST_PROTOCOL) $(TEST_LMUX2) $(TEST_CARRIER) $(TEST_LMUX2_INTEGRATION) $(TEST_LMUX2_PTY_INTEGRATION) $(TEST_LMUX2_FILE_INTEGRATION) $(TEST_LMUX_CLIENT)
 
 .PHONY: all host target strip-target clean selftest new-build bump-version
 
 all: host target
 
-host: $(HOST_DIR)/lmuxd $(HOST_DIR)/lmux $(HOST_DIR)/test_protocol $(HOST_DIR)/test_lmux2 $(HOST_DIR)/test_lmux2_integration $(HOST_DIR)/test_lmux2_pty_integration $(HOST_DIR)/test_lmux2_file_integration $(HOST_DIR)/test_lmux_client
+host: $(HOST_DIR)/lmuxd $(HOST_DIR)/lmux $(HOST_DIR)/test_protocol $(HOST_DIR)/test_lmux2 $(HOST_DIR)/test_carrier $(HOST_DIR)/test_lmux2_integration $(HOST_DIR)/test_lmux2_pty_integration $(HOST_DIR)/test_lmux2_file_integration $(HOST_DIR)/test_lmux_client
 
 target: $(TARGET_DIR)/lmuxd $(TARGET_DIR)/lmux $(TARGET_DIR)/test_lmux2
 
-selftest: $(HOST_DIR)/lmuxd $(HOST_DIR)/lmux $(HOST_DIR)/test_protocol $(HOST_DIR)/test_lmux2 $(HOST_DIR)/test_lmux2_integration $(HOST_DIR)/test_lmux2_pty_integration $(HOST_DIR)/test_lmux2_file_integration $(HOST_DIR)/test_lmux_client
+selftest: $(HOST_DIR)/lmuxd $(HOST_DIR)/lmux $(HOST_DIR)/test_protocol $(HOST_DIR)/test_lmux2 $(HOST_DIR)/test_carrier $(HOST_DIR)/test_lmux2_integration $(HOST_DIR)/test_lmux2_pty_integration $(HOST_DIR)/test_lmux2_file_integration $(HOST_DIR)/test_lmux_client
 	$(HOST_DIR)/test_protocol
 	$(HOST_DIR)/test_lmux2
+	$(HOST_DIR)/test_carrier
 	$(HOST_DIR)/test_lmux_client
 	$(HOST_DIR)/test_lmux2_integration
 	$(HOST_DIR)/test_lmux2_pty_integration
@@ -49,38 +78,41 @@ new-build bump-version:
 	rm -f $(GEN_VERSION) $(GEN_DIR)/version.txt
 	$(MAKE) $(GEN_VERSION)
 
-$(HOST_DIR)/lmuxd: lmuxd.c $(COMMON_SRC) $(LMUX2_SRC) $(LMUX2_RUNTIME_SRC) lmux.h lxf.h lmux2_protocol.h lmux2_core.h lmux2_runtime.h $(GEN_VERSION) | $(HOST_DIR)
-	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ lmuxd.c $(COMMON_SRC) $(LMUX2_SRC) $(LMUX2_RUNTIME_SRC)
+$(HOST_DIR)/lmuxd: $(LMUXD) $(COMMON_SRC) $(LMUX2_SRC) $(CARRIER_SRC) $(SERVICES_SRC) $(HOST_SUBSYS_SRC) $(LMUX2_RUNTIME_SRC) $(TRANSPORT_HDRS) $(CARRIER_HDRS) $(SERVICES_HDRS) $(HOST_SUBSYS_HDRS) $(LXF_HDR) $(RUNTIME_HDRS) $(GEN_VERSION) | $(HOST_DIR)
+	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(LMUXD) $(COMMON_SRC) $(LMUX2_SRC) $(CARRIER_SRC) $(SERVICES_SRC) $(HOST_SUBSYS_SRC) $(LMUX2_RUNTIME_SRC)
 
-$(HOST_DIR)/lmux: lmux.c $(COMMON_SRC) lmux.h lxf.h $(GEN_VERSION) | $(HOST_DIR)
-	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ lmux.c $(COMMON_SRC)
+$(HOST_DIR)/lmux: $(LMUX) $(COMMON_SRC) $(TRANSPORT_DIR)/lmux.h $(LXF_HDR) $(GEN_VERSION) | $(HOST_DIR)
+	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(LMUX) $(COMMON_SRC)
 
-$(HOST_DIR)/test_protocol: test_protocol.c $(COMMON_SRC) lmux.h lxf.h $(GEN_VERSION) | $(HOST_DIR)
-	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ test_protocol.c $(COMMON_SRC)
+$(HOST_DIR)/test_protocol: $(TEST_PROTOCOL) $(COMMON_SRC) $(TRANSPORT_DIR)/lmux.h $(LXF_HDR) $(GEN_VERSION) | $(HOST_DIR)
+	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_PROTOCOL) $(COMMON_SRC)
 
-$(HOST_DIR)/test_lmux2: test_lmux2.c $(COMMON_SRC) $(LMUX2_SRC) lmux.h lxf.h lmux2_protocol.h lmux2_core.h $(GEN_VERSION) | $(HOST_DIR)
-	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ test_lmux2.c $(COMMON_SRC) $(LMUX2_SRC)
+$(HOST_DIR)/test_lmux2: $(TEST_LMUX2) $(COMMON_SRC) $(LMUX2_SRC) $(TRANSPORT_HDRS) $(LXF_HDR) $(GEN_VERSION) | $(HOST_DIR)
+	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_LMUX2) $(COMMON_SRC) $(LMUX2_SRC)
 
-$(HOST_DIR)/test_lmux2_integration: test_lmux2_integration.c $(COMMON_SRC) lmux2_protocol.c lmux.h lmux2_protocol.h $(GEN_VERSION) | $(HOST_DIR)
-	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ test_lmux2_integration.c $(COMMON_SRC) lmux2_protocol.c
+$(HOST_DIR)/test_carrier: $(TEST_CARRIER) $(CARRIER_SRC) $(CARRIER_HDRS) $(GEN_VERSION) | $(HOST_DIR)
+	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_CARRIER) $(CARRIER_SRC)
 
-$(HOST_DIR)/test_lmux2_pty_integration: test_lmux2_pty_integration.c $(GEN_VERSION) | $(HOST_DIR)
-	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ test_lmux2_pty_integration.c
+$(HOST_DIR)/test_lmux2_integration: $(TEST_LMUX2_INTEGRATION) $(COMMON_SRC) $(TRANSPORT_DIR)/lmux2_protocol.c $(TRANSPORT_DIR)/lmux.h $(TRANSPORT_DIR)/lmux2_protocol.h $(GEN_VERSION) | $(HOST_DIR)
+	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_LMUX2_INTEGRATION) $(COMMON_SRC) $(TRANSPORT_DIR)/lmux2_protocol.c
 
-$(HOST_DIR)/test_lmux2_file_integration: test_lmux2_file_integration.c $(COMMON_SRC) lmux.h lxf.h $(GEN_VERSION) | $(HOST_DIR)
-	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ test_lmux2_file_integration.c $(COMMON_SRC)
+$(HOST_DIR)/test_lmux2_pty_integration: $(TEST_LMUX2_PTY_INTEGRATION) $(GEN_VERSION) | $(HOST_DIR)
+	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_LMUX2_PTY_INTEGRATION)
 
-$(HOST_DIR)/test_lmux_client: test_lmux_client.c lmux.c $(COMMON_SRC) lmux.h lxf.h $(GEN_VERSION) | $(HOST_DIR)
-	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ test_lmux_client.c $(COMMON_SRC)
+$(HOST_DIR)/test_lmux2_file_integration: $(TEST_LMUX2_FILE_INTEGRATION) $(COMMON_SRC) $(TRANSPORT_DIR)/lmux.h $(LXF_HDR) $(GEN_VERSION) | $(HOST_DIR)
+	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_LMUX2_FILE_INTEGRATION) $(COMMON_SRC)
 
-$(TARGET_DIR)/lmuxd: lmuxd.c $(COMMON_SRC) $(LMUX2_SRC) $(LMUX2_RUNTIME_SRC) lmux.h lxf.h lmux2_protocol.h lmux2_core.h lmux2_runtime.h $(GEN_VERSION) | $(TARGET_DIR)
-	$(TARGET_CC) $(COMMON_CFLAGS) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) -o $@ lmuxd.c $(COMMON_SRC) $(LMUX2_SRC) $(LMUX2_RUNTIME_SRC)
+$(HOST_DIR)/test_lmux_client: $(TEST_LMUX_CLIENT) $(LMUX) $(COMMON_SRC) $(TRANSPORT_DIR)/lmux.h $(LXF_HDR) $(GEN_VERSION) | $(HOST_DIR)
+	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_LMUX_CLIENT) $(COMMON_SRC)
 
-$(TARGET_DIR)/lmux: lmux.c $(COMMON_SRC) lmux.h lxf.h $(GEN_VERSION) | $(TARGET_DIR)
-	$(TARGET_CC) $(COMMON_CFLAGS) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) -o $@ lmux.c $(COMMON_SRC)
+$(TARGET_DIR)/lmuxd: $(LMUXD) $(COMMON_SRC) $(LMUX2_SRC) $(CARRIER_SRC) $(SERVICES_SRC) $(HOST_SUBSYS_SRC) $(LMUX2_RUNTIME_SRC) $(TRANSPORT_HDRS) $(CARRIER_HDRS) $(SERVICES_HDRS) $(HOST_SUBSYS_HDRS) $(LXF_HDR) $(RUNTIME_HDRS) $(GEN_VERSION) | $(TARGET_DIR)
+	$(TARGET_CC) $(COMMON_CFLAGS) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) -o $@ $(LMUXD) $(COMMON_SRC) $(LMUX2_SRC) $(CARRIER_SRC) $(SERVICES_SRC) $(HOST_SUBSYS_SRC) $(LMUX2_RUNTIME_SRC)
 
-$(TARGET_DIR)/test_lmux2: test_lmux2.c $(COMMON_SRC) $(LMUX2_SRC) lmux.h lxf.h lmux2_protocol.h lmux2_core.h $(GEN_VERSION) | $(TARGET_DIR)
-	$(TARGET_CC) $(COMMON_CFLAGS) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) -o $@ test_lmux2.c $(COMMON_SRC) $(LMUX2_SRC)
+$(TARGET_DIR)/lmux: $(LMUX) $(COMMON_SRC) $(TRANSPORT_DIR)/lmux.h $(LXF_HDR) $(GEN_VERSION) | $(TARGET_DIR)
+	$(TARGET_CC) $(COMMON_CFLAGS) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) -o $@ $(LMUX) $(COMMON_SRC)
+
+$(TARGET_DIR)/test_lmux2: $(TEST_LMUX2) $(COMMON_SRC) $(LMUX2_SRC) $(TRANSPORT_HDRS) $(LXF_HDR) $(GEN_VERSION) | $(TARGET_DIR)
+	$(TARGET_CC) $(COMMON_CFLAGS) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) -o $@ $(TEST_LMUX2) $(COMMON_SRC) $(LMUX2_SRC)
 
 strip-target: target
 	$(TARGET_STRIP) $(TARGET_DIR)/lmuxd $(TARGET_DIR)/lmux
