@@ -1,44 +1,68 @@
 # LMUX Wire
 
-LMUX Wire is a lightweight userspace multiplexer for carrying multiple logical byte streams over one serial-like transport. The CLI client is `lmux`, the foreground daemon is `lmuxd`, the transport protocol is LMUX/1, and the channel-4 file-transfer protocol is LXF/1.
+LMUX Wire is a lightweight userspace multiplexer for embedded Linux. The
+foreground daemon is `lmuxd`, the CLI client is `lmux`, and the runtime wire
+transport is LMUX/2.
 
-Current features include supervised interactive PTY consoles, raw stream channels for uses such as GDB, built-in file transfer with HOST/TARGET path semantics, Ctrl-T terminal controls, TARGET shell cwd awareness, and transfer progress reporting.
+LMUX/2 carries services and transient byte streams over one full-duplex carrier.
+The transport knows about factories, services, streams, bytes, flow control,
+framing, and lifecycle. Application protocols such as LXF remain opaque bytes on
+top of streams.
 
-## Channel Layout
+LMUX/1 was the historical fixed-channel predecessor and remains useful only as a
+git-history reference point.
 
-- channel 1: interactive console 1
-- channel 2: interactive console 2
-- channel 3: generic raw stream, intended for GDB
-- channel 4: file-transfer stream
+## Runtime Model
 
-LMUX/1 still uses COBS framing, CRC-16/CCITT-FALSE, HELLO/OPEN/CLOSE/DATA/CREDIT/RESET, fixed 1024-byte per-channel RX/TX rings, and round-robin DATA scheduling. `LMUX_MAX_PAYLOAD` remains 256 bytes.
+The target daemon advertises bounded built-in factories:
+
+- `pty`
+- `unix-rendezvous`
+- `file`
+
+The host daemon owns desired topology and ensures durable services by name:
+
+- `console1`: `pty`, `/bin/sh`, supervised
+- `console2`: `pty`, `/bin/sh`, supervised
+- `gdb`: `unix-rendezvous`, target socket `/tmp/lmux-gdb.sock`
+- `files`: `file`
+
+Host-side sockets for the default deployment are:
+
+- `/run/lmux/console1.sock`
+- `/run/lmux/console2.sock`
+- `/run/lmux/gdb.sock`
+- `/run/lmux/file.sock`
+- `/run/lmux/control.sock`
+
+Service names are durable identities inside one target worker lifetime.
+`service_id` values are runtime handles in that worker lifetime. `stream_id`
+values are transient and connection-local; a physical reconnect creates a fresh
+stream-id namespace and old streams cannot be reused.
 
 ## Programs
 
 - `lmuxd`: foreground daemon owning the physical carrier.
-- `lmux term [-v|--verbose] [--remote-dir DIR] [--channel 1|2] [1|2|SOCKET]`: raw terminal client with local Ctrl-T prefix controls. With no argument it uses `/run/lmux/console1.sock`; `1` and `2` select the default console sockets.
-- `lmux status [--control SOCKET]`: query the local host daemon status/control socket.
+- `lmux term [-v|--verbose] [--remote-dir DIR] [--channel 1|2] [1|2|SOCKET]`:
+  raw terminal client with local Ctrl-T prefix controls.
+- `lmux status [--control SOCKET]`: query the local host daemon status socket.
 - `lmux connect SOCKET`: binary-clean stdin/stdout socket bridge.
-- `lmux exec SOCKET -- PROGRAM [ARGS...]`: dup2s a socket to child stdin/stdout and execs directly.
-- `lmux put [OPTIONS] HOST_SRC [TARGET_DST]`: upload, HOST -> TARGET.
-- `lmux get [OPTIONS] TARGET_SRC [HOST_DST]`: download, TARGET -> HOST.
+- `lmux exec SOCKET -- PROGRAM [ARGS...]`: dup2s a socket to child stdin/stdout
+  and execs directly.
+- `lmux put [OPTIONS] HOST_SRC [TARGET_DST]`: upload, HOST to TARGET.
+- `lmux get [OPTIONS] TARGET_SRC [HOST_DST]`: download, TARGET to HOST.
 
 ## Target Startup
 
-Normal DSO target startup is one supervised `lmuxd`:
+The target daemon is zero-config with respect to service topology. It owns the
+carrier and advertises factories; the host decides which services should exist.
 
 ```sh
-/root/lmux/lmuxd \
-  --carrier /dev/ttyGS0 \
-  --shell 1:/dev/lmux1 \
-  --shell 2:/dev/lmux2 \
-  --socket 3:/tmp/lmux-gdb.sock \
-  --file 4
+/root/lmux/lmuxd --role target --carrier /dev/ttyGS0
 ```
 
-`--shell` creates a Unix98 PTY, creates the stable symlink, spawns `/bin/sh` on the slave side, reaps it, and respawns it after about one second if it exits. The shell belongs to the local `lmuxd` lifetime, so host detach, USB reconnect, or remote CLOSE do not kill the console session. On daemon shutdown, managed shells receive SIGHUP and are reaped with a bounded SIGKILL fallback.
-
-The included target wrapper waits for `/dev/ttyGS0` and execs foreground `lmuxd`:
+The included target wrapper waits for `/dev/ttyGS0` and execs foreground
+`lmuxd`:
 
 ```sh
 /root/lmux/lmux-start
@@ -50,26 +74,28 @@ Intended BusyBox init entry:
 ::respawn:/root/lmux/lmux-start
 ```
 
-No separate getty or console scripts are needed for normal deployment. `--pty` remains available as a generic PTY endpoint.
+No separate getty or console scripts are needed for normal deployment.
 
 ## Host Startup
 
 ```sh
 mkdir -p /run/lmux
 /mnt/linfiles/SourceCode/lmux/build/host/lmuxd \
+  --role host \
   --carrier /dev/ttyACM0 \
   --control /run/lmux/control.sock \
-  --socket 1:/run/lmux/console1.sock \
-  --socket 2:/run/lmux/console2.sock \
-  --socket 3:/run/lmux/gdb.sock \
-  --socket 4:/run/lmux/file.sock
+  --pty console1:/run/lmux/console1.sock:/bin/sh \
+  --pty console2:/run/lmux/console2.sock:/bin/sh \
+  --unix gdb:/run/lmux/gdb.sock:/tmp/lmux-gdb.sock \
+  --file files:/run/lmux/file.sock
 ```
 
-`start-host.sh` starts this layout and cleans stale owned sockets including `file.sock`.
+`start-host.sh` starts this topology and cleans stale owned sockets.
 
 ## Terminal Prefix
 
-`lmux term` puts the local tty in raw mode. Ordinary bytes, including Ctrl-C and Ctrl-Z, go to the remote PTY. Local control uses Ctrl-T:
+`lmux term` puts the local tty in raw mode. Ordinary bytes, including Ctrl-C and
+Ctrl-Z, go to the remote PTY. Local control uses Ctrl-T:
 
 ```text
 Ctrl-T ?       help
@@ -79,23 +105,33 @@ Ctrl-T p       upload file   HOST -> TARGET
 Ctrl-T g       download file TARGET -> HOST
 ```
 
-Unknown Ctrl-T combinations preserve input by sending literal Ctrl-T and the following byte.
+Ctrl-T `p` and `g` temporarily restore the HOST terminal to canonical mode,
+prompt for paths, run the same LXF file service used by `lmux put/get`, then
+restore raw mode and resume the same console socket. The console stream is not
+closed.
 
-Ctrl-T `p` and `g` temporarily restore the HOST terminal to canonical mode, prompt for paths, run the same channel-4 PUT/GET engine used by `lmux put/get`, then restore raw mode and resume the same console socket. The console socket is not closed. During the modal transfer, console output is naturally backpressured by its LMUX channel while file data uses channel 4.
-
-`lmux term` and `lmux term 1` use console context 1. `lmux term 2` uses console context 2. For a custom socket, add `--channel 1` or `--channel 2` if Ctrl-T file operations should query that TARGET shell's current working directory:
+`lmux term` and `lmux term 1` use console context 1. `lmux term 2` uses console
+context 2. For a custom socket, add `--channel 1` or `--channel 2` if Ctrl-T file
+operations should query that TARGET shell's current working directory:
 
 ```sh
 lmux term --channel 2 /custom/console.sock
 ```
 
-Ctrl-T PUT/GET display the HOST current working directory and the TARGET base directory. The TARGET base comes from `--remote-dir DIR`, then absolute `LMUX_REMOTE_DIR`, then the supervised TARGET shell cwd queried through channel 4, then `/root`.
+Ctrl-T PUT/GET display the HOST current working directory and the TARGET base
+directory. The TARGET base comes from `--remote-dir DIR`, then absolute
+`LMUX_REMOTE_DIR`, then the supervised TARGET shell cwd queried through the file
+service, then `/root`.
 
-`lmux term` sends the initial terminal size and later SIGWINCH changes as LMUX channel metadata. The target daemon applies those sizes to the supervised PTY with `TIOCSWINSZ`; resize metadata is not injected into the shell byte stream.
+`lmux term` sends the initial terminal size and later SIGWINCH changes to the
+host daemon control socket. The host forwards resize control to the matching
+PTY service, and the target applies it with `TIOCSWINSZ`; resize metadata is not
+injected into the shell byte stream.
 
 ## Status
 
-Host `lmuxd` can expose a local-only control socket, normally `/run/lmux/control.sock` when started by `start-host.sh`.
+Host `lmuxd` can expose a local-only control socket, normally
+`/run/lmux/control.sock` when started by `start-host.sh`.
 
 ```sh
 lmux status
@@ -106,12 +142,15 @@ Example output:
 ```text
 LMUX Wire
 local:  0.1.0+build.N
-peer:   0.1.0+build.M
-wire:   LMUX/1
+wire:   LMUX/2
+role:   host
 link:   established
-features: FILE CWD WINSIZE STREAM_GEN
-peer-features: FILE CWD WINSIZE STREAM_GEN
-ch1 socket active local=open peer=open tx=0 rx=0 session=1 peer_session=1
+control: connected
+services:
+  console1 pty id=...
+  console2 pty id=...
+  gdb unix-rendezvous id=...
+  files file id=...
 ```
 
 ## GDB
@@ -128,30 +167,9 @@ Host GDB:
 target remote /run/lmux/gdb.sock
 ```
 
-Real-world attach example:
-
-```sh
-# TARGET
-PID=$(pidof phoenix)
-lmux exec /tmp/lmux-gdb.sock -- gdbserver --attach stdio "$PID"
-
-# HOST
-gdb-multiarch phoenix
-```
-
-Inside GDB:
-
-```text
-target remote /run/lmux/gdb.sock
-info threads
-info registers
-continue
-detach
-```
-
-Channel 3 remains a generic raw stream; there is no GDB-specific daemon logic. GDB's raw all-stop interrupt byte, `0x03`, is transported as ordinary channel data, so Ctrl-C should stop the inferior while it is running.
-
-Generic Unix socket channels are rendezvous streams. Either side may connect first and wait for the peer application later. Each accepted application stream has its own session generation so a stale CLOSE from an older stream cannot terminate a newly accepted client; configured listeners remain alive for repeated sessions.
+The `gdb` service is a generic Unix rendezvous service. There is no GDB-specific
+daemon logic. GDB's raw all-stop interrupt byte, `0x03`, is transported as
+ordinary stream data.
 
 ## File Transfer
 
@@ -163,9 +181,13 @@ Host file socket default:
 
 Override with `-S SOCKET` or `--socket SOCKET`.
 
-HOST paths refer to the machine running `lmux`. TARGET paths refer to the filesystem served by target `lmuxd`. Relative HOST paths resolve against the HOST process cwd. Relative TARGET paths resolve against the TARGET base directory: `--remote-dir`, absolute `LMUX_REMOTE_DIR`, queried TARGET shell cwd for `--channel`, or `/root`.
+HOST paths refer to the machine running `lmux`. TARGET paths refer to the
+filesystem served by target `lmuxd`. Relative HOST paths resolve against the
+HOST process cwd. Relative TARGET paths resolve against the TARGET base
+directory: `--remote-dir`, absolute `LMUX_REMOTE_DIR`, queried TARGET shell cwd
+for `--channel`, or `/root`.
 
-Upload, HOST -> TARGET:
+Upload, HOST to TARGET:
 
 ```sh
 lmux put ./lmuxd
@@ -174,7 +196,7 @@ lmux put --mode 0755 ./lmuxd /root/lmux/lmuxd.new
 lmux put - /tmp/stdin.bin
 ```
 
-Download, TARGET -> HOST:
+Download, TARGET to HOST:
 
 ```sh
 lmux get log.log
@@ -183,24 +205,16 @@ lmux get /tmp/output.bin -
 lmux get -S /custom/file.sock /tmp/foo ./foo
 ```
 
-`--channel 1` or `--channel 2` selects which supervised TARGET shell cwd is queried for relative TARGET paths. Explicit absolute paths remain unchanged. Directory recursion and automatic parent-directory creation are not supported.
+`--channel 1` or `--channel 2` selects which supervised TARGET shell cwd is
+queried for relative TARGET paths. Explicit absolute paths remain unchanged.
+Directory recursion and automatic parent-directory creation are not supported.
 
-When stderr is a TTY, transfers show a compact progress line such as:
+When stderr is a TTY, transfers show a compact progress line. Use `-v` or
+`--verbose` with `lmux put`, `lmux get`, or `lmux term` for detailed progress.
+Progress is always written to stderr. `lmux get TARGET -` keeps downloaded bytes
+on stdout only.
 
-```text
-PUT [############------------] 50%
-GET [##################------] 75%
-```
-
-Use `-v` or `--verbose` with `lmux put`, `lmux get`, or `lmux term` for detailed Ctrl-T transfer progress:
-
-```text
-PUT [############------] 67%  344.8 KiB/512.0 KiB  2.37 MiB/s  elapsed 12s  ETA 6s
-```
-
-Progress is always written to stderr. Non-TTY stderr does not receive carriage-return animation, preserving script and MCP-friendly logs. `lmux get TARGET -` keeps downloaded bytes on stdout only.
-
-The file service uses the LXF/1 application protocol on channel 4:
+The file service uses the LXF/1 application protocol over the `files` service:
 
 ```text
 magic "LXF1"
@@ -211,9 +225,20 @@ u32 payload_length LE
 payload
 ```
 
-PUT streams into a temporary regular file in the destination directory using `O_CREAT|O_EXCL`, verifies byte count and SHA-256, applies the requested mode, fsyncs, and atomically renames over the final path. Existing regular files may be replaced; symlinks, directories, devices, FIFOs, and sockets are rejected using final-component `lstat()` checks.
+PUT streams into a temporary regular file in the destination directory using
+`O_CREAT|O_EXCL`, verifies byte count and SHA-256, applies the requested mode,
+fsyncs, and atomically renames over the final path. Existing regular files may
+be replaced; symlinks, directories, devices, FIFOs, and sockets are rejected
+using final-component `lstat()` checks.
 
-GET requires a TARGET regular file, streams DATA records, and sends DONE with byte count and SHA-256. HOST `lmux get` writes to a same-directory temp file and atomically renames on successful verification. For `HOST_DST = -`, data goes directly to stdout and all diagnostics stay on stderr.
+GET requires a TARGET regular file, streams DATA records, and sends DONE with
+byte count and SHA-256. HOST `lmux get` writes to a same-directory temp file and
+atomically renames on successful verification. For `HOST_DST = -`, data goes
+directly to stdout and all diagnostics stay on stderr.
+
+CWD support currently belongs to the LXF/frontend path: `LXF_T_CWD_REQUEST`
+maps console context 1 or 2 to PTY services `console1` or `console2` and reads
+`/proc/<shell-pid>/cwd` on the target. It does not parse shell prompts.
 
 ## Build
 
@@ -225,7 +250,8 @@ make target
 make strip-target
 ```
 
-Target builds use `arm-linux-gnueabi-gcc`, ARMv5TE, soft-float, and static linking.
+Target builds use `arm-linux-gnueabi-gcc`, ARMv5TE, soft-float, and static
+linking.
 
 ## Version
 
@@ -234,19 +260,40 @@ lmux --version
 lmuxd --version
 ```
 
-Version strings use `BASE+build.N`, for example `0.1.0+build.37`. `BASE` comes from `VERSION`; `N` is a persistent monotonic build number shared by `lmux`, `lmuxd`, and the host/target binaries from the same build cycle.
+Version strings use `BASE+build.N`, for example `0.1.0+build.104`. `BASE` comes
+from `VERSION`; `N` is a persistent monotonic build number shared by `lmux`,
+`lmuxd`, and the host/target binaries from the same build cycle.
 
-Human-facing version output includes the project name, for example `lmux 0.1.0+build.37 (LMUX Wire)`.
+Human-facing version output includes the project name, for example
+`lmux 0.1.0+build.104 (LMUX Wire)`.
 
-## Reconnect And Reset
+## Reconnect
 
-On carrier open, `lmuxd` applies raw termios, flushes tty queues, generates a new local session, and starts HELLO. Before HELLO, stale malformed frames and stale OPEN/CREDIT/DATA are discarded without RESET. After establishment, protocol faults remain strict. HELLO responses are ordered before OPEN advertisements so one peer losing the first HELLO cannot deadlock startup.
+Physical carrier reconnect is distinct from service lifetime. When a physical
+LMUX/2 connection is lost, all transient streams become terminal and stream IDs
+restart in the new connection namespace. Durable target services may survive
+inside the same daemon process. Host startup/reconnect performs discovery,
+receives the service snapshot, reconciles desired services by name, and opens
+new transient streams.
+
+PTY services keep the supervised `/bin/sh` process across stream detach and
+carrier reconnect while the target daemon remains alive. File transfers are
+transient: an active LXF transfer aborts on physical disconnect and the durable
+`files` service remains usable after reconnect.
 
 ## Limits
 
-- Exactly four fixed LMUX/1 channels.
-- `LMUX_MAX_PAYLOAD = 256`.
-- Per-channel LMUX RX/TX rings are 1024 bytes.
-- LXF DATA payloads are bounded to 4096 bytes and are streamed through the normal LMUX scheduler.
+- `LMUX2_MAX_STREAMS = 16`.
+- Per-stream RX/TX rings are 1024 bytes.
+- Connection receive window is 4096 bytes.
+- Control/lifecycle queue capacity is 32 frames.
+- Maximum LMUX/2 frame payload is 512 bytes.
+- Service registry capacity is 8 services.
+- Host desired service capacity is 8 services.
+- Per-service binding capacity is 8 bindings.
+- Runtime poll table capacity is 64 fds.
+- LXF DATA payloads are bounded to 4096 bytes and are streamed through normal
+  LMUX/2 flow control.
 - Internal paths are bounded to 255 bytes.
-- No authentication, encryption, compression, TCP, retransmission, directory recursion, or remote command protocol.
+- No authentication, encryption, compression, TCP, retransmission, directory
+  recursion, or remote command protocol.

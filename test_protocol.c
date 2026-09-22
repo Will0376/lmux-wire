@@ -13,10 +13,9 @@ int main(void)
 {
     const uint8_t check[] = "123456789";
     uint8_t all[256];
-    uint8_t enc[LMUX_MAX_ENCODED];
-    uint8_t dec[LMUX_MAX_DECODED];
+    uint8_t enc[512];
+    uint8_t dec[512];
     size_t enc_len = 0, dec_len = 0;
-    struct lmux_frame fr, out;
     int i;
     struct sha256_ctx sha;
     uint8_t digest[32];
@@ -35,28 +34,6 @@ int main(void)
         return fail("COBS decode");
     if (dec_len != sizeof(all) || memcmp(dec, all, sizeof(all)) != 0)
         return fail("COBS round-trip");
-
-    memset(&fr, 0, sizeof(fr));
-    fr.version = LMUX_VERSION;
-    fr.type = LMUX_T_DATA;
-    fr.channel = 2;
-    fr.sequence = 0x1234;
-    fr.payload_len = sizeof(all);
-    memcpy(fr.payload, all, sizeof(all));
-    if (lmux_encode_frame(&fr, enc, sizeof(enc), &enc_len) < 0)
-        return fail("frame encode");
-    if (enc[enc_len - 1] != 0)
-        return fail("frame delimiter");
-    if (lmux_decode_frame(enc, enc_len - 1, &out) < 0)
-        return fail("frame decode");
-    if (out.type != fr.type || out.channel != fr.channel ||
-        out.sequence != fr.sequence || out.payload_len != fr.payload_len ||
-        memcmp(out.payload, fr.payload, fr.payload_len) != 0)
-        return fail("frame round-trip");
-
-    enc[3] ^= 0x55;
-    if (lmux_decode_frame(enc, enc_len - 1, &out) == 0)
-        return fail("bad CRC rejection");
 
     sha256_init(&sha);
     sha256_update(&sha, check, 9);

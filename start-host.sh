@@ -57,12 +57,13 @@ rm -f \
 umask 000
 
 nohup "$LMUXD" \
+--role host \
 --carrier "$CARRIER" \
 --control "$RUNDIR/control.sock" \
---socket 1:"$RUNDIR/console1.sock" \
---socket 2:"$RUNDIR/console2.sock" \
---socket 3:"$RUNDIR/gdb.sock" \
---socket 4:"$RUNDIR/file.sock" \
+--pty console1:"$RUNDIR/console1.sock":/bin/sh \
+--pty console2:"$RUNDIR/console2.sock":/bin/sh \
+--unix gdb:"$RUNDIR/gdb.sock":/tmp/lmux-gdb.sock \
+--file files:"$RUNDIR/file.sock" \
 --verbose \
 >"$LOG" 2>&1 &
 

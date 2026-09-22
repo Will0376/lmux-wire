@@ -1,0 +1,723 @@
+#include "lxf.h"
+#include "lmux.h"
+
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+static int fail(const char *msg)
+{
+    fprintf(stderr, "lmux2 file integration failed: %s\n", msg);
+    return 1;
+}
+
+static long long now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int wait_fd_event(int fd, short events, int timeout_ms)
+{
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = events;
+    pfd.revents = 0;
+    return poll(&pfd, 1, timeout_ms) > 0 ? pfd.revents : 0;
+}
+
+static int connect_unix_test(const char *path)
+{
+    int fd, err = 0;
+    socklen_t errlen = sizeof(err);
+    struct sockaddr_un sa;
+    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (fd < 0)
+        return -1;
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    strcpy(sa.sun_path, path);
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        if (errno != EINPROGRESS ||
+            !(wait_fd_event(fd, POLLOUT | POLLERR | POLLHUP | POLLNVAL, 1000) & POLLOUT) ||
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0 || err != 0) {
+            close(fd);
+            return -1;
+        }
+    }
+    return fd;
+}
+
+static int wait_connect(const char *path, int timeout_ms)
+{
+    long long end = now_ms() + timeout_ms;
+    while (now_ms() < end) {
+        int fd = connect_unix_test(path);
+        if (fd >= 0)
+            return fd;
+        usleep(20000);
+    }
+    return -1;
+}
+
+static int wait_path_exists(const char *path, int timeout_ms)
+{
+    long long end = now_ms() + timeout_ms;
+    while (now_ms() < end) {
+        struct stat st;
+        if (lstat(path, &st) == 0)
+            return 0;
+        usleep(20000);
+    }
+    return -1;
+}
+
+static int write_all(int fd, const void *buf, size_t len)
+{
+    const unsigned char *p = buf;
+    while (len) {
+        ssize_t w = write(fd, p, len);
+        if (w > 0) {
+            p += w;
+            len -= (size_t)w;
+        } else if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            (void)wait_fd_event(fd, POLLOUT, 1000);
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int read_exact(int fd, void *buf, size_t len, int timeout_ms)
+{
+    unsigned char *p = buf;
+    long long end = now_ms() + timeout_ms;
+    while (len && now_ms() < end) {
+        int re = wait_fd_event(fd, POLLIN | POLLHUP | POLLERR | POLLNVAL, 100);
+        ssize_t r;
+        if (!(re & POLLIN)) {
+            if (re & (POLLHUP | POLLERR | POLLNVAL))
+                return -1;
+            continue;
+        }
+        r = read(fd, p, len);
+        if (r > 0) {
+            p += r;
+            len -= (size_t)r;
+        } else if (r == 0) {
+            return -1;
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            return -1;
+        }
+    }
+    return len == 0 ? 0 : -1;
+}
+
+static int send_record_frag(int fd, uint8_t type, const uint8_t *payload,
+                            uint32_t len, size_t frag)
+{
+    uint8_t rec[LXF_MAX_RECORD];
+    size_t out_len, off = 0;
+    if (lxf_encode_record(type, 0, payload, len, rec, sizeof(rec), &out_len) < 0)
+        return -1;
+    if (frag == 0)
+        frag = out_len;
+    while (off < out_len) {
+        size_t n = out_len - off;
+        if (n > frag)
+            n = frag;
+        if (write_all(fd, rec + off, n) < 0)
+            return -1;
+        off += n;
+    }
+    return 0;
+}
+
+static int recv_record(int fd, uint8_t *type, uint8_t *payload, uint32_t *len)
+{
+    uint8_t hdr[LXF_HEADER_LEN], flags;
+    if (read_exact(fd, hdr, sizeof(hdr), 10000) < 0 ||
+        lxf_decode_header(hdr, sizeof(hdr), type, &flags, len) < 0)
+        return -1;
+    (void)flags;
+    if (*len > LXF_MAX_PAYLOAD)
+        return -1;
+    return read_exact(fd, payload, *len, 10000);
+}
+
+static void fill_pattern(uint8_t *p, size_t len, unsigned seed)
+{
+    size_t i;
+    for (i = 0; i < len; i++)
+        p[i] = (uint8_t)((i * 33u + seed + (i >> 3)) & 0xffu);
+}
+
+static int read_file_alloc(const char *path, uint8_t **out, size_t *len)
+{
+    int fd = open(path, O_RDONLY);
+    struct stat st;
+    uint8_t *p;
+    size_t off = 0;
+    if (fd < 0 || fstat(fd, &st) < 0 || st.st_size < 0) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    p = malloc((size_t)st.st_size + 1);
+    if (!p) {
+        close(fd);
+        return -1;
+    }
+    while (off < (size_t)st.st_size) {
+        ssize_t r = read(fd, p + off, (size_t)st.st_size - off);
+        if (r > 0)
+            off += (size_t)r;
+        else if (r == 0)
+            break;
+        else if (errno != EINTR) {
+            free(p);
+            close(fd);
+            return -1;
+        }
+    }
+    close(fd);
+    *out = p;
+    *len = off;
+    return 0;
+}
+
+static int put_data(const char *sock, const char *target, const uint8_t *data,
+                    size_t len, int bad_hash, size_t frag)
+{
+    int fd = wait_connect(sock, 5000);
+    uint8_t payload[LXF_MAX_PAYLOAD], got[LXF_MAX_PAYLOAD], digest[32], type;
+    uint32_t rlen;
+    struct sha256_ctx sha;
+    size_t off = 0;
+    if (fd < 0 || strlen(target) + 1 > sizeof(payload) - 16)
+        return -1;
+    lmux_put_le32(payload, 0644);
+    lmux_put_le64(payload + 4, (uint64_t)len);
+    lmux_put_le32(payload + 12, LXF_F_SIZE_KNOWN);
+    strcpy((char *)payload + 16, target);
+    if (send_record_frag(fd, LXF_T_PUT_REQUEST, payload,
+                         (uint32_t)(16 + strlen(target) + 1), frag) < 0 ||
+        recv_record(fd, &type, got, &rlen) < 0 || type != LXF_T_OK) {
+        fprintf(stderr, "put %s initial response type=%u len=%u errno=%d\n",
+                target, type, rlen, errno);
+        close(fd);
+        return -1;
+    }
+    sha256_init(&sha);
+    while (off < len) {
+        size_t n = len - off;
+        if (n > LXF_MAX_PAYLOAD)
+            n = LXF_MAX_PAYLOAD;
+        sha256_update(&sha, data + off, n);
+        if (send_record_frag(fd, LXF_T_DATA, data + off, (uint32_t)n, frag) < 0) {
+            close(fd);
+            return -1;
+        }
+        off += n;
+    }
+    sha256_final(&sha, digest);
+    if (bad_hash)
+        digest[0] ^= 0x55;
+    lmux_put_le64(payload, (uint64_t)len);
+    memcpy(payload + 8, digest, 32);
+    if (send_record_frag(fd, LXF_T_DONE, payload, 40, frag) < 0 ||
+        recv_record(fd, &type, got, &rlen) < 0) {
+        fprintf(stderr, "put %s completion read failed errno=%d\n", target, errno);
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    if (bad_hash)
+        return type == LXF_T_ERROR ? 0 : -1;
+    return type == LXF_T_OK && rlen >= 40 && lmux_get_le64(got) == (uint64_t)len ? 0 : -1;
+}
+
+static int get_data(const char *sock, const char *target, uint8_t **out, size_t *out_len,
+                    size_t frag)
+{
+    int fd = wait_connect(sock, 5000);
+    uint8_t payload[LXF_MAX_PAYLOAD], got[LXF_MAX_PAYLOAD], type, digest[32], rdigest[32];
+    uint32_t len;
+    uint64_t expected, count = 0, done_count;
+    uint8_t *buf = NULL;
+    size_t cap = 0;
+    struct sha256_ctx sha;
+    if (fd < 0 || strlen(target) + 1 > sizeof(payload))
+        return -1;
+    strcpy((char *)payload, target);
+    if (send_record_frag(fd, LXF_T_GET_REQUEST, payload,
+                         (uint32_t)(strlen(target) + 1), frag) < 0 ||
+        recv_record(fd, &type, got, &len) < 0 || type != LXF_T_OK || len < 16) {
+        close(fd);
+        return -1;
+    }
+    expected = lmux_get_le64(got + 4);
+    cap = (size_t)expected + 1;
+    buf = malloc(cap ? cap : 1);
+    if (!buf) {
+        close(fd);
+        return -1;
+    }
+    sha256_init(&sha);
+    for (;;) {
+        if (recv_record(fd, &type, got, &len) < 0) {
+            free(buf);
+            close(fd);
+            return -1;
+        }
+        if (type == LXF_T_DATA) {
+            if (count + len > expected) {
+                free(buf);
+                close(fd);
+                return -1;
+            }
+            memcpy(buf + count, got, len);
+            sha256_update(&sha, got, len);
+            count += len;
+        } else if (type == LXF_T_DONE) {
+            if (len < 40) {
+                free(buf);
+                close(fd);
+                return -1;
+            }
+            done_count = lmux_get_le64(got);
+            sha256_final(&sha, digest);
+            memcpy(rdigest, got + 8, 32);
+            close(fd);
+            if (done_count != count || count != expected || memcmp(digest, rdigest, 32) != 0) {
+                free(buf);
+                return -1;
+            }
+            *out = buf;
+            *out_len = (size_t)count;
+            return 0;
+        } else {
+            free(buf);
+            close(fd);
+            return -1;
+        }
+    }
+}
+
+static int shell_cmd_expect(int fd, const char *cmd, const char *needle)
+{
+    char buf[4096];
+    size_t len = 0;
+    long long end = now_ms() + 5000;
+    if (write_all(fd, cmd, strlen(cmd)) < 0 || write_all(fd, "\n", 1) < 0)
+        return -1;
+    while (now_ms() < end) {
+        int re = wait_fd_event(fd, POLLIN | POLLHUP | POLLERR | POLLNVAL, 100);
+        ssize_t r;
+        if (re & POLLIN) {
+            if (len + 1 >= sizeof(buf))
+                return -1;
+            r = read(fd, buf + len, sizeof(buf) - len - 1);
+            if (r > 0) {
+                len += (size_t)r;
+                buf[len] = 0;
+                if (strstr(buf, needle))
+                    return 0;
+            } else if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                return -1;
+            }
+        }
+        if (re & (POLLHUP | POLLERR | POLLNVAL))
+            return -1;
+    }
+    return -1;
+}
+
+static int count_fds(pid_t pid)
+{
+    char path[128];
+    DIR *dir;
+    struct dirent *de;
+    int n = 0;
+    snprintf(path, sizeof(path), "/proc/%ld/fd", (long)pid);
+    dir = opendir(path);
+    if (!dir)
+        return -1;
+    while ((de = readdir(dir)) != NULL)
+        if (strcmp(de->d_name, ".") != 0 && strcmp(de->d_name, "..") != 0)
+            n++;
+    closedir(dir);
+    return n;
+}
+
+static int count_temp_files(const char *dir)
+{
+    DIR *d = opendir(dir);
+    struct dirent *de;
+    int n = 0;
+    if (!d)
+        return -1;
+    while ((de = readdir(d)) != NULL)
+        if (strstr(de->d_name, ".lmux-tmp-"))
+            n++;
+    closedir(d);
+    return n;
+}
+
+static void stop_child(pid_t pid)
+{
+    long long end;
+    if (pid <= 0)
+        return;
+    kill(pid, SIGTERM);
+    end = now_ms() + 1000;
+    while (now_ms() < end) {
+        if (waitpid(pid, NULL, WNOHANG) == pid)
+            return;
+        usleep(20000);
+    }
+    kill(pid, SIGKILL);
+    (void)waitpid(pid, NULL, 0);
+}
+
+static int run_lmux_cli(char *const argv[])
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        int dn = open("/dev/null", O_WRONLY);
+        if (dn >= 0) {
+            dup2(dn, STDOUT_FILENO);
+            dup2(dn, STDERR_FILENO);
+            if (dn > STDERR_FILENO)
+                close(dn);
+        }
+        execv("build/host/lmux", argv);
+        _exit(127);
+    }
+    if (pid > 0) {
+        int st;
+        if (waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0)
+            return 0;
+    }
+    return -1;
+}
+
+static pid_t spawn_target(const char *carrier)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (getenv("LMUX2_IT_VERBOSE"))
+            execl("build/host/lmuxd", "lmuxd", "--role", "target",
+                  "--carrier-listen", carrier, "--verbose", (char *)NULL);
+        else
+            execl("build/host/lmuxd", "lmuxd", "--role", "target",
+                  "--carrier-listen", carrier, (char *)NULL);
+        _exit(127);
+    }
+    return pid;
+}
+
+static pid_t spawn_host(const char *carrier, const char *pty1, const char *pty2,
+                        const char *gdb, const char *file1, const char *file_dup,
+                        const char *file_conflict)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (getenv("LMUX2_IT_VERBOSE"))
+            execl("build/host/lmuxd", "lmuxd", "--role", "host",
+                  "--carrier-connect", carrier, "--verbose",
+                  "--pty", pty1, "--pty", pty2,
+                  "--unix", gdb,
+                  "--file", file1, "--file", file_dup,
+                  "--pty", file_conflict, (char *)NULL);
+        else
+            execl("build/host/lmuxd", "lmuxd", "--role", "host",
+                  "--carrier-connect", carrier,
+                  "--pty", pty1, "--pty", pty2,
+                  "--unix", gdb,
+                  "--file", file1, "--file", file_dup,
+                  "--pty", file_conflict, (char *)NULL);
+        _exit(127);
+    }
+    return pid;
+}
+
+static int integration_test(void)
+{
+    char dir[] = "/tmp/lmux2-file-it-XXXXXX";
+    char carrier[160], c1[160], c2[160], gdb[512], gdb_host[160], gdb_target[160];
+    char file_sock[160], file_bad_sock[160];
+    char pty1[512], pty2[512], file_arg[320], file_dup[320], file_conflict[320];
+    char target_zero[160], target_norm[160], target_large[160], target_bad[160], target_abort[160];
+    char target_get0[160], target_get_large[160], target_reconnect[160], target_cli[160];
+    char cli_src[160], cli_dst[160];
+    pid_t target = -1, host = -1;
+    int fd1 = -1, gfd = -1, rc = 1;
+    int host_fd_base = -1, target_fd_base = -1;
+    uint8_t *data = NULL, *got = NULL;
+    size_t got_len;
+    const char *where = "setup";
+
+    if (!mkdtemp(dir))
+        return fail("mkdtemp");
+    snprintf(carrier, sizeof(carrier), "%s/carrier.sock", dir);
+    snprintf(c1, sizeof(c1), "%s/console1.sock", dir);
+    snprintf(c2, sizeof(c2), "%s/console2.sock", dir);
+    snprintf(gdb_host, sizeof(gdb_host), "%s/gdb.sock", dir);
+    snprintf(gdb_target, sizeof(gdb_target), "%s/target-gdb.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(file_bad_sock, sizeof(file_bad_sock), "%s/file-bad.sock", dir);
+    snprintf(pty1, sizeof(pty1), "console1:%s:/bin/sh", c1);
+    snprintf(pty2, sizeof(pty2), "console2:%s:/bin/sh", c2);
+    snprintf(gdb, sizeof(gdb), "gdb:%s:%s", gdb_host, gdb_target);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+    snprintf(file_dup, sizeof(file_dup), "files:%s", file_sock);
+    snprintf(file_conflict, sizeof(file_conflict), "files:%s:/bin/false", file_bad_sock);
+    snprintf(target_zero, sizeof(target_zero), "%s/zero.bin", dir);
+    snprintf(target_norm, sizeof(target_norm), "%s/normal.bin", dir);
+    snprintf(target_large, sizeof(target_large), "%s/large.bin", dir);
+    snprintf(target_bad, sizeof(target_bad), "%s/bad.bin", dir);
+    snprintf(target_abort, sizeof(target_abort), "%s/abort.bin", dir);
+    snprintf(target_get0, sizeof(target_get0), "%s/get0.bin", dir);
+    snprintf(target_get_large, sizeof(target_get_large), "%s/get-large.bin", dir);
+    snprintf(target_reconnect, sizeof(target_reconnect), "%s/reconnect.bin", dir);
+    snprintf(target_cli, sizeof(target_cli), "%s/cli.bin", dir);
+    snprintf(cli_src, sizeof(cli_src), "%s/cli-src.bin", dir);
+    snprintf(cli_dst, sizeof(cli_dst), "%s/cli-dst.bin", dir);
+
+    target = spawn_target(carrier);
+    if (target < 0 || wait_path_exists(carrier, 8000) < 0)
+        goto out;
+    host = spawn_host(carrier, pty1, pty2, gdb, file_arg, file_dup, file_conflict);
+    if (host < 0)
+        goto out;
+
+    where = "listeners";
+    fd1 = wait_connect(c1, 10000);
+    gfd = wait_connect(gdb_host, 10000);
+    if (fd1 < 0 || gfd < 0 || wait_path_exists(file_sock, 10000) < 0)
+        goto out;
+    close(gfd); gfd = -1;
+    if (access(file_bad_sock, F_OK) == 0)
+        goto out;
+    host_fd_base = count_fds(host);
+    target_fd_base = count_fds(target);
+
+    where = "CWD request";
+    {
+        int fd = wait_connect(file_sock, 5000);
+        uint8_t req = 1, reply[LXF_MAX_PAYLOAD], type;
+        uint32_t rlen;
+        if (fd < 0 ||
+            send_record_frag(fd, LXF_T_CWD_REQUEST, &req, 1, 1) < 0 ||
+            recv_record(fd, &type, reply, &rlen) < 0 ||
+            type != LXF_T_CWD_REPLY || rlen < 2 || memchr(reply, 0, rlen) == NULL ||
+            reply[0] != '/') {
+            if (fd >= 0) close(fd);
+            goto out;
+        }
+        close(fd);
+    }
+
+    where = "zero PUT";
+    if (put_data(file_sock, target_zero, (const uint8_t *)"", 0, 0, 7) < 0)
+        goto out;
+    if (read_file_alloc(target_zero, &got, &got_len) < 0 || got_len != 0)
+        goto out;
+    free(got); got = NULL;
+
+    where = "normal PUT";
+    data = malloc(70000);
+    if (!data)
+        goto out;
+    fill_pattern(data, 70000, 17);
+    if (put_data(file_sock, target_norm, data, 3217, 0, 5) < 0 ||
+        read_file_alloc(target_norm, &got, &got_len) < 0 ||
+        got_len != 3217 || memcmp(got, data, got_len) != 0)
+        goto out;
+    free(got); got = NULL;
+
+    where = "large PUT fragmented";
+    fill_pattern(data, 70000, 91);
+    if (put_data(file_sock, target_large, data, 70000, 0, 113) < 0 ||
+        read_file_alloc(target_large, &got, &got_len) < 0 ||
+        got_len != 70000 || memcmp(got, data, got_len) != 0)
+        goto out;
+    free(got); got = NULL;
+
+    where = "lmux CLI put/get";
+    {
+        int fd = open(cli_src, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        char *put_argv[] = { "lmux", "put", "-S", file_sock, cli_src, target_cli, NULL };
+        char *get_argv[] = { "lmux", "get", "-S", file_sock, target_cli, cli_dst, NULL };
+        if (fd < 0 || write_all(fd, "cli-data", 8) < 0) {
+            if (fd >= 0) close(fd);
+            goto out;
+        }
+        close(fd);
+        if (run_lmux_cli(put_argv) < 0 || run_lmux_cli(get_argv) < 0 ||
+            read_file_alloc(cli_dst, &got, &got_len) < 0 ||
+            got_len != 8 || memcmp(got, "cli-data", 8) != 0)
+            goto out;
+        free(got); got = NULL;
+    }
+
+    where = "bad hash preserves destination";
+    if (put_data(file_sock, target_bad, (const uint8_t *)"original", 8, 0, 11) < 0 ||
+        put_data(file_sock, target_bad, (const uint8_t *)"replacement", 11, 1, 3) < 0 ||
+        read_file_alloc(target_bad, &got, &got_len) < 0 ||
+        got_len != 8 || memcmp(got, "original", 8) != 0)
+        goto out;
+    free(got); got = NULL;
+
+    where = "mid PUT abort cleanup";
+    {
+        int fd = wait_connect(file_sock, 5000);
+        uint8_t payload[LXF_MAX_PAYLOAD], reply[LXF_MAX_PAYLOAD], type;
+        uint32_t rlen;
+        if (fd < 0)
+            goto out;
+        lmux_put_le32(payload, 0644);
+        lmux_put_le64(payload + 4, 70000);
+        lmux_put_le32(payload + 12, LXF_F_SIZE_KNOWN);
+        strcpy((char *)payload + 16, target_abort);
+        if (send_record_frag(fd, LXF_T_PUT_REQUEST, payload,
+                             (uint32_t)(16 + strlen(target_abort) + 1), 9) < 0 ||
+            recv_record(fd, &type, reply, &rlen) < 0 || type != LXF_T_OK ||
+            send_record_frag(fd, LXF_T_DATA, data, 4096, 13) < 0) {
+            close(fd);
+            goto out;
+        }
+        close(fd);
+    }
+    usleep(300000);
+    if (access(target_abort, F_OK) == 0 || count_temp_files(dir) != 0)
+        goto out;
+    if (put_data(file_sock, target_abort, (const uint8_t *)"next", 4, 0, 2) < 0)
+        goto out;
+
+    where = "GET zero/large";
+    close(open(target_get0, O_WRONLY | O_CREAT | O_TRUNC, 0644));
+    if (get_data(file_sock, target_get0, &got, &got_len, 4) < 0 || got_len != 0)
+        goto out;
+    free(got); got = NULL;
+    fill_pattern(data, 70000, 133);
+    {
+        int fd = open(target_get_large, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0 || write_all(fd, data, 70000) < 0) {
+            if (fd >= 0) close(fd);
+            goto out;
+        }
+        close(fd);
+    }
+    if (get_data(file_sock, target_get_large, &got, &got_len, 17) < 0 ||
+        got_len != 70000 || memcmp(got, data, got_len) != 0)
+        goto out;
+    free(got); got = NULL;
+
+    where = "bulk file does not starve PTY";
+    {
+        pid_t child = fork();
+        if (child == 0) {
+            uint8_t *cg = NULL;
+            size_t clen = 0;
+            int ok = get_data(file_sock, target_get_large, &cg, &clen, 29) == 0 && clen == 70000;
+            free(cg);
+            _exit(ok ? 0 : 1);
+        }
+        if (child <= 0)
+            goto out;
+        for (int i = 0; i < 10; i++)
+            if (shell_cmd_expect(fd1, "printf 'F''ILEPTY\\n'", "FILEPTY") < 0)
+                goto out;
+        {
+            int st;
+            if (waitpid(child, &st, 0) != child || !WIFEXITED(st) || WEXITSTATUS(st) != 0)
+                goto out;
+        }
+    }
+
+    where = "physical reconnect aborts file transfer";
+    {
+        int fd = wait_connect(file_sock, 5000);
+        uint8_t payload[LXF_MAX_PAYLOAD], reply[LXF_MAX_PAYLOAD], type;
+        uint32_t rlen;
+        if (fd < 0)
+            goto out;
+        lmux_put_le32(payload, 0644);
+        lmux_put_le64(payload + 4, 70000);
+        lmux_put_le32(payload + 12, LXF_F_SIZE_KNOWN);
+        strcpy((char *)payload + 16, target_reconnect);
+        if (send_record_frag(fd, LXF_T_PUT_REQUEST, payload,
+                             (uint32_t)(16 + strlen(target_reconnect) + 1), 7) < 0 ||
+            recv_record(fd, &type, reply, &rlen) < 0 || type != LXF_T_OK ||
+            send_record_frag(fd, LXF_T_DATA, data, 4096, 19) < 0) {
+            close(fd);
+            goto out;
+        }
+        stop_child(host);
+        host = -1;
+        close(fd);
+        close(fd1); fd1 = -1;
+    }
+    usleep(300000);
+    if (access(target_reconnect, F_OK) == 0 || count_temp_files(dir) != 0)
+        goto out;
+    host = spawn_host(carrier, pty1, pty2, gdb, file_arg, file_dup, file_conflict);
+    if (host < 0)
+        goto out;
+    fd1 = wait_connect(c1, 10000);
+    if (fd1 < 0 || wait_path_exists(file_sock, 10000) < 0)
+        goto out;
+    if (put_data(file_sock, target_reconnect, (const uint8_t *)"after", 5, 0, 3) < 0)
+        goto out;
+    host_fd_base = count_fds(host);
+    target_fd_base = count_fds(target);
+
+    where = "fd/temp baseline";
+    usleep(300000);
+    if (count_temp_files(dir) != 0 ||
+        (host_fd_base >= 0 && count_fds(host) != host_fd_base) ||
+        (target_fd_base >= 0 && count_fds(target) != target_fd_base))
+        goto out;
+
+    rc = 0;
+
+out:
+    if (rc)
+        fprintf(stderr, "where: %s\n", where);
+    if (fd1 >= 0) close(fd1);
+    if (gfd >= 0) close(gfd);
+    free(data);
+    free(got);
+    stop_child(host);
+    stop_child(target);
+    unlink(carrier); unlink(c1); unlink(c2); unlink(gdb_host); unlink(gdb_target);
+    unlink(file_sock); unlink(file_bad_sock);
+    unlink(target_zero); unlink(target_norm); unlink(target_large); unlink(target_bad);
+    unlink(target_abort); unlink(target_get0); unlink(target_get_large); unlink(target_reconnect);
+    unlink(target_cli); unlink(cli_src); unlink(cli_dst);
+    rmdir(dir);
+    return rc ? fail(where) : 0;
+}
+
+int main(void)
+{
+    if (integration_test())
+        return 1;
+    puts("lmux2 file integration selftest ok");
+    return 0;
+}
