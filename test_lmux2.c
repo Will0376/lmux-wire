@@ -166,14 +166,41 @@ static int test_handshake(void)
         return fail("make duplicate HELLO");
     if (lmux2_handle_frame(&h, &fr) < 0 || h.state != LMUX2_CONN_ESTABLISHED)
         return fail("duplicate HELLO behavior");
+    if (h.local_conn_id != 0x1111 || h.peer_restart_count != 0)
+        return fail("duplicate HELLO restarted session");
+
+    if (lmux2_open_stream(&h, 77, &fr.stream_id) < 0 || h.next_local_stream_id != 3)
+        return fail("setup peer restart open");
+    memset(&fr, 0, sizeof(fr));
+    fr.type = LMUX2_T_HELLO;
+    if (lmux2_make_hello_payload(LMUX2_ROLE_TARGET, 0x9999, LMUX2_CORE_MAX_STREAMS,
+                                 LMUX2_STREAM_RX_CAP, LMUX2_CONN_RX_CAP,
+                                 fr.payload, &fr.payload_len) < 0)
+        return fail("make peer restart HELLO");
+    if (lmux2_handle_frame(&h, &fr) < 0 ||
+        h.state != LMUX2_CONN_ESTABLISHED ||
+        h.peer_conn_id != 0x9999 ||
+        h.local_conn_id != 0x1112 ||
+        h.next_local_stream_id != 1 ||
+        lmux2_find_stream(&h, 1) ||
+        h.outq_len != 1 ||
+        !h.max_data_dirty ||
+        h.local_max_data != LMUX2_CONN_RX_CAP ||
+        h.peer_restart_count != 1)
+        return fail("different HELLO peer id did not replace session");
 
     lmux2_conn_init(&h, LMUX2_ROLE_HOST, 0x3333);
     memset(&fr, 0, sizeof(fr));
     fr.type = LMUX2_T_STREAM_OPEN;
     fr.stream_id = 2;
     if (lmux2_handle_frame(&h, &fr) < 0 || lmux2_find_stream(&h, 2) ||
-        h.stale_frames == 0)
+        h.stale_frames != 0 || h.pre_established_drops != 1)
         return fail("stream traffic before HELLO");
+    memset(&fr, 0, sizeof(fr));
+    fr.type = LMUX2_T_CONTROL;
+    if (lmux2_handle_frame(&h, &fr) < 0 || h.state != LMUX2_CONN_WAIT_HELLO ||
+        h.stale_frames != 0 || h.pre_established_drops != 2)
+        return fail("control traffic before HELLO");
 
     if (setup_pair(&h, &t) < 0)
         return fail("setup for reconnect");
@@ -389,6 +416,146 @@ static int test_flow_control(void)
     return 0;
 }
 
+static uint8_t bulk_byte(size_t off)
+{
+    return (uint8_t)((off * 33u + (off >> 5) + 0x5au) & 0xffu);
+}
+
+static void fill_sender_tx(struct lmux2_conn *c, uint64_t id, size_t *produced,
+                           size_t total)
+{
+    uint8_t buf[257];
+    while (*produced < total && lmux2_stream_tx_len(c, id) < LMUX2_STREAM_TX_CAP) {
+        size_t n = total - *produced;
+        size_t room = LMUX2_STREAM_TX_CAP - lmux2_stream_tx_len(c, id);
+        size_t j, w;
+        if (n > room)
+            n = room;
+        if (n > sizeof(buf))
+            n = sizeof(buf);
+        for (j = 0; j < n; j++)
+            buf[j] = bulk_byte(*produced + j);
+        w = lmux2_stream_write(c, id, buf, n);
+        if (w == 0)
+            return;
+        *produced += w;
+    }
+}
+
+static int test_flow_control_liveness(void)
+{
+    struct lmux2_conn h, t;
+    struct lmux2_frame fr;
+    struct lmux2_stream *hs, *ts;
+    uint64_t id;
+    size_t produced = 0, consumed = 0;
+    unsigned stream_updates = 0, conn_updates = 0, blocked_cycles = 0;
+    enum { TOTAL = 1024 * 1024 };
+    uint8_t buf[257], got[333];
+    int i;
+
+    for (i = 0; i < (int)sizeof(buf); i++)
+        buf[i] = bulk_byte((size_t)i);
+    if (setup_pair(&h, &t) < 0 || open_host_stream(&h, &t, &id) < 0)
+        return fail("flow liveness setup");
+    hs = lmux2_find_stream(&h, id);
+    ts = lmux2_find_stream(&t, id);
+    if (!hs || !ts)
+        return fail("flow liveness stream lookup");
+    hs->peer_max_stream_data = 256;
+    h.peer_max_data = 256;
+
+    while (consumed < TOTAL) {
+        fill_sender_tx(&h, id, &produced, TOTAL);
+
+        for (;;) {
+            int r = lmux2_next_frame(&h, &fr);
+            if (r < 0)
+                return fail("flow liveness sender next");
+            if (r == 0)
+                break;
+            if (fr.type == LMUX2_T_DATA && lmux2_handle_frame(&t, &fr) < 0)
+                return fail("flow liveness receiver handle DATA");
+            else if (fr.type != LMUX2_T_DATA && lmux2_handle_frame(&t, &fr) < 0)
+                return fail("flow liveness receiver handle non-DATA");
+            if (fr.type == LMUX2_T_DATA)
+                fill_sender_tx(&h, id, &produced, TOTAL);
+        }
+
+        if (lmux2_stream_tx_len(&h, id) > 0 &&
+            (hs->send_offset >= hs->peer_max_stream_data ||
+             h.conn_send_offset >= h.peer_max_data))
+            blocked_cycles++;
+
+        while (lmux2_stream_rx_len(&t, id) > 0) {
+            size_t n = lmux2_stream_read(&t, id, got, sizeof(got));
+            size_t j;
+            if (n == 0)
+                return fail("flow liveness read zero");
+            for (j = 0; j < n; j++)
+                if (got[j] != bulk_byte(consumed + j))
+                    return fail("flow liveness data mismatch");
+            consumed += n;
+
+            for (;;) {
+                int r = lmux2_next_frame(&t, &fr);
+                if (r < 0)
+                    return fail("flow liveness receiver next");
+                if (r == 0)
+                    break;
+                if (fr.type == LMUX2_T_MAX_STREAM_DATA)
+                    stream_updates++;
+                if (fr.type == LMUX2_T_MAX_DATA)
+                    conn_updates++;
+                if (lmux2_handle_frame(&h, &fr) < 0)
+                    return fail("flow liveness sender handle limit");
+            }
+        }
+    }
+
+    if (produced != TOTAL || consumed != TOTAL)
+        return fail("flow liveness incomplete");
+    if (blocked_cycles < 100 || stream_updates < 100 || conn_updates < 100) {
+        fprintf(stderr, "flow liveness counts: blocked=%u stream_updates=%u conn_updates=%u produced=%zu consumed=%zu\n",
+                blocked_cycles, stream_updates, conn_updates, produced, consumed);
+        return fail("flow liveness did not cycle limits");
+    }
+    if (ts->local_max_stream_data != ts->last_sent_max_stream_data ||
+        t.local_max_data != t.last_sent_max_data ||
+        ts->max_stream_data_dirty || t.max_data_dirty)
+        return fail("flow liveness dirty limits not flushed");
+
+    if (setup_pair(&h, &t) < 0 || open_host_stream(&h, &t, &id) < 0)
+        return fail("flow dirty queue setup");
+    for (i = 0; i < LMUX2_OUTQ_CAP; i++) {
+        memset(&fr, 0, sizeof(fr));
+        fr.type = LMUX2_T_CONTROL;
+        if (lmux2_queue_frame(&t, &fr) < 0)
+            return fail("flow dirty queue fill");
+    }
+    if (lmux2_stream_write(&h, id, buf, sizeof(buf)) != sizeof(buf) ||
+        pump_one(&h, &t) < 0)
+        return fail("flow dirty queue data");
+    if (lmux2_stream_read(&t, id, got, sizeof(buf)) != sizeof(buf))
+        return fail("flow dirty queue read");
+    ts = lmux2_find_stream(&t, id);
+    if (!ts || !ts->max_stream_data_dirty || !t.max_data_dirty ||
+        t.state != LMUX2_CONN_ESTABLISHED)
+        return fail("flow dirty queue lost dirty state");
+    for (i = 0; i < LMUX2_OUTQ_CAP; i++) {
+        if (lmux2_next_frame(&t, &fr) != 1 || fr.type != LMUX2_T_CONTROL ||
+            lmux2_handle_frame(&h, &fr) < 0)
+            return fail("flow dirty queue drain");
+    }
+    if (lmux2_next_frame(&t, &fr) != 1 || fr.type != LMUX2_T_MAX_DATA ||
+        lmux2_handle_frame(&h, &fr) < 0)
+        return fail("flow dirty queue max data");
+    if (lmux2_next_frame(&t, &fr) != 1 || fr.type != LMUX2_T_MAX_STREAM_DATA ||
+        lmux2_handle_frame(&h, &fr) < 0)
+        return fail("flow dirty queue max stream data");
+    return 0;
+}
+
 static int test_stale_traffic(void)
 {
     struct lmux2_conn h, t;
@@ -468,6 +635,7 @@ int main(void)
         test_stream_lifecycle() ||
         test_data() ||
         test_flow_control() ||
+        test_flow_control_liveness() ||
         test_stale_traffic() ||
         test_resource_limits() ||
         test_unknown_frames())

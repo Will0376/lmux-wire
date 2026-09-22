@@ -156,7 +156,9 @@ static void reset_transient(struct lmux2_conn *c)
     c->conn_rx_consumed = 0;
     c->local_max_data = 0;
     c->advertised_max_data = 0;
+    c->last_sent_max_data = 0;
     c->peer_max_data = 0;
+    c->max_data_dirty = 0;
     c->rr_next = 0;
 }
 
@@ -230,25 +232,19 @@ static int advertise_conn_limit(struct lmux2_conn *c)
     if (add_overflow_u64(c->conn_rx_consumed, LMUX2_CONN_RX_CAP, &limit) < 0)
         return -1;
     c->local_max_data = limit;
-    if (limit <= c->advertised_max_data)
-        return 0;
-    if (queue_simple(c, LMUX2_T_MAX_DATA, 0, limit) < 0)
-        return -1;
-    c->advertised_max_data = limit;
+    if (limit > c->last_sent_max_data)
+        c->max_data_dirty = 1;
     return 0;
 }
 
-static int advertise_stream_limit(struct lmux2_conn *c, struct lmux2_stream *s)
+static int advertise_stream_limit(struct lmux2_stream *s)
 {
     uint64_t limit;
     if (add_overflow_u64(s->recv_consumed, LMUX2_STREAM_RX_CAP, &limit) < 0)
         return -1;
     s->local_max_stream_data = limit;
-    if (limit <= s->advertised_max_stream_data)
-        return 0;
-    if (queue_simple(c, LMUX2_T_MAX_STREAM_DATA, s->id, limit) < 0)
-        return -1;
-    s->advertised_max_stream_data = limit;
+    if (limit > s->last_sent_max_stream_data)
+        s->max_stream_data_dirty = 1;
     return 0;
 }
 
@@ -258,10 +254,15 @@ static int establish_from_hello(struct lmux2_conn *c, const struct lmux2_hello *
         set_conn_error(c, "peer role matches local role");
         return -1;
     }
-    if (c->state == LMUX2_CONN_ESTABLISHED && c->peer_conn_id == h->conn_id)
+    if (c->state == LMUX2_CONN_ESTABLISHED && c->peer_conn_id == h->conn_id) {
+        if (!c->hello_sent && queue_hello(c) < 0)
+            return -1;
         return 0;
-    if (c->state == LMUX2_CONN_ESTABLISHED && c->peer_conn_id != h->conn_id)
-        reset_transient(c);
+    }
+    if (c->state == LMUX2_CONN_ESTABLISHED && c->peer_conn_id != h->conn_id) {
+        c->peer_restart_count++;
+        lmux2_conn_begin_physical(c, c->local_conn_id + 1);
+    }
     c->state = LMUX2_CONN_ESTABLISHED;
     c->peer_conn_id = h->conn_id;
     if (!c->hello_sent && queue_hello(c) < 0)
@@ -324,7 +325,7 @@ static void handle_stream_open_ok(struct lmux2_conn *c, const struct lmux2_frame
         return;
     }
     s->state = LMUX2_STREAM_OPEN;
-    (void)advertise_stream_limit(c, s);
+    (void)advertise_stream_limit(s);
 }
 
 static void handle_stream_open_error(struct lmux2_conn *c, const struct lmux2_frame *fr)
@@ -460,7 +461,7 @@ int lmux2_handle_frame(struct lmux2_conn *c, const struct lmux2_frame *fr)
         return -1;
     }
     if (fr->type != LMUX2_T_HELLO && c->state != LMUX2_CONN_ESTABLISHED) {
-        c->stale_frames++;
+        c->pre_established_drops++;
         return 0;
     }
 
@@ -516,6 +517,35 @@ int lmux2_next_frame(struct lmux2_conn *c, struct lmux2_frame *fr)
     }
     if (c->state != LMUX2_CONN_ESTABLISHED)
         return 0;
+    if (c->max_data_dirty && c->local_max_data > c->last_sent_max_data) {
+        memset(fr, 0, sizeof(*fr));
+        fr->type = LMUX2_T_MAX_DATA;
+        fr->value = c->local_max_data;
+        c->advertised_max_data = c->local_max_data;
+        c->last_sent_max_data = c->local_max_data;
+        c->max_data_dirty = 0;
+        c->frames_tx++;
+        return 1;
+    }
+    for (n = 0; n < LMUX2_CORE_MAX_STREAMS; n++) {
+        int idx = (c->rr_next + n) % LMUX2_CORE_MAX_STREAMS;
+        struct lmux2_stream *s = &c->streams[idx];
+        if (s->state == LMUX2_STREAM_UNUSED || s->state == LMUX2_STREAM_TERMINAL)
+            continue;
+        if (!s->max_stream_data_dirty ||
+            s->local_max_stream_data <= s->last_sent_max_stream_data)
+            continue;
+        memset(fr, 0, sizeof(*fr));
+        fr->type = LMUX2_T_MAX_STREAM_DATA;
+        fr->stream_id = s->id;
+        fr->value = s->local_max_stream_data;
+        s->advertised_max_stream_data = s->local_max_stream_data;
+        s->last_sent_max_stream_data = s->local_max_stream_data;
+        s->max_stream_data_dirty = 0;
+        c->rr_next = (idx + 1) % LMUX2_CORE_MAX_STREAMS;
+        c->frames_tx++;
+        return 1;
+    }
     for (n = 0; n < LMUX2_CORE_MAX_STREAMS; n++) {
         int idx = (c->rr_next + n) % LMUX2_CORE_MAX_STREAMS;
         struct lmux2_stream *s = &c->streams[idx];
@@ -600,7 +630,7 @@ int lmux2_accept_stream(struct lmux2_conn *c, uint64_t stream_id)
     s->state = LMUX2_STREAM_OPEN;
     if (queue_simple(c, LMUX2_T_STREAM_OPEN_OK, stream_id, 0) < 0)
         return -1;
-    return advertise_stream_limit(c, s);
+    return advertise_stream_limit(s);
 }
 
 int lmux2_reject_stream(struct lmux2_conn *c, uint64_t stream_id, uint32_t error_code)
@@ -671,7 +701,7 @@ size_t lmux2_stream_read(struct lmux2_conn *c, uint64_t stream_id,
         c->conn_rx_consumed += n;
     }
     if (done) {
-        (void)advertise_stream_limit(c, s);
+        (void)advertise_stream_limit(s);
         (void)advertise_conn_limit(c);
     }
     return done;

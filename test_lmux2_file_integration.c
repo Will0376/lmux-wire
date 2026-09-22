@@ -127,6 +127,85 @@ static int read_exact(int fd, void *buf, size_t len, int timeout_ms)
     return len == 0 ? 0 : -1;
 }
 
+static int read_status_snapshot(const char *control, char *buf, size_t cap, int timeout_ms)
+{
+    char req[] = "STATUS\n";
+    size_t len = 0;
+    long long end = now_ms() + timeout_ms;
+    int fd = wait_connect(control, timeout_ms);
+    if (fd < 0)
+        return -1;
+    if (write_all(fd, req, strlen(req)) < 0) {
+        close(fd);
+        return -1;
+    }
+    if (cap)
+        buf[0] = 0;
+    while (now_ms() < end && len + 1 < cap) {
+        int re = wait_fd_event(fd, POLLIN | POLLHUP | POLLERR | POLLNVAL, 100);
+        if (re & POLLIN) {
+            ssize_t r = read(fd, buf + len, cap - len - 1);
+            if (r > 0) {
+                len += (size_t)r;
+                buf[len] = 0;
+            } else if (r == 0) {
+                close(fd);
+                return 0;
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                close(fd);
+                return -1;
+            }
+        }
+        if (re & (POLLHUP | POLLERR | POLLNVAL)) {
+            close(fd);
+            return len ? 0 : -1;
+        }
+    }
+    close(fd);
+    return len ? 0 : -1;
+}
+
+static int parse_conn_ids(const char *status, unsigned long long *local,
+                          unsigned long long *peer)
+{
+    const char *p = strstr(status, "connection:");
+    if (!p)
+        return -1;
+    p = strstr(p, "local_conn=");
+    if (!p)
+        return -1;
+    *local = strtoull(p + 11, NULL, 10);
+    p = strstr(p, "peer_conn=");
+    if (!p)
+        return -1;
+    *peer = strtoull(p + 10, NULL, 10);
+    return 0;
+}
+
+static int status_stream_progress(const char *status, unsigned long long *tx,
+                                  unsigned long long *peer_limit)
+{
+    const char *p = status;
+    int found = 0;
+    *tx = 0;
+    *peer_limit = 0;
+    while ((p = strstr(p, "  id=")) != NULL) {
+        const char *txp = strstr(p, " tx=");
+        const char *plp = strstr(p, " peer_limit=");
+        const char *next = strstr(p + 1, "\n  id=");
+        if (txp && plp && (!next || txp < next) && (!next || plp < next)) {
+            unsigned long long cur_tx = strtoull(txp + 4, NULL, 10);
+            if (!found || cur_tx > *tx) {
+                *tx = cur_tx;
+                *peer_limit = strtoull(plp + 12, NULL, 10);
+                found = 1;
+            }
+        }
+        p++;
+    }
+    return found ? 0 : -1;
+}
+
 static int send_record_frag(int fd, uint8_t type, const uint8_t *payload,
                             uint32_t len, size_t frag)
 {
@@ -415,6 +494,77 @@ static int run_lmux_cli(char *const argv[])
     return -1;
 }
 
+static int monitored_put(const char *control, const char *sock, const char *target,
+                         const uint8_t *data, size_t len)
+{
+    char status[8192];
+    unsigned long long local0 = 0, peer0 = 0, local = 0, peer = 0;
+    int crossed_210225 = 0, crossed_1m = 0, peer_limit_grew = 0;
+    int saw_open = 0, saw_lost = 0;
+    pid_t pid;
+    long long end;
+
+    if (read_status_snapshot(control, status, sizeof(status), 5000) < 0 ||
+        parse_conn_ids(status, &local0, &peer0) < 0 ||
+        local0 == 0 || peer0 == 0) {
+        fprintf(stderr, "monitored_put: initial status failed\n%s\n", status);
+        return -1;
+    }
+
+    pid = fork();
+    if (pid == 0)
+        _exit(put_data(sock, target, data, len, 0, 257) == 0 ? 0 : 1);
+    if (pid <= 0)
+        return -1;
+
+    end = now_ms() + 30000;
+    while (now_ms() < end) {
+        int st;
+        if (read_status_snapshot(control, status, sizeof(status), 1000) == 0) {
+            unsigned long long tx = 0, peer_limit = 0;
+            if (strstr(status, "lost=0") == NULL)
+                saw_lost = 1;
+            if (parse_conn_ids(status, &local, &peer) == 0 &&
+                (local != local0 || peer != peer0))
+                saw_lost = 1;
+            if (status_stream_progress(status, &tx, &peer_limit) == 0) {
+                saw_open = 1;
+                if (tx > 210225)
+                    crossed_210225 = 1;
+                if (tx > 1024 * 1024)
+                    crossed_1m = 1;
+                if (peer_limit > 210225)
+                    peer_limit_grew = 1;
+            }
+        }
+        if (waitpid(pid, &st, WNOHANG) == pid) {
+            if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
+                return fprintf(stderr, "monitored_put: child failed\n"), -1;
+            break;
+        }
+        usleep(10000);
+    }
+    if (now_ms() >= end) {
+        kill(pid, SIGKILL);
+        (void)waitpid(pid, NULL, 0);
+        return fprintf(stderr, "monitored_put: child timed out\n"), -1;
+    }
+    if (read_status_snapshot(control, status, sizeof(status), 5000) < 0 ||
+        parse_conn_ids(status, &local, &peer) < 0 ||
+        local != local0 || peer != peer0 ||
+        strstr(status, "lost=0") == NULL) {
+        fprintf(stderr, "monitored_put: final status failed local0=%llu peer0=%llu\n%s\n",
+                local0, peer0, status);
+        return -1;
+    }
+    if (!(saw_open && crossed_210225 && crossed_1m && peer_limit_grew && !saw_lost)) {
+        fprintf(stderr, "monitored_put: criteria saw_open=%d crossed210225=%d crossed1m=%d peer_limit_grew=%d saw_lost=%d\nlast status:\n%s\n",
+                saw_open, crossed_210225, crossed_1m, peer_limit_grew, saw_lost, status);
+        return -1;
+    }
+    return 0;
+}
+
 static pid_t spawn_target(const char *carrier)
 {
     pid_t pid = fork();
@@ -430,7 +580,8 @@ static pid_t spawn_target(const char *carrier)
     return pid;
 }
 
-static pid_t spawn_host(const char *carrier, const char *pty1, const char *pty2,
+static pid_t spawn_host(const char *carrier, const char *control,
+                        const char *pty1, const char *pty2,
                         const char *gdb, const char *file1, const char *file_dup,
                         const char *file_conflict)
 {
@@ -438,14 +589,14 @@ static pid_t spawn_host(const char *carrier, const char *pty1, const char *pty2,
     if (pid == 0) {
         if (getenv("LMUX2_IT_VERBOSE"))
             execl("build/host/lmuxd", "lmuxd", "--role", "host",
-                  "--carrier-connect", carrier, "--verbose",
+                  "--carrier-connect", carrier, "--control", control, "--verbose",
                   "--pty", pty1, "--pty", pty2,
                   "--unix", gdb,
                   "--file", file1, "--file", file_dup,
                   "--pty", file_conflict, (char *)NULL);
         else
             execl("build/host/lmuxd", "lmuxd", "--role", "host",
-                  "--carrier-connect", carrier,
+                  "--carrier-connect", carrier, "--control", control,
                   "--pty", pty1, "--pty", pty2,
                   "--unix", gdb,
                   "--file", file1, "--file", file_dup,
@@ -458,11 +609,12 @@ static pid_t spawn_host(const char *carrier, const char *pty1, const char *pty2,
 static int integration_test(void)
 {
     char dir[] = "/tmp/lmux2-file-it-XXXXXX";
-    char carrier[160], c1[160], c2[160], gdb[512], gdb_host[160], gdb_target[160];
+    char carrier[160], control[160], c1[160], c2[160], gdb[512], gdb_host[160], gdb_target[160];
     char file_sock[160], file_bad_sock[160];
     char pty1[512], pty2[512], file_arg[320], file_dup[320], file_conflict[320];
-    char target_zero[160], target_norm[160], target_large[160], target_bad[160], target_abort[160];
-    char target_get0[160], target_get_large[160], target_reconnect[160], target_cli[160];
+    char target_zero[160], target_norm[160], target_large[160], target_10_put[160];
+    char target_bad[160], target_abort[160];
+    char target_get0[160], target_get_large[160], target_10_get[160], target_reconnect[160], target_cli[160];
     char cli_src[160], cli_dst[160];
     pid_t target = -1, host = -1;
     int fd1 = -1, gfd = -1, rc = 1;
@@ -474,6 +626,7 @@ static int integration_test(void)
     if (!mkdtemp(dir))
         return fail("mkdtemp");
     snprintf(carrier, sizeof(carrier), "%s/carrier.sock", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
     snprintf(c1, sizeof(c1), "%s/console1.sock", dir);
     snprintf(c2, sizeof(c2), "%s/console2.sock", dir);
     snprintf(gdb_host, sizeof(gdb_host), "%s/gdb.sock", dir);
@@ -489,20 +642,31 @@ static int integration_test(void)
     snprintf(target_zero, sizeof(target_zero), "%s/zero.bin", dir);
     snprintf(target_norm, sizeof(target_norm), "%s/normal.bin", dir);
     snprintf(target_large, sizeof(target_large), "%s/large.bin", dir);
+    snprintf(target_10_put, sizeof(target_10_put), "%s/put-10m.bin", dir);
     snprintf(target_bad, sizeof(target_bad), "%s/bad.bin", dir);
     snprintf(target_abort, sizeof(target_abort), "%s/abort.bin", dir);
     snprintf(target_get0, sizeof(target_get0), "%s/get0.bin", dir);
     snprintf(target_get_large, sizeof(target_get_large), "%s/get-large.bin", dir);
+    snprintf(target_10_get, sizeof(target_10_get), "%s/get-10m.bin", dir);
     snprintf(target_reconnect, sizeof(target_reconnect), "%s/reconnect.bin", dir);
     snprintf(target_cli, sizeof(target_cli), "%s/cli.bin", dir);
     snprintf(cli_src, sizeof(cli_src), "%s/cli-src.bin", dir);
     snprintf(cli_dst, sizeof(cli_dst), "%s/cli-dst.bin", dir);
 
+    host = spawn_host(carrier, control, pty1, pty2, gdb, file_arg, file_dup, file_conflict);
+    if (host < 0)
+        goto out;
+
+    where = "host listeners before peer";
+    if (wait_path_exists(control, 5000) < 0 ||
+        wait_path_exists(c1, 5000) < 0 ||
+        wait_path_exists(gdb_host, 5000) < 0 ||
+        wait_path_exists(file_sock, 5000) < 0 ||
+        access(file_bad_sock, F_OK) == 0)
+        goto out;
+
     target = spawn_target(carrier);
     if (target < 0 || wait_path_exists(carrier, 8000) < 0)
-        goto out;
-    host = spawn_host(carrier, pty1, pty2, gdb, file_arg, file_dup, file_conflict);
-    if (host < 0)
         goto out;
 
     where = "listeners";
@@ -540,7 +704,7 @@ static int integration_test(void)
     free(got); got = NULL;
 
     where = "normal PUT";
-    data = malloc(70000);
+    data = malloc(10 * 1024 * 1024);
     if (!data)
         goto out;
     fill_pattern(data, 70000, 17);
@@ -555,6 +719,14 @@ static int integration_test(void)
     if (put_data(file_sock, target_large, data, 70000, 0, 113) < 0 ||
         read_file_alloc(target_large, &got, &got_len) < 0 ||
         got_len != 70000 || memcmp(got, data, got_len) != 0)
+        goto out;
+    free(got); got = NULL;
+
+    where = "10MiB PUT flow-control stress";
+    fill_pattern(data, 10 * 1024 * 1024, 201);
+    if (monitored_put(control, file_sock, target_10_put, data, 10 * 1024 * 1024) < 0 ||
+        read_file_alloc(target_10_put, &got, &got_len) < 0 ||
+        got_len != 10 * 1024 * 1024 || memcmp(got, data, got_len) != 0)
         goto out;
     free(got); got = NULL;
 
@@ -628,6 +800,21 @@ static int integration_test(void)
         goto out;
     free(got); got = NULL;
 
+    where = "10MiB GET flow-control stress";
+    fill_pattern(data, 10 * 1024 * 1024, 219);
+    {
+        int fd = open(target_10_get, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0 || write_all(fd, data, 10 * 1024 * 1024) < 0) {
+            if (fd >= 0) close(fd);
+            goto out;
+        }
+        close(fd);
+    }
+    if (get_data(file_sock, target_10_get, &got, &got_len, 31) < 0 ||
+        got_len != 10 * 1024 * 1024 || memcmp(got, data, got_len) != 0)
+        goto out;
+    free(got); got = NULL;
+
     where = "bulk file does not starve PTY";
     {
         pid_t child = fork();
@@ -676,7 +863,7 @@ static int integration_test(void)
     usleep(300000);
     if (access(target_reconnect, F_OK) == 0 || count_temp_files(dir) != 0)
         goto out;
-    host = spawn_host(carrier, pty1, pty2, gdb, file_arg, file_dup, file_conflict);
+    host = spawn_host(carrier, control, pty1, pty2, gdb, file_arg, file_dup, file_conflict);
     if (host < 0)
         goto out;
     fd1 = wait_connect(c1, 10000);
@@ -705,10 +892,11 @@ out:
     free(got);
     stop_child(host);
     stop_child(target);
-    unlink(carrier); unlink(c1); unlink(c2); unlink(gdb_host); unlink(gdb_target);
+    unlink(carrier); unlink(control); unlink(c1); unlink(c2); unlink(gdb_host); unlink(gdb_target);
     unlink(file_sock); unlink(file_bad_sock);
-    unlink(target_zero); unlink(target_norm); unlink(target_large); unlink(target_bad);
-    unlink(target_abort); unlink(target_get0); unlink(target_get_large); unlink(target_reconnect);
+    unlink(target_zero); unlink(target_norm); unlink(target_large); unlink(target_10_put);
+    unlink(target_bad); unlink(target_abort); unlink(target_get0); unlink(target_get_large);
+    unlink(target_10_get); unlink(target_reconnect);
     unlink(target_cli); unlink(cli_src); unlink(cli_dst);
     rmdir(dir);
     return rc ? fail(where) : 0;
@@ -716,6 +904,7 @@ out:
 
 int main(void)
 {
+    signal(SIGPIPE, SIG_IGN);
     if (integration_test())
         return 1;
     puts("lmux2 file integration selftest ok");

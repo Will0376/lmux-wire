@@ -178,6 +178,184 @@ static int count_fds(pid_t pid)
     return n;
 }
 
+static void dump_fds(pid_t pid)
+{
+    char path[128], linkpath[512], target[256];
+    DIR *dir;
+    struct dirent *de;
+    snprintf(path, sizeof(path), "/proc/%ld/fd", (long)pid);
+    dir = opendir(path);
+    if (!dir)
+        return;
+    fprintf(stderr, "fds for %ld:\n", (long)pid);
+    while ((de = readdir(dir)) != NULL) {
+        ssize_t n;
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        snprintf(linkpath, sizeof(linkpath), "%s/%s", path, de->d_name);
+        n = readlink(linkpath, target, sizeof(target) - 1);
+        if (n >= 0) {
+            target[n] = 0;
+            fprintf(stderr, "  %s -> %s\n", de->d_name, target);
+        }
+    }
+    closedir(dir);
+}
+
+static int read_status_contains(const char *control, const char *want, int timeout_ms)
+{
+    char req[] = "STATUS\n";
+    char last[4096];
+    long long end = now_ms() + timeout_ms;
+    last[0] = 0;
+    while (now_ms() < end) {
+        char buf[4096];
+        size_t len = 0;
+        int fd = wait_connect(control, 500);
+        if (fd < 0) {
+            usleep(50000);
+            continue;
+        }
+        if (write_all(fd, req, strlen(req)) < 0) {
+            close(fd);
+            usleep(50000);
+            continue;
+        }
+        buf[0] = 0;
+        while (now_ms() < end && len + 1 < sizeof(buf)) {
+            int re = wait_fd_event(fd, POLLIN | POLLHUP | POLLERR | POLLNVAL, 100);
+            ssize_t r;
+            if (re & POLLIN) {
+                r = read(fd, buf + len, sizeof(buf) - len - 1);
+                if (r > 0) {
+                    len += (size_t)r;
+                    buf[len] = 0;
+                    if (strstr(buf, want)) {
+                        close(fd);
+                        return 0;
+                    }
+                }
+            }
+            if (re & (POLLHUP | POLLERR | POLLNVAL))
+                break;
+        }
+        close(fd);
+        snprintf(last, sizeof(last), "%s", buf);
+        usleep(50000);
+    }
+    fprintf(stderr, "status missing '%s':\n%s\n", want, last);
+    return -1;
+}
+
+static int read_status_snapshot(const char *control, char *buf, size_t cap, int timeout_ms)
+{
+    char req[] = "STATUS\n";
+    size_t len = 0;
+    long long end = now_ms() + timeout_ms;
+    int fd = wait_connect(control, timeout_ms);
+    if (fd < 0)
+        return -1;
+    if (write_all(fd, req, strlen(req)) < 0) {
+        close(fd);
+        return -1;
+    }
+    if (cap)
+        buf[0] = 0;
+    while (now_ms() < end && len + 1 < cap) {
+        int re = wait_fd_event(fd, POLLIN | POLLHUP | POLLERR | POLLNVAL, 100);
+        if (re & POLLIN) {
+            ssize_t r = read(fd, buf + len, cap - len - 1);
+            if (r > 0) {
+                len += (size_t)r;
+                buf[len] = 0;
+            } else if (r == 0) {
+                close(fd);
+                return 0;
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                close(fd);
+                return -1;
+            }
+        }
+        if (re & (POLLHUP | POLLERR | POLLNVAL)) {
+            close(fd);
+            return len ? 0 : -1;
+        }
+    }
+    close(fd);
+    return len ? 0 : -1;
+}
+
+static int status_u64_after(const char *buf, const char *key, unsigned long long *out)
+{
+    const char *p = strstr(buf, key);
+    char *endp;
+    if (!p)
+        return -1;
+    p += strlen(key);
+    errno = 0;
+    *out = strtoull(p, &endp, 10);
+    return errno == 0 && endp != p ? 0 : -1;
+}
+
+static int status_service_last_stream(const char *buf, const char *service,
+                                      unsigned long long *out)
+{
+    const char *p = strstr(buf, "\nservices:\n");
+    const char *end;
+    size_t n = strlen(service);
+    if (!p)
+        return -1;
+    end = strstr(p, "\nstreams:\n");
+    while ((p = strstr(p, "\n  ")) != NULL) {
+        if (end && p >= end)
+            break;
+        p += 3;
+        if (strncmp(p, service, n) == 0 && p[n] == ' ') {
+            const char *eol = strchr(p, '\n');
+            const char *k = strstr(p, "last_stream=");
+            if (!k || (eol && k > eol))
+                return -1;
+            return status_u64_after(k, "last_stream=", out);
+        }
+    }
+    return -1;
+}
+
+static int wait_console_stream_id(const char *control, const char *service,
+                                  unsigned long long want_conn,
+                                  unsigned long long want_stream,
+                                  int timeout_ms)
+{
+    char buf[4096], last[4096];
+    unsigned long long last_conn = 0, last_stream = 0;
+    int last_conn_ok = 0, last_stream_ok = 0;
+    long long end = now_ms() + timeout_ms;
+    last[0] = 0;
+    while (now_ms() < end) {
+        unsigned long long conn = 0, stream = 0;
+        if (read_status_snapshot(control, buf, sizeof(buf), 1000) == 0 &&
+            status_u64_after(buf, "local_conn=", &conn) == 0 &&
+            status_service_last_stream(buf, service, &stream) == 0 &&
+            conn == want_conn && stream == want_stream)
+            return 0;
+        last_conn = conn;
+        last_stream = stream;
+        last_conn_ok = status_u64_after(buf, "local_conn=", &conn) == 0;
+        last_stream_ok = status_service_last_stream(buf, service, &stream) == 0;
+        if (last_conn_ok)
+            last_conn = conn;
+        if (last_stream_ok)
+            last_stream = stream;
+        snprintf(last, sizeof(last), "%s", buf);
+        usleep(50000);
+    }
+    fprintf(stderr, "status missing %s local_conn=%llu last_stream=%llu parsed_conn=%s/%llu parsed_stream=%s/%llu:\n%s\n",
+            service, want_conn, want_stream,
+            last_conn_ok ? "ok" : "bad", last_conn,
+            last_stream_ok ? "ok" : "bad", last_stream, last);
+    return -1;
+}
+
 static void stop_child(pid_t pid)
 {
     long long end;
@@ -198,6 +376,9 @@ static pid_t spawn_target(const char *carrier)
 {
     pid_t pid = fork();
     if (pid == 0) {
+        if (getenv("LMUX2_IT_VERBOSE"))
+            execl("build/host/lmuxd", "lmuxd", "--role", "target",
+                  "--carrier-listen", carrier, "--verbose", (char *)NULL);
         execl("build/host/lmuxd", "lmuxd", "--role", "target",
               "--carrier-listen", carrier, (char *)NULL);
         _exit(127);
@@ -211,6 +392,12 @@ static pid_t spawn_host(const char *carrier, const char *control,
 {
     pid_t pid = fork();
     if (pid == 0) {
+        if (getenv("LMUX2_IT_VERBOSE"))
+            execl("build/host/lmuxd", "lmuxd", "--role", "host",
+                  "--carrier-connect", carrier, "--control", control,
+                  "--pty", pty1, "--pty", pty1_dup,
+                  "--pty", pty1_conflict, "--pty", pty2,
+                  "--verbose", (char *)NULL);
         execl("build/host/lmuxd", "lmuxd", "--role", "host",
               "--carrier-connect", carrier, "--control", control,
               "--pty", pty1, "--pty", pty1_dup,
@@ -244,8 +431,9 @@ static int integration_test(void)
     pid_t target = -1, host = -1;
     int fd1 = -1, fd2 = -1, rc = 1;
     int host_fd_base = -1, target_fd_base = -1;
+    unsigned long long initial_conn = 0;
     long pid1 = -1, pid1_after = -1, pid2 = -1, pid1_respawn = -1;
-    char out[8192];
+    char out[8192], status[4096];
     const char *where = "setup";
 
     if (!mkdtemp(dir))
@@ -260,26 +448,39 @@ static int integration_test(void)
     snprintf(arg1_conflict, sizeof(arg1_conflict), "console1:%s:/bin/false", c1_bad);
     snprintf(arg2, sizeof(arg2), "console2:%s:/bin/sh", c2);
 
+    host = spawn_host(carrier, control, arg1, arg1_dup, arg1_conflict, arg2);
+    if (host < 0)
+        goto out;
+
+    where = "host console listeners before peer";
+    if (wait_path_exists(control, 5000) < 0 ||
+        wait_path_exists(c1, 5000) < 0 ||
+        wait_path_exists(c2, 5000) < 0 ||
+        access(c1_bad, F_OK) == 0)
+        goto out;
+
     target = spawn_target(carrier);
     if (target < 0)
         goto out;
     if (wait_path_exists(carrier, 8000) < 0)
         goto out;
-    host = spawn_host(carrier, control, arg1, arg1_dup, arg1_conflict, arg2);
-    if (host < 0)
+    where = "service reconciliation";
+    if (read_status_contains(control, "console1 id=1", 10000) < 0 ||
+        read_status_contains(control, "console2 id=2", 10000) < 0)
         goto out;
 
-    where = "console listeners";
+    where = "console1 listener";
     fd1 = wait_connect(c1, 10000);
-    fd2 = wait_connect(c2, 10000);
-    if (fd1 < 0 || fd2 < 0)
+    if (fd1 < 0)
         goto out;
     if (access(c1_bad, F_OK) == 0)
         goto out;
-    host_fd_base = count_fds(host);
-    target_fd_base = count_fds(target);
 
     where = "initial shell pid/state";
+    if (shell_cmd_expect(fd1, "echo LMUX2_READY", "LMUX2_READY", out, sizeof(out)) < 0) {
+        dump_excerpt("initial console1 ready", out);
+        goto out;
+    }
     if (shell_cmd_expect(fd1, "LMUX_STATE=alive; printf 'P''ID1:%s\\n' \"$$\"", "PID1:", out, sizeof(out)) < 0) {
         dump_excerpt("initial console1", out);
         goto out;
@@ -287,11 +488,50 @@ static int integration_test(void)
     pid1 = parse_pid_marker(out, "PID1:");
     if (pid1 <= 0)
         goto out;
+    if (read_status_snapshot(control, status, sizeof(status), 3000) < 0 ||
+        status_u64_after(status, "local_conn=", &initial_conn) < 0 ||
+        wait_console_stream_id(control, "console1", initial_conn, 1, 5000) < 0)
+        goto out;
+    where = "detach preserves shell";
+    close(fd1);
+    fd1 = wait_connect(c1, 5000);
+    if (fd1 < 0)
+        goto out;
+    if (wait_console_stream_id(control, "console1", initial_conn, 3, 5000) < 0)
+        goto out;
+    if (shell_cmd_expect(fd1, "printf 'P''ID1B:%s:%s\\n' \"$$\" \"$LMUX_STATE\"", "PID1B:", out, sizeof(out)) < 0)
+        goto out;
+    pid1_after = parse_pid_marker(out, "PID1B:");
+    if (pid1_after != pid1 || !strstr(out, ":alive"))
+        goto out;
+
+    where = "monotonic console stream ids";
+    close(fd1);
+    fd1 = wait_connect(c1, 5000);
+    if (fd1 < 0 ||
+        wait_console_stream_id(control, "console1", initial_conn, 5, 5000) < 0 ||
+        shell_cmd_expect(fd1, "printf 'P''ID1E:%s:%s\\n' \"$$\" \"$LMUX_STATE\"", "PID1E:", out, sizeof(out)) < 0 ||
+        parse_pid_marker(out, "PID1E:") != pid1 || !strstr(out, ":alive"))
+        goto out;
+    close(fd1);
+    fd1 = wait_connect(c1, 5000);
+    if (fd1 < 0 ||
+        wait_console_stream_id(control, "console1", initial_conn, 7, 5000) < 0 ||
+        shell_cmd_expect(fd1, "printf 'P''ID1F:%s:%s\\n' \"$$\" \"$LMUX_STATE\"", "PID1F:", out, sizeof(out)) < 0 ||
+        parse_pid_marker(out, "PID1F:") != pid1 || !strstr(out, ":alive"))
+        goto out;
+
+    where = "console2 listener";
+    fd2 = wait_connect(c2, 10000);
+    if (fd2 < 0)
+        goto out;
     if (shell_cmd_expect(fd2, "printf 'P''ID2:%s\\n' \"$$\"", "PID2:", out, sizeof(out)) < 0)
         goto out;
     pid2 = parse_pid_marker(out, "PID2:");
     if (pid2 <= 0 || pid2 == pid1)
         goto out;
+    host_fd_base = count_fds(host);
+    target_fd_base = count_fds(target);
 
     where = "winsize isolation";
     if (send_winsize(control, "console1", 33, 101) < 0 ||
@@ -300,17 +540,6 @@ static int integration_test(void)
     if (shell_cmd_expect(fd1, "stty size", "33 101", out, sizeof(out)) < 0)
         goto out;
     if (shell_cmd_expect(fd2, "stty size", "22 77", out, sizeof(out)) < 0)
-        goto out;
-
-    where = "detach preserves shell";
-    close(fd1);
-    fd1 = wait_connect(c1, 5000);
-    if (fd1 < 0)
-        goto out;
-    if (shell_cmd_expect(fd1, "printf 'P''ID1B:%s:%s\\n' \"$$\" \"$LMUX_STATE\"", "PID1B:", out, sizeof(out)) < 0)
-        goto out;
-    pid1_after = parse_pid_marker(out, "PID1B:");
-    if (pid1_after != pid1 || !strstr(out, ":alive"))
         goto out;
 
     where = "console1 churn while console2 alive";
@@ -330,10 +559,12 @@ static int integration_test(void)
     usleep(300000);
     if (host_fd_base >= 0 && count_fds(host) != host_fd_base) {
         fprintf(stderr, "host fd count %d expected %d\n", count_fds(host), host_fd_base);
+        dump_fds(host);
         goto out;
     }
     if (target_fd_base >= 0 && count_fds(target) != target_fd_base) {
         fprintf(stderr, "target fd count %d expected %d\n", count_fds(target), target_fd_base);
+        dump_fds(target);
         goto out;
     }
 
@@ -345,6 +576,53 @@ static int integration_test(void)
                   strlen("printf 'AFTER''CTRL\\n'\n")) < 0 ||
         read_until(fd1, "AFTERCTRL", out, sizeof(out), 5000) < 0)
         goto out;
+
+    where = "target-only daemon restart";
+    stop_child(target);
+    target = -1;
+    (void)wait_fd_event(fd1, POLLHUP | POLLERR | POLLNVAL, 5000);
+    if (fd1 >= 0) {
+        close(fd1);
+        fd1 = -1;
+    }
+    if (fd2 >= 0) {
+        close(fd2);
+        fd2 = -1;
+    }
+    if (read_status_contains(control, "carrier: down", 7000) < 0)
+        goto out;
+    fd1 = wait_connect(c1, 5000);
+    if (fd1 < 0 ||
+        write_all(fd1, "echo TARGET_RESTART_PENDING\n",
+                  strlen("echo TARGET_RESTART_PENDING\n")) < 0)
+        goto out;
+    target = spawn_target(carrier);
+    if (target < 0 || wait_path_exists(carrier, 8000) < 0)
+        goto out;
+    if (read_until(fd1, "TARGET_RESTART_PENDING", out, sizeof(out), 12000) < 0) {
+        dump_excerpt("target restart pending console1", out);
+        goto out;
+    }
+    if (read_status_snapshot(control, status, sizeof(status), 5000) < 0 ||
+        status_u64_after(status, "local_conn=", &initial_conn) < 0 ||
+        wait_console_stream_id(control, "console1", initial_conn, 1, 8000) < 0)
+        goto out;
+    if (shell_cmd_expect(fd1, "LMUX_STATE=alive; printf 'P''ID1R:%s\\n' \"$$\"", "PID1R:", out, sizeof(out)) < 0)
+        goto out;
+    pid1_after = parse_pid_marker(out, "PID1R:");
+    if (pid1_after <= 0 || pid1_after == pid1)
+        goto out;
+    pid1 = pid1_after;
+    fd2 = wait_connect(c2, 10000);
+    if (fd2 < 0 ||
+        shell_cmd_expect(fd2, "printf 'P''ID2R:%s\\n' \"$$\"", "PID2R:", out, sizeof(out)) < 0)
+        goto out;
+    pid1_after = parse_pid_marker(out, "PID2R:");
+    if (pid1_after <= 0 || pid1_after == pid2 || pid1_after == pid1)
+        goto out;
+    pid2 = pid1_after;
+    host_fd_base = count_fds(host);
+    target_fd_base = count_fds(target);
 
     where = "physical reconnect preserves shell";
     stop_child(host);
@@ -420,6 +698,7 @@ out:
 
 int main(void)
 {
+    signal(SIGPIPE, SIG_IGN);
     if (integration_test())
         return 1;
     puts("lmux2 pty integration selftest ok");

@@ -130,6 +130,7 @@ struct v2_service {
     long long respawn_at_ms;
     int supervised;
     uint64_t active_stream_id;
+    uint64_t last_stream_id;
     struct v2_file_session file;
     struct v2_binding bindings[V2_MAX_BINDINGS];
 };
@@ -155,6 +156,7 @@ struct v2_app {
     int verbose;
     int stop;
     int factories_reported;
+    int peer_restart_converging;
     int factory_unix;
     int factory_pty;
     int factory_file;
@@ -170,6 +172,18 @@ struct v2_app {
     const char *carrier_connect_path;
     int carrier_listen_fd;
     int carrier_created_path;
+    long long next_carrier_attempt_ms;
+    unsigned long long carrier_open_count;
+    unsigned long long carrier_lost_count;
+    unsigned long long carrier_open_fail_count;
+    unsigned long long connection_recreated_count;
+    unsigned long long connection_established_count;
+    unsigned long long peer_restart_count;
+    unsigned long long stream_open_count;
+    unsigned long long stream_close_count;
+    unsigned long long stream_reset_count;
+    unsigned long long carrier_rx_bytes;
+    unsigned long long carrier_tx_bytes;
     struct lmux2_conn conn;
     uint8_t enc_in[LMUX2_MAX_ENCODED];
     size_t enc_in_len;
@@ -186,6 +200,12 @@ static struct v2_app *global_v2_app;
 static void reset_connection_streams(struct v2_app *a);
 static void pty_terminate_child(struct v2_service *s);
 static void file_session_reset(struct v2_file_session *fs);
+static int service_has_active_binding(const struct v2_service *s);
+static int service_has_live_stream(const struct v2_app *a, const struct v2_service *s);
+static struct v2_service *find_service_name(struct v2_app *a, const char *name);
+static struct v2_service *alloc_service(struct v2_app *a);
+static int create_listener(const char *path, int *created_path);
+static void attach_host_pending_clients(struct v2_app *a);
 
 static void log_msg(struct v2_app *a, int verbose, const char *fmt, ...)
 {
@@ -275,6 +295,46 @@ static int copy_bounded(char *out, size_t cap, const char *in)
         return -1;
     memcpy(out, in, n + 1);
     return 0;
+}
+
+static const char *role_name(enum lmux2_role role)
+{
+    return role == LMUX2_ROLE_HOST ? "host" : "target";
+}
+
+static const char *conn_state_name(enum lmux2_conn_state st)
+{
+    switch (st) {
+    case LMUX2_CONN_WAIT_HELLO: return "WAIT_HELLO";
+    case LMUX2_CONN_ESTABLISHED: return "ESTABLISHED";
+    case LMUX2_CONN_ERROR: return "ERROR";
+    }
+    return "?";
+}
+
+static const char *stream_state_name(enum lmux2_stream_state st)
+{
+    switch (st) {
+    case LMUX2_STREAM_UNUSED: return "UNUSED";
+    case LMUX2_STREAM_OPEN_SENT: return "OPEN_SENT";
+    case LMUX2_STREAM_OPEN_RECEIVED: return "OPEN_RECEIVED";
+    case LMUX2_STREAM_OPEN: return "OPEN";
+    case LMUX2_STREAM_LOCAL_CLOSED: return "LOCAL_CLOSED";
+    case LMUX2_STREAM_REMOTE_CLOSED: return "REMOTE_CLOSED";
+    case LMUX2_STREAM_RESET: return "RESET";
+    case LMUX2_STREAM_TERMINAL: return "TERMINAL";
+    }
+    return "?";
+}
+
+static const char *service_type_name(enum v2_service_type type)
+{
+    switch (type) {
+    case V2_SERVICE_UNIX_RENDEZVOUS: return "unix-rendezvous";
+    case V2_SERVICE_PTY: return "pty";
+    case V2_SERVICE_FILE: return "file";
+    }
+    return "?";
 }
 
 static int split_unix_arg(const char *arg, char *name, char *host_path, char *target_path)
@@ -416,10 +476,70 @@ static void init_service_slots(struct v2_app *a)
 static struct v2_service *find_service_id(struct v2_app *a, uint64_t id)
 {
     int i;
+    if (id == 0)
+        return NULL;
     for (i = 0; i < V2_MAX_SERVICES; i++)
         if (a->services[i].used && a->services[i].id == id)
             return &a->services[i];
     return NULL;
+}
+
+static int desired_matches_service(const struct v2_desired *d, const struct v2_service *s)
+{
+    if (d->type != s->type)
+        return 0;
+    if (strcmp(d->host_path, s->host_path) != 0)
+        return 0;
+    if (d->type == V2_SERVICE_UNIX_RENDEZVOUS)
+        return strcmp(d->target_path, s->target_path) == 0;
+    if (d->type == V2_SERVICE_PTY)
+        return strcmp(d->argv, s->argv) == 0 && d->supervised == s->supervised;
+    return d->type == V2_SERVICE_FILE;
+}
+
+static int create_host_desired_services(struct v2_app *a)
+{
+    int i;
+    if (a->role != LMUX2_ROLE_HOST)
+        return 0;
+    for (i = 0; i < V2_MAX_DESIRED; i++) {
+        struct v2_desired *d = &a->desired[i];
+        struct v2_service *s;
+        if (!d->used)
+            continue;
+        s = find_service_name(a, d->name);
+        if (s) {
+            if (!desired_matches_service(d, s))
+                log_msg(a, 1, "lmux2 desired service %s conflicts locally; listener not created",
+                        d->name);
+            continue;
+        }
+        s = alloc_service(a);
+        if (!s)
+            return -1;
+        s->id = 0;
+        s->type = d->type;
+        if (copy_bounded(s->name, sizeof(s->name), d->name) < 0 ||
+            copy_bounded(s->host_path, sizeof(s->host_path), d->host_path) < 0) {
+            cleanup_service(s);
+            return -1;
+        }
+        if (d->target_path[0])
+            copy_bounded(s->target_path, sizeof(s->target_path), d->target_path);
+        if (d->argv[0])
+            copy_bounded(s->argv, sizeof(s->argv), d->argv);
+        s->supervised = d->supervised;
+        s->listen_fd = create_listener(s->host_path, &s->created_path);
+        if (s->listen_fd < 0) {
+            fprintf(stderr, "lmux2 host listener %s: %s\n", s->host_path, strerror(errno));
+            cleanup_service(s);
+            return -1;
+        }
+        copy_bounded(s->listen_path, sizeof(s->listen_path), s->host_path);
+        log_msg(a, 1, "lmux2 host local listener service=%s type=%s path=%s",
+                s->name, service_type_name(s->type), s->host_path);
+    }
+    return 0;
 }
 
 static struct v2_service *find_service_name(struct v2_app *a, const char *name)
@@ -480,6 +600,23 @@ static struct v2_binding *alloc_binding(struct v2_service *s)
         if (s->bindings[i].fd < 0)
             return &s->bindings[i];
     return NULL;
+}
+
+static int socket_peer_closed(int fd)
+{
+    uint8_t ch;
+    ssize_t r;
+
+    do {
+        r = recv(fd, &ch, 1, MSG_PEEK);
+    } while (r < 0 && errno == EINTR);
+    if (r == 0)
+        return 1;
+    if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        return 0;
+    if (r < 0)
+        return 1;
+    return 0;
 }
 
 static void child_close_daemon_fds(void)
@@ -898,11 +1035,58 @@ static int connect_unix_carrier(const char *path)
     return fd;
 }
 
+static int open_configured_carrier(struct v2_app *a)
+{
+    int fd;
+    if (!a->carrier_path && !a->carrier_connect_path)
+        return -1;
+    if (a->carrier_connect_path) {
+        fd = connect_unix_carrier(a->carrier_connect_path);
+        if (fd < 0)
+            return -1;
+    } else {
+        fd = open(a->carrier_path, O_RDWR | O_NOCTTY | O_NONBLOCK);
+        if (fd < 0)
+            return -1;
+        (void)configure_tty(fd);
+    }
+    a->carrier_fd = fd;
+    a->carrier_fd_owned = 1;
+    a->carrier_open_count++;
+    log_msg(a, 1, "lmux2 carrier opened %s",
+            a->carrier_connect_path ? a->carrier_connect_path : a->carrier_path);
+    return 0;
+}
+
+static void try_open_carrier(struct v2_app *a)
+{
+    long long t;
+    if (a->carrier_fd >= 0 || a->carrier_listen_fd >= 0 ||
+        (!a->carrier_path && !a->carrier_connect_path))
+        return;
+    t = now_ms();
+    if (t < a->next_carrier_attempt_ms)
+        return;
+    a->next_carrier_attempt_ms = t + 1000;
+    if (open_configured_carrier(a) < 0) {
+        a->carrier_open_fail_count++;
+        return;
+    }
+    reset_connection_streams(a);
+}
+
 static void carrier_lost(struct v2_app *a)
 {
+    if (a->carrier_fd >= 0) {
+        a->carrier_lost_count++;
+        log_msg(a, 1, "lmux2 carrier lost");
+    }
     reset_connection_streams(a);
-    if (a->carrier_listen_fd >= 0)
-        close_fd(&a->carrier_fd);
+    close_fd(&a->carrier_fd);
+    a->out_len = a->out_pos = 0;
+    a->enc_in_len = 0;
+    a->discard_until_delim = 0;
+    a->next_carrier_attempt_ms = now_ms() + 250;
 }
 
 static void accept_carrier(struct v2_app *a)
@@ -914,6 +1098,8 @@ static void accept_carrier(struct v2_app *a)
     close_fd(&a->carrier_fd);
     a->carrier_fd = fd;
     a->carrier_fd_owned = 1;
+    a->carrier_open_count++;
+    log_msg(a, 1, "lmux2 carrier accepted");
     reset_connection_streams(a);
 }
 
@@ -968,7 +1154,10 @@ static int queue_factory_report(struct v2_app *a)
         ctrl_put_u8(tlv, sizeof(tlv), &off, V2_TLV_SERVICE_TYPE,
                     V2_SERVICE_FILE) < 0)
         return -1;
-    return queue_control(a, V2_CTRL_FACTORY_REPORT, 0, 0, 0, tlv, (uint16_t)off);
+    if (queue_control(a, V2_CTRL_FACTORY_REPORT, 0, 0, 0, tlv, (uint16_t)off) < 0)
+        return -1;
+    log_msg(a, 1, "lmux2 FACTORY_REPORT sent unix-rendezvous pty file");
+    return 0;
 }
 
 static int queue_service_ok(struct v2_app *a, uint32_t req_id, const struct v2_service *s)
@@ -989,7 +1178,11 @@ static int queue_service_ok(struct v2_app *a, uint32_t req_id, const struct v2_s
          ctrl_put_u8(tlv, sizeof(tlv), &off, V2_TLV_SUPERVISED,
                      s->supervised ? 1 : 0) < 0))
         return -1;
-    return queue_control(a, V2_CTRL_SERVICE_OK, req_id, s->id, 0, tlv, (uint16_t)off);
+    if (queue_control(a, V2_CTRL_SERVICE_OK, req_id, s->id, 0, tlv, (uint16_t)off) < 0)
+        return -1;
+    log_msg(a, 1, "lmux2 SERVICE_OK sent req=%u service=%s id=%llu type=%s",
+            req_id, s->name, (unsigned long long)s->id, service_type_name(s->type));
+    return 0;
 }
 
 static int queue_service_error(struct v2_app *a, uint32_t req_id, uint64_t service_id,
@@ -998,7 +1191,11 @@ static int queue_service_error(struct v2_app *a, uint32_t req_id, uint64_t servi
     uint8_t tlv[8];
     size_t off = 0;
     (void)ctrl_put_u8(tlv, sizeof(tlv), &off, V2_TLV_ERROR_CODE, code);
-    return queue_control(a, V2_CTRL_SERVICE_ERROR, req_id, service_id, 0, tlv, (uint16_t)off);
+    if (queue_control(a, V2_CTRL_SERVICE_ERROR, req_id, service_id, 0, tlv, (uint16_t)off) < 0)
+        return -1;
+    log_msg(a, 1, "lmux2 SERVICE_ERROR sent req=%u service=%llu code=%u",
+            req_id, (unsigned long long)service_id, code);
+    return 0;
 }
 
 static int queue_service_event(struct v2_app *a, const struct v2_service *s,
@@ -1146,6 +1343,8 @@ static int send_service_ensure(struct v2_app *a, struct v2_desired *d)
         return -1;
     }
     d->sent = 1;
+    log_msg(a, 1, "lmux2 SERVICE_ENSURE sent req=%u name=%s type=%s",
+            d->req_id, d->name, service_type_name(d->type));
     return queue_control(a, V2_CTRL_SERVICE_ENSURE, d->req_id, 0, 0,
                          tlv, (uint16_t)off);
 }
@@ -1250,6 +1449,8 @@ static void handle_service_ensure(struct v2_app *a, const struct ctrl_view *cv)
         (void)queue_service_error(a, cv->req_id, 0, V2_E_BAD_REQUEST);
         return;
     }
+    log_msg(a, 1, "lmux2 SERVICE_ENSURE received req=%u name=%s type=%s",
+            cv->req_id, name, service_type_name((enum v2_service_type)type));
     if (type == V2_SERVICE_UNIX_RENDEZVOUS) {
         if (tlv_string(cv, V2_TLV_TARGET_PATH, path, sizeof(path)) < 0) {
             (void)queue_service_error(a, cv->req_id, 0, V2_E_BAD_REQUEST);
@@ -1288,6 +1489,8 @@ static void handle_service_ok(struct v2_app *a, const struct ctrl_view *cv)
         d->service_id = cv->service_id;
         s = find_service_id(a, cv->service_id);
         if (!s)
+            s = find_service_name(a, d->name);
+        if (!s)
             s = alloc_service(a);
         if (!s)
             return;
@@ -1300,13 +1503,14 @@ static void handle_service_ok(struct v2_app *a, const struct ctrl_view *cv)
         if (d->argv[0])
             copy_bounded(s->argv, sizeof(s->argv), d->argv);
         s->supervised = d->supervised;
-        if (s->listen_fd < 0) {
+        if (s->listen_fd < 0 && s->host_path[0]) {
             s->listen_fd = create_listener(s->host_path, &s->created_path);
             if (s->listen_fd >= 0)
                 copy_bounded(s->listen_path, sizeof(s->listen_path), s->host_path);
         }
-        log_msg(a, 1, "lmux2 service %s id=%llu type=%u host listener %s",
-                s->name, (unsigned long long)s->id, (unsigned)s->type, s->host_path);
+        log_msg(a, 1, "lmux2 SERVICE_OK service=%s id=%llu type=%s listener=%s",
+                s->name, (unsigned long long)s->id, service_type_name(s->type),
+                s->listen_fd >= 0 ? "ready" : "missing");
     }
 }
 
@@ -1325,10 +1529,15 @@ static void handle_service_event(struct v2_app *a, const struct ctrl_view *cv)
     uint8_t event;
     if (a->role != LMUX2_ROLE_HOST || !s || tlv_u8(cv, V2_TLV_EVENT, &event) < 0)
         return;
-    if (event == V2_EVENT_PENDING_CLIENT)
+    if (event == V2_EVENT_PENDING_CLIENT) {
         s->pending_event_token = cv->token;
-    else if (event == V2_EVENT_PENDING_CLEARED && s->pending_event_token == cv->token)
+        log_msg(a, 1, "lmux2 SERVICE_EVENT pending service=%s token=%llu",
+                s->name, (unsigned long long)cv->token);
+    } else if (event == V2_EVENT_PENDING_CLEARED && s->pending_event_token == cv->token) {
         s->pending_event_token = 0;
+        log_msg(a, 1, "lmux2 SERVICE_EVENT pending-cleared service=%s token=%llu",
+                s->name, (unsigned long long)cv->token);
+    }
 }
 
 static void handle_service_control(struct v2_app *a, const struct ctrl_view *cv)
@@ -1364,6 +1573,9 @@ static void handle_control(struct v2_app *a, const struct lmux2_frame *fr)
             a->factory_unix = ctrl_has_service_type(&cv, V2_SERVICE_UNIX_RENDEZVOUS);
             a->factory_pty = ctrl_has_service_type(&cv, V2_SERVICE_PTY);
             a->factory_file = ctrl_has_service_type(&cv, V2_SERVICE_FILE);
+            log_msg(a, 1, "lmux2 FACTORY_REPORT received unix=%d pty=%d file=%d",
+                    a->factory_unix, a->factory_pty, a->factory_file);
+            log_msg(a, 1, "lmux2 reconciling desired services");
             for (i = 0; i < V2_MAX_DESIRED; i++)
                 if (a->desired[i].used &&
                     ((a->desired[i].type == V2_SERVICE_UNIX_RENDEZVOUS && a->factory_unix) ||
@@ -1399,6 +1611,7 @@ static void handle_control(struct v2_app *a, const struct lmux2_frame *fr)
     default:
         break;
     }
+    attach_host_pending_clients(a);
 }
 
 static void bind_fd_to_stream(struct v2_service *s, uint64_t stream_id, int fd)
@@ -1410,6 +1623,7 @@ static void bind_fd_to_stream(struct v2_service *s, uint64_t stream_id, int fd)
     }
     b->stream_id = stream_id;
     b->fd = fd;
+    s->last_stream_id = stream_id;
 }
 
 static int stream_can_send_endpoint_data(const struct v2_app *a, uint64_t stream_id)
@@ -1423,12 +1637,16 @@ static int stream_can_send_endpoint_data(const struct v2_app *a, uint64_t stream
 static void close_binding(struct v2_app *a, struct v2_service *s, struct v2_binding *b,
                           int send_close)
 {
+    uint64_t stream_id = b->stream_id;
     if (b->fd >= 0)
         close_fd(&b->fd);
-    if (send_close)
-        (void)lmux2_close_stream(&a->conn, b->stream_id);
+    if (send_close && stream_id) {
+        (void)lmux2_close_stream(&a->conn, stream_id);
+        a->stream_close_count++;
+        log_msg(a, 1, "lmux2 STREAM_CLOSE sent service=%s stream=%llu binding-detached",
+                s->name, (unsigned long long)stream_id);
+    }
     b->stream_id = 0;
-    (void)s;
 }
 
 static void clear_pending(struct v2_app *a, struct v2_service *s)
@@ -1436,8 +1654,192 @@ static void clear_pending(struct v2_app *a, struct v2_service *s)
     uint64_t token = s->pending_token;
     close_fd(&s->pending_fd);
     s->pending_token = 0;
-    if (token)
+    if (a->role == LMUX2_ROLE_TARGET && token)
         (void)queue_service_event(a, s, V2_EVENT_PENDING_CLEARED, token);
+}
+
+static int host_service_can_accept_pending(const struct v2_service *s)
+{
+    if (s->pending_fd >= 0)
+        return 0;
+    if ((s->type == V2_SERVICE_PTY || s->type == V2_SERVICE_FILE) &&
+        (s->active_stream_id || service_has_active_binding(s)))
+        return 0;
+    return 1;
+}
+
+static void attach_host_pending_clients(struct v2_app *a)
+{
+    int i;
+    if (a->role != LMUX2_ROLE_HOST || a->conn.state != LMUX2_CONN_ESTABLISHED)
+        return;
+    for (i = 0; i < V2_MAX_SERVICES; i++) {
+        struct v2_service *s = &a->services[i];
+        uint64_t stream_id, token;
+        if (!s->used || s->pending_fd < 0 || s->id == 0)
+            continue;
+        if (s->type == V2_SERVICE_UNIX_RENDEZVOUS && service_has_live_stream(a, s))
+            continue;
+        if ((s->type == V2_SERVICE_PTY || s->type == V2_SERVICE_FILE) &&
+            (s->active_stream_id || service_has_active_binding(s)))
+            continue;
+        token = 0;
+        if (lmux2_open_stream_ex(&a->conn, s->id, token, &stream_id) < 0)
+            continue;
+        bind_fd_to_stream(s, stream_id, s->pending_fd);
+        s->pending_fd = -1;
+        a->stream_open_count++;
+        log_msg(a, 1, "lmux2 STREAM_OPEN sent pending service=%s stream=%llu token=%llu",
+                s->name, (unsigned long long)stream_id, (unsigned long long)token);
+    }
+}
+
+static void control_write_all(int fd, const char *buf, size_t len)
+{
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, buf + off, len - off);
+        if (w > 0) {
+            off += (size_t)w;
+            continue;
+        }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            struct pollfd pfd;
+            pfd.fd = fd;
+            pfd.events = POLLOUT;
+            pfd.revents = 0;
+            (void)poll(&pfd, 1, 1000);
+            continue;
+        }
+        return;
+    }
+}
+
+static void control_printf(struct v2_app *a, const char *fmt, ...)
+{
+    char buf[512];
+    va_list ap;
+    int n;
+    if (a->control_fd < 0)
+        return;
+    va_start(ap, fmt);
+    n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n <= 0)
+        return;
+    if ((size_t)n >= sizeof(buf))
+        n = (int)sizeof(buf) - 1;
+    control_write_all(a->control_fd, buf, (size_t)n);
+}
+
+static const char *yesno(int v)
+{
+    return v ? "yes" : "no";
+}
+
+static void write_status(struct v2_app *a)
+{
+    int i, j;
+    control_printf(a, "LMUX Wire\n");
+    control_printf(a, "local:  %s\n", LMUX_BUILD_VERSION);
+    control_printf(a, "wire:   LMUX/2\n");
+    control_printf(a, "role:   %s\n", role_name(a->role));
+    control_printf(a, "carrier: %s fd=%d opens=%llu lost=%llu open_fail=%llu rx_bytes=%llu tx_bytes=%llu\n",
+                   a->carrier_fd >= 0 ? "open" : "down", a->carrier_fd,
+                   a->carrier_open_count, a->carrier_lost_count,
+                   a->carrier_open_fail_count, a->carrier_rx_bytes,
+                   a->carrier_tx_bytes);
+    control_printf(a, "connection: %s local_conn=%llu peer_conn=%llu established=%llu recreations=%llu peer_restarts=%llu last_error=%s\n",
+                   conn_state_name(a->conn.state),
+                   (unsigned long long)a->conn.local_conn_id,
+                   (unsigned long long)a->conn.peer_conn_id,
+                   a->connection_established_count,
+                   a->connection_recreated_count,
+                   a->peer_restart_count,
+                   a->conn.last_error[0] ? a->conn.last_error : "-");
+    control_printf(a, "frames: tx=%llu rx=%llu protocol_errors=%llu stream_errors=%llu stale=%llu pre_established_drops=%llu\n",
+                   a->conn.frames_tx, a->conn.frames_rx,
+                   a->conn.protocol_errors, a->conn.stream_errors,
+                   a->conn.stale_frames, a->conn.pre_established_drops);
+    control_printf(a, "stream_counters: opens=%llu closes=%llu resets=%llu\n",
+                   a->stream_open_count, a->stream_close_count,
+                   a->stream_reset_count);
+    control_printf(a, "flow: conn_tx=%llu peer_max_data=%llu conn_rx=%llu conn_consumed=%llu local_max_data=%llu last_max_data_sent=%llu dirty=%s outq=%zu\n",
+                   (unsigned long long)a->conn.conn_send_offset,
+                   (unsigned long long)a->conn.peer_max_data,
+                   (unsigned long long)a->conn.conn_recv_offset,
+                   (unsigned long long)a->conn.conn_rx_consumed,
+                   (unsigned long long)a->conn.local_max_data,
+                   (unsigned long long)a->conn.last_sent_max_data,
+                   yesno(a->conn.max_data_dirty), a->conn.outq_len);
+    if (a->role == LMUX2_ROLE_TARGET) {
+        control_printf(a, "factories: unix-rendezvous pty file\n");
+    } else {
+        control_printf(a, "factories: unix-rendezvous=%s pty=%s file=%s desired_sent=%s\n",
+                       yesno(a->factory_unix), yesno(a->factory_pty),
+                       yesno(a->factory_file), yesno(a->desired_sent));
+    }
+    control_printf(a, "desired_services:\n");
+    for (i = 0; i < V2_MAX_DESIRED; i++) {
+        struct v2_desired *d = &a->desired[i];
+        if (!d->used)
+            continue;
+        control_printf(a, "  %s type=%s host=%s target=%s configured=yes sent=%s acknowledged=%s req=%u service_id=%llu\n",
+                       d->name, service_type_name(d->type), d->host_path,
+                       d->target_path[0] ? d->target_path : "-",
+                       yesno(d->sent), yesno(d->service_id != 0), d->req_id,
+                       (unsigned long long)d->service_id);
+    }
+    control_printf(a, "services:\n");
+    for (i = 0; i < V2_MAX_SERVICES; i++) {
+        struct v2_service *s = &a->services[i];
+        if (!s->used)
+            continue;
+        control_printf(a, "  %s id=%llu type=%s listener=%s path=%s pending_fd=%s pending_token=%llu pending_event=%llu active_stream=%llu last_stream=%llu",
+                       s->name, (unsigned long long)s->id,
+                       service_type_name(s->type),
+                       s->listen_fd >= 0 ? "ready" : "none",
+                       s->listen_path[0] ? s->listen_path :
+                       (s->host_path[0] ? s->host_path :
+                        (s->target_path[0] ? s->target_path : "-")),
+                       s->pending_fd >= 0 ? "yes" : "no",
+                       (unsigned long long)s->pending_token,
+                       (unsigned long long)s->pending_event_token,
+                       (unsigned long long)s->active_stream_id,
+                       (unsigned long long)s->last_stream_id);
+        if (s->type == V2_SERVICE_PTY) {
+            if (a->role == LMUX2_ROLE_TARGET)
+                control_printf(a, " pty_master=%s child_pid=%ld",
+                               s->pty_master_fd >= 0 ? "ready" : "none",
+                               (long)s->child_pid);
+            else
+                control_printf(a, " target_child=not-reported");
+        }
+        control_printf(a, "\n");
+        for (j = 0; j < V2_MAX_BINDINGS; j++) {
+            struct v2_binding *b = &s->bindings[j];
+            if (b->fd >= 0)
+                control_printf(a, "    binding stream=%llu fd=%d\n",
+                               (unsigned long long)b->stream_id, b->fd);
+        }
+    }
+    control_printf(a, "streams:\n");
+    for (i = 0; i < LMUX2_CORE_MAX_STREAMS; i++) {
+        struct lmux2_stream *st = &a->conn.streams[i];
+        if (st->state == LMUX2_STREAM_UNUSED)
+            continue;
+        control_printf(a, "  id=%llu state=%s service=%llu tx=%llu rx_expect=%llu rx_len=%zu tx_len=%zu peer_limit=%llu local_limit=%llu consumed=%llu last_limit_sent=%llu limit_dirty=%s\n",
+                       (unsigned long long)st->id, stream_state_name(st->state),
+                       (unsigned long long)st->service_id,
+                       (unsigned long long)st->send_offset,
+                       (unsigned long long)st->expected_recv_offset,
+                       st->rx.len, st->tx.len,
+                       (unsigned long long)st->peer_max_stream_data,
+                       (unsigned long long)st->local_max_stream_data,
+                       (unsigned long long)st->recv_consumed,
+                       (unsigned long long)st->last_sent_max_stream_data,
+                       yesno(st->max_stream_data_dirty));
+    }
 }
 
 static void control_handle_line(struct v2_app *a, char *line)
@@ -1446,7 +1848,10 @@ static void control_handle_line(struct v2_app *a, char *line)
     unsigned rows, cols, xp = 0, yp = 0;
     if (sscanf(line, "%15s", cmd) != 1)
         return;
-    if (strcmp(cmd, "WINSIZE") == 0) {
+    if (strcmp(cmd, "STATUS") == 0) {
+        write_status(a);
+        close_fd(&a->control_fd);
+    } else if (strcmp(cmd, "WINSIZE") == 0) {
         struct v2_service *s;
         if (sscanf(line, "%*s %31s %u %u %u %u", name, &rows, &cols, &xp, &yp) < 3) {
             (void)write(a->control_fd, "ERR bad WINSIZE\n", 16);
@@ -1464,8 +1869,10 @@ static void control_handle_line(struct v2_app *a, char *line)
             (void)write(a->control_fd, "ERR WINSIZE unavailable\n", 23);
         else
             (void)write(a->control_fd, "OK\n", 3);
+        close_fd(&a->control_fd);
     } else {
         (void)write(a->control_fd, "ERR unknown command\n", 20);
+        close_fd(&a->control_fd);
     }
 }
 
@@ -1521,14 +1928,22 @@ static void accept_service_client(struct v2_app *a, struct v2_service *s)
             continue;
         }
         if (a->role == LMUX2_ROLE_HOST) {
-            uint64_t token = s->pending_event_token;
-            if (lmux2_open_stream_ex(&a->conn, s->id, token, &stream_id) < 0) {
-                close(fd);
+            uint64_t token = 0;
+            if (s->id == 0 || a->conn.state != LMUX2_CONN_ESTABLISHED ||
+                (s->type == V2_SERVICE_UNIX_RENDEZVOUS && service_has_live_stream(a, s)) ||
+                lmux2_open_stream_ex(&a->conn, s->id, token, &stream_id) < 0) {
+                if (!host_service_can_accept_pending(s)) {
+                    close(fd);
+                    continue;
+                }
+                s->pending_fd = fd;
+                log_msg(a, 1, "lmux2 host local client pending service=%s reason=%s",
+                        s->name, s->id == 0 ? "no-service" : "no-connection");
                 continue;
             }
-            s->pending_event_token = 0;
             bind_fd_to_stream(s, stream_id, fd);
-            log_msg(a, 1, "lmux2 host local client service=%s stream=%llu token=%llu",
+            a->stream_open_count++;
+            log_msg(a, 1, "lmux2 STREAM_OPEN sent service=%s stream=%llu token=%llu",
                     s->name, (unsigned long long)stream_id, (unsigned long long)token);
         } else {
             if (s->pending_fd >= 0) {
@@ -1550,9 +1965,13 @@ static void service_handle_open_received(struct v2_app *a, struct lmux2_stream *
 {
     struct v2_service *s = find_service_id(a, st->service_id);
     if (!s) {
+        log_msg(a, 1, "lmux2 STREAM_OPEN received stream=%llu service=%llu refused=no-service",
+                (unsigned long long)st->id, (unsigned long long)st->service_id);
         (void)lmux2_reject_stream(&a->conn, st->id, LMUX2_OPEN_E_REFUSED);
         return;
     }
+    log_msg(a, 1, "lmux2 STREAM_OPEN received stream=%llu service=%s token=%llu",
+            (unsigned long long)st->id, s->name, (unsigned long long)st->open_token);
     if (a->role == LMUX2_ROLE_TARGET && s->type == V2_SERVICE_PTY) {
         if (st->open_token || s->active_stream_id || s->pty_master_fd < 0) {
             (void)lmux2_reject_stream(&a->conn, st->id, LMUX2_OPEN_E_BAD_STATE);
@@ -1561,6 +1980,10 @@ static void service_handle_open_received(struct v2_app *a, struct lmux2_stream *
         if (lmux2_accept_stream(&a->conn, st->id) < 0)
             return;
         s->active_stream_id = st->id;
+        s->last_stream_id = st->id;
+        a->stream_open_count++;
+        log_msg(a, 1, "lmux2 STREAM_OPEN_OK sent stream=%llu service=%s pty-bound child=%ld",
+                (unsigned long long)st->id, s->name, (long)s->child_pid);
         log_msg(a, 1, "lmux2 target attached pty stream=%llu service=%s",
                 (unsigned long long)st->id, s->name);
         return;
@@ -1574,6 +1997,10 @@ static void service_handle_open_received(struct v2_app *a, struct lmux2_stream *
         if (lmux2_accept_stream(&a->conn, st->id) < 0)
             return;
         s->active_stream_id = st->id;
+        s->last_stream_id = st->id;
+        a->stream_open_count++;
+        log_msg(a, 1, "lmux2 STREAM_OPEN_OK sent stream=%llu service=%s file-bound",
+                (unsigned long long)st->id, s->name);
         log_msg(a, 1, "lmux2 target attached file stream=%llu service=%s",
                 (unsigned long long)st->id, s->name);
         return;
@@ -1594,6 +2021,10 @@ static void service_handle_open_received(struct v2_app *a, struct lmux2_stream *
     }
     if (lmux2_accept_stream(&a->conn, st->id) < 0)
         return;
+    s->last_stream_id = st->id;
+    a->stream_open_count++;
+    log_msg(a, 1, "lmux2 STREAM_OPEN_OK sent stream=%llu service=%s",
+            (unsigned long long)st->id, s->name);
     if (a->role == LMUX2_ROLE_TARGET && !st->open_token)
         log_msg(a, 1, "lmux2 target accepted host-first stream=%llu service=%s",
                 (unsigned long long)st->id, s->name);
@@ -1710,6 +2141,7 @@ static void collect_pty_tx(struct v2_app *a, struct v2_service *s)
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
             return;
         (void)lmux2_close_stream(&a->conn, s->active_stream_id);
+        a->stream_close_count++;
         s->active_stream_id = 0;
         return;
     }
@@ -1718,8 +2150,12 @@ static void collect_pty_tx(struct v2_app *a, struct v2_service *s)
 static void close_pty_attachment(struct v2_app *a, struct v2_service *s)
 {
     if (s->active_stream_id) {
+        uint64_t stream_id = s->active_stream_id;
         (void)lmux2_close_stream(&a->conn, s->active_stream_id);
+        a->stream_close_count++;
         s->active_stream_id = 0;
+        log_msg(a, 1, "lmux2 STREAM_CLOSE sent service=%s stream=%llu pty-detached child=%ld",
+                s->name, (unsigned long long)stream_id, (long)s->child_pid);
     }
 }
 
@@ -1847,17 +2283,25 @@ static void pair_unbound_target_streams(struct v2_app *a)
     int i;
     if (a->role != LMUX2_ROLE_TARGET)
         return;
-    for (i = 0; i < LMUX2_CORE_MAX_STREAMS; i++) {
-        struct lmux2_stream *st = &a->conn.streams[i];
-        struct v2_service *s;
-        if (st->state != LMUX2_STREAM_OPEN || st->open_token)
+    for (i = 0; i < V2_MAX_SERVICES; i++) {
+        int j, best = -1;
+        uint64_t best_id = 0, token;
+        struct v2_service *s = &a->services[i];
+        if (!s->used || s->type != V2_SERVICE_UNIX_RENDEZVOUS || s->pending_fd < 0)
             continue;
-        if (find_binding(a, st->id, NULL))
-            continue;
-        s = find_service_id(a, st->service_id);
-        if (s && s->type == V2_SERVICE_UNIX_RENDEZVOUS && s->pending_fd >= 0) {
-            uint64_t token = s->pending_token;
-            bind_fd_to_stream(s, st->id, s->pending_fd);
+        for (j = 0; j < LMUX2_CORE_MAX_STREAMS; j++) {
+            struct lmux2_stream *st = &a->conn.streams[j];
+            if (st->state != LMUX2_STREAM_OPEN || st->open_token ||
+                st->service_id != s->id || find_binding(a, st->id, NULL))
+                continue;
+            if (st->id > best_id) {
+                best_id = st->id;
+                best = j;
+            }
+        }
+        if (best >= 0) {
+            token = s->pending_token;
+            bind_fd_to_stream(s, a->conn.streams[best].id, s->pending_fd);
             s->pending_fd = -1;
             s->pending_token = 0;
             if (token)
@@ -1875,6 +2319,48 @@ static int service_has_active_binding(const struct v2_service *s)
     return 0;
 }
 
+static int service_has_live_stream(const struct v2_app *a, const struct v2_service *s)
+{
+    int i;
+    if (!s->id)
+        return 0;
+    for (i = 0; i < LMUX2_CORE_MAX_STREAMS; i++) {
+        const struct lmux2_stream *st = &a->conn.streams[i];
+        if (st->service_id == s->id &&
+            st->state != LMUX2_STREAM_UNUSED &&
+            st->state != LMUX2_STREAM_TERMINAL &&
+            st->state != LMUX2_STREAM_RESET)
+            return 1;
+    }
+    return 0;
+}
+
+static int stream_has_endpoint_binding(struct v2_app *a, uint64_t stream_id)
+{
+    int i;
+    if (find_binding(a, stream_id, NULL))
+        return 1;
+    for (i = 0; i < V2_MAX_SERVICES; i++) {
+        struct v2_service *s = &a->services[i];
+        if (s->used && s->active_stream_id == stream_id)
+            return 1;
+    }
+    return 0;
+}
+
+static void ack_unbound_remote_close(struct v2_app *a, uint64_t stream_id)
+{
+    struct lmux2_stream *st = lmux2_find_stream(&a->conn, stream_id);
+    if (!st || st->state != LMUX2_STREAM_REMOTE_CLOSED ||
+        stream_has_endpoint_binding(a, stream_id))
+        return;
+    if (lmux2_close_stream(&a->conn, stream_id) == 0) {
+        a->stream_close_count++;
+        log_msg(a, 1, "lmux2 STREAM_CLOSE sent stream=%llu unbound-ack",
+                (unsigned long long)stream_id);
+    }
+}
+
 static void cleanup_terminal_bindings(struct v2_app *a)
 {
     int i, j;
@@ -1884,10 +2370,24 @@ static void cleanup_terminal_bindings(struct v2_app *a)
             continue;
         for (j = 0; j < V2_MAX_BINDINGS; j++) {
             struct v2_binding *b = &s->bindings[j];
-            const struct lmux2_stream *st;
+            struct lmux2_stream *st;
             if (b->fd < 0)
                 continue;
-            st = lmux2_find_stream_const(&a->conn, b->stream_id);
+            st = lmux2_find_stream(&a->conn, b->stream_id);
+            if (a->role == LMUX2_ROLE_HOST && st &&
+                st->state == LMUX2_STREAM_TERMINAL &&
+                st->open_token && st->remote_error == LMUX2_OPEN_E_BAD_STATE) {
+                uint64_t stream_id;
+                if (lmux2_open_stream_ex(&a->conn, s->id, 0, &stream_id) == 0) {
+                    log_msg(a, 1, "lmux2 host retrying stale-token client service=%s old_stream=%llu new_stream=%llu",
+                            s->name, (unsigned long long)b->stream_id,
+                            (unsigned long long)stream_id);
+                    b->stream_id = stream_id;
+                    s->last_stream_id = stream_id;
+                    a->stream_open_count++;
+                    continue;
+                }
+            }
             if (!st || st->state == LMUX2_STREAM_TERMINAL ||
                 st->state == LMUX2_STREAM_RESET ||
                 st->state == LMUX2_STREAM_REMOTE_CLOSED)
@@ -1917,7 +2417,7 @@ static void cleanup_terminal_bindings(struct v2_app *a)
     }
 }
 
-static void reset_connection_streams(struct v2_app *a)
+static void invalidate_connection_runtime(struct v2_app *a)
 {
     int i, j;
     for (i = 0; i < V2_MAX_SERVICES; i++) {
@@ -1927,11 +2427,15 @@ static void reset_connection_streams(struct v2_app *a)
         for (j = 0; j < V2_MAX_BINDINGS; j++)
             close_binding(a, s, &s->bindings[j], 0);
         s->active_stream_id = 0;
+        if (a->role == LMUX2_ROLE_HOST) {
+            s->id = 0;
+            s->pending_event_token = 0;
+        }
         if (s->type == V2_SERVICE_FILE)
             file_session_reset(&s->file);
     }
-    lmux2_conn_begin_physical(&a->conn, make_conn_id());
     a->factories_reported = 0;
+    a->peer_restart_converging = 0;
     a->desired_sent = 0;
     a->factory_unix = 0;
     a->factory_pty = 0;
@@ -1941,7 +2445,20 @@ static void reset_connection_streams(struct v2_app *a)
         a->desired[i].req_id = 0;
         a->desired[i].service_id = 0;
     }
+    log_msg(a, 1, "lmux2 remote factory/service cache invalidated");
+}
+
+static void reset_connection_streams(struct v2_app *a)
+{
+    invalidate_connection_runtime(a);
+    a->out_len = a->out_pos = 0;
+    lmux2_conn_begin_physical(&a->conn, make_conn_id());
+    a->connection_recreated_count++;
+    log_msg(a, 1, "lmux2 connection reset/recreated local_conn=%llu",
+            (unsigned long long)a->conn.local_conn_id);
     (void)lmux2_conn_start(&a->conn);
+    log_msg(a, 1, "lmux2 HELLO sent local_conn=%llu",
+            (unsigned long long)a->conn.local_conn_id);
 }
 
 static void supervise_pty_services(struct v2_app *a)
@@ -1984,19 +2501,87 @@ static int step_file_services(struct v2_app *a)
     return progress;
 }
 
+static int frame_is_peer_restart(struct v2_app *a, const struct lmux2_frame *fr,
+                                 uint64_t *old_peer, uint64_t *new_peer)
+{
+    struct lmux2_hello h;
+    if (fr->type != LMUX2_T_HELLO || a->conn.state != LMUX2_CONN_ESTABLISHED)
+        return 0;
+    if (fr->stream_id != 0 || fr->value != 0 ||
+        lmux2_parse_hello_payload(fr->payload, fr->payload_len, &h) < 0)
+        return 0;
+    if (h.role == a->role || h.conn_id == a->conn.peer_conn_id)
+        return 0;
+    if (old_peer)
+        *old_peer = a->conn.peer_conn_id;
+    if (new_peer)
+        *new_peer = h.conn_id;
+    return 1;
+}
+
 static void process_frame(struct v2_app *a, const struct lmux2_frame *fr)
 {
     enum lmux2_conn_state before = a->conn.state;
-    if (fr->type == LMUX2_T_CONTROL)
-        handle_control(a, fr);
-    (void)lmux2_handle_frame(&a->conn, fr);
+    uint64_t old_peer = 0, new_peer = 0, old_local = a->conn.local_conn_id;
+    int pre_established_drop = before != LMUX2_CONN_ESTABLISHED &&
+        fr->type != LMUX2_T_HELLO;
+    if (frame_is_peer_restart(a, fr, &old_peer, &new_peer)) {
+        if (a->peer_restart_converging) {
+            log_msg(a, 1, "lmux2 peer restart convergence old_peer=%llu new_peer=%llu",
+                    (unsigned long long)old_peer, (unsigned long long)new_peer);
+            a->conn.peer_conn_id = new_peer;
+            a->peer_restart_converging = 0;
+        } else {
+            log_msg(a, 1, "lmux2 peer restart detected old_peer=%llu new_peer=%llu",
+                    (unsigned long long)old_peer, (unsigned long long)new_peer);
+            log_msg(a, 1, "lmux2 old session retired local=%llu peer=%llu",
+                    (unsigned long long)old_local, (unsigned long long)old_peer);
+            a->peer_restart_count++;
+            reset_connection_streams(a);
+            a->peer_restart_converging = 1;
+            before = a->conn.state;
+            pre_established_drop = 0;
+        }
+    }
+    if (lmux2_handle_frame(&a->conn, fr) < 0)
+        return;
+    if (pre_established_drop) {
+        log_msg(a, 1, "lmux2 pre-HELLO frame dropped type=%u stream=%llu",
+                fr->type, (unsigned long long)fr->stream_id);
+        cleanup_terminal_bindings(a);
+        return;
+    }
     cleanup_terminal_bindings(a);
+    if (a->conn.state == LMUX2_CONN_ESTABLISHED &&
+        before != LMUX2_CONN_ESTABLISHED) {
+        a->connection_established_count++;
+        log_msg(a, 1, "lmux2 connection established local_conn=%llu peer_conn=%llu",
+                (unsigned long long)a->conn.local_conn_id,
+                (unsigned long long)a->conn.peer_conn_id);
+    }
     if (a->conn.state == LMUX2_CONN_ESTABLISHED &&
         before != LMUX2_CONN_ESTABLISHED && a->role == LMUX2_ROLE_TARGET &&
         !a->factories_reported) {
         (void)queue_factory_report(a);
         a->factories_reported = 1;
     }
+    if (fr->type == LMUX2_T_CONTROL && a->conn.state == LMUX2_CONN_ESTABLISHED)
+        handle_control(a, fr);
+    else if (fr->type == LMUX2_T_STREAM_OPEN_OK)
+        log_msg(a, 1, "lmux2 STREAM_OPEN_OK received stream=%llu",
+                (unsigned long long)fr->stream_id);
+    else if (fr->type == LMUX2_T_STREAM_OPEN_ERROR)
+        log_msg(a, 1, "lmux2 STREAM_OPEN_ERROR received stream=%llu code=%llu",
+                (unsigned long long)fr->stream_id, (unsigned long long)fr->value);
+    else if (fr->type == LMUX2_T_STREAM_CLOSE) {
+        log_msg(a, 1, "lmux2 STREAM_CLOSE received stream=%llu",
+                (unsigned long long)fr->stream_id);
+        ack_unbound_remote_close(a, fr->stream_id);
+    } else if (fr->type == LMUX2_T_STREAM_RESET)
+        log_msg(a, 1, "lmux2 STREAM_RESET received stream=%llu code=%llu",
+                (unsigned long long)fr->stream_id, (unsigned long long)fr->value);
+    if (fr->type != LMUX2_T_HELLO && a->conn.state == LMUX2_CONN_ESTABLISHED)
+        a->peer_restart_converging = 0;
     process_open_received(a);
 }
 
@@ -2007,6 +2592,7 @@ static void feed_carrier(struct v2_app *a)
         ssize_t r = read(a->carrier_fd, buf, sizeof(buf));
         ssize_t i;
         if (r > 0) {
+            a->carrier_rx_bytes += (unsigned long long)r;
             for (i = 0; i < r; i++) {
                 if (buf[i] == 0) {
                     if (!a->discard_until_delim && a->enc_in_len) {
@@ -2015,6 +2601,10 @@ static void feed_carrier(struct v2_app *a)
                             process_frame(a, &fr);
                         else
                             a->conn.state = LMUX2_CONN_ERROR;
+                        if (a->conn.state == LMUX2_CONN_ERROR) {
+                            carrier_lost(a);
+                            return;
+                        }
                     }
                     a->enc_in_len = 0;
                     a->discard_until_delim = 0;
@@ -2050,9 +2640,12 @@ static void build_next_output(struct v2_app *a)
 
 static void flush_carrier(struct v2_app *a)
 {
+    if (a->carrier_fd < 0)
+        return;
     while (a->out_pos < a->out_len) {
         ssize_t w = write(a->carrier_fd, a->out + a->out_pos, a->out_len - a->out_pos);
         if (w > 0) {
+            a->carrier_tx_bytes += (unsigned long long)w;
             a->out_pos += (size_t)w;
             if (a->out_pos == a->out_len)
                 a->out_pos = a->out_len = 0;
@@ -2086,6 +2679,8 @@ static void run_loop(struct v2_app *a)
         struct pollfd pfds[64];
         int kind[64], svc[64], bind[64];
         nfds_t n = 0, i;
+        try_open_carrier(a);
+        attach_host_pending_clients(a);
         (void)step_file_services(a);
         build_next_output(a);
         if (a->carrier_fd >= 0) {
@@ -2153,7 +2748,9 @@ static void run_loop(struct v2_app *a)
             } else if (kind[i] == 2) {
                 accept_service_client(a, &a->services[svc[i]]);
             } else if (kind[i] == 3) {
-                if (pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL))
+                if ((pfds[i].revents & (POLLERR | POLLNVAL)) ||
+                    ((pfds[i].revents & POLLHUP) &&
+                     socket_peer_closed(a->services[svc[i]].pending_fd)))
                     clear_pending(a, &a->services[svc[i]]);
             } else if (kind[i] == 4) {
                 struct v2_service *s = &a->services[svc[i]];
@@ -2162,7 +2759,9 @@ static void run_loop(struct v2_app *a)
                     deliver_stream_rx(a, s, b);
                 if (pfds[i].revents & POLLIN)
                     collect_endpoint_tx(a, s, b);
-                if (pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL))
+                if (b->fd >= 0 &&
+                    ((pfds[i].revents & (POLLERR | POLLNVAL)) ||
+                     ((pfds[i].revents & POLLHUP) && socket_peer_closed(b->fd))))
                     close_binding(a, s, b, 1);
             } else if (kind[i] == 5) {
                 struct v2_service *s = &a->services[svc[i]];
@@ -2186,6 +2785,7 @@ static void run_loop(struct v2_app *a)
             }
         }
         pair_unbound_target_streams(a);
+        attach_host_pending_clients(a);
         cleanup_terminal_bindings(a);
         (void)step_file_services(a);
         supervise_pty_services(a);
@@ -2301,21 +2901,7 @@ int lmux2_runtime_main(int argc, char **argv)
             return 1;
         }
         a.carrier_fd = -1;
-    } else if (a.carrier_connect_path) {
-        a.carrier_fd = connect_unix_carrier(a.carrier_connect_path);
-        if (a.carrier_fd < 0) {
-            perror(a.carrier_connect_path);
-            return 1;
-        }
-        a.carrier_fd_owned = 1;
-    } else if (a.carrier_fd < 0) {
-        a.carrier_fd = open(a.carrier_path, O_RDWR | O_NOCTTY | O_NONBLOCK);
-        if (a.carrier_fd < 0) {
-            perror(a.carrier_path);
-            return 1;
-        }
-        (void)configure_tty(a.carrier_fd);
-    } else {
+    } else if (a.carrier_fd >= 0) {
         (void)set_nonblock(a.carrier_fd);
     }
     if (a.control_path) {
@@ -2326,14 +2912,20 @@ int lmux2_runtime_main(int argc, char **argv)
             return 1;
         }
     }
+    if (create_host_desired_services(&a) < 0) {
+        cleanup_app(&a);
+        return 1;
+    }
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
     global_v2_app = &a;
     lmux2_conn_init(&a.conn, a.role, make_conn_id());
     (void)lmux2_conn_start(&a.conn);
+    if (a.carrier_fd < 0 && !a.carrier_listen_fd)
+        try_open_carrier(&a);
     fprintf(stderr, "lmuxd %s (%s) LMUX/2 role=%s\n", LMUX_BUILD_VERSION,
-            LMUX_PROJECT_NAME, a.role == LMUX2_ROLE_HOST ? "host" : "target");
+            LMUX_PROJECT_NAME, role_name(a.role));
     run_loop(&a);
     cleanup_app(&a);
     return 0;

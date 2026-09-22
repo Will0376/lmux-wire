@@ -46,7 +46,9 @@ struct lmux2_stream {
     uint64_t recv_consumed;
     uint64_t local_max_stream_data;
     uint64_t advertised_max_stream_data;
+    uint64_t last_sent_max_stream_data;
     uint64_t peer_max_stream_data;
+    int max_stream_data_dirty;
     uint32_t local_error;
     uint32_t remote_error;
     struct lmux2_ring rx;
@@ -65,7 +67,9 @@ struct lmux2_conn {
     uint64_t conn_rx_consumed;
     uint64_t local_max_data;
     uint64_t advertised_max_data;
+    uint64_t last_sent_max_data;
     uint64_t peer_max_data;
+    int max_data_dirty;
     int hello_sent;
     int rr_next;
     unsigned long long frames_tx;
@@ -73,6 +77,8 @@ struct lmux2_conn {
     unsigned long long protocol_errors;
     unsigned long long stream_errors;
     unsigned long long stale_frames;
+    unsigned long long pre_established_drops;
+    unsigned long long peer_restart_count;
     char last_error[96];
     struct lmux2_stream streams[LMUX2_CORE_MAX_STREAMS];
     struct lmux2_frame outq[LMUX2_OUTQ_CAP];

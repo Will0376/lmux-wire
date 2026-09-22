@@ -1,4 +1,4 @@
-#include "lmux2_protocol.h"
+#include "lmux2_core.h"
 #include "lmux.h"
 
 #include <errno.h>
@@ -221,25 +221,107 @@ static pid_t spawn_lmuxd(const char *role, int fd, const char *unix_arg1,
     return pid;
 }
 
+static pid_t spawn_host_connect(const char *carrier, const char *control,
+                                const char *unix_arg)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (getenv("LMUX2_IT_VERBOSE"))
+            execl("build/host/lmuxd", "lmuxd", "--role", "host",
+                  "--carrier-connect", carrier, "--control", control,
+                  "--unix", unix_arg, "--verbose", (char *)NULL);
+        else
+            execl("build/host/lmuxd", "lmuxd", "--role", "host",
+                  "--carrier-connect", carrier, "--control", control,
+                  "--unix", unix_arg, (char *)NULL);
+        _exit(127);
+    }
+    return pid;
+}
+
+static pid_t spawn_target_listen(const char *carrier)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (getenv("LMUX2_IT_VERBOSE"))
+            execl("build/host/lmuxd", "lmuxd", "--role", "target",
+                  "--carrier-listen", carrier, "--verbose", (char *)NULL);
+        else
+            execl("build/host/lmuxd", "lmuxd", "--role", "target",
+                  "--carrier-listen", carrier, (char *)NULL);
+        _exit(127);
+    }
+    return pid;
+}
+
+static int read_status_contains(const char *control, const char *want, int timeout_ms)
+{
+    char req[] = "STATUS\n";
+    char buf[4096];
+    size_t len = 0;
+    long long end = now_ms() + timeout_ms;
+    int fd = wait_connect(control, timeout_ms);
+    if (fd < 0)
+        return -1;
+    if (write_all_timeout(fd, (const uint8_t *)req, strlen(req), timeout_ms) < 0) {
+        close(fd);
+        return -1;
+    }
+    buf[0] = 0;
+    while (now_ms() < end && len + 1 < sizeof(buf)) {
+        int re = wait_fd_event(fd, POLLIN | POLLHUP | POLLERR | POLLNVAL,
+                               remaining_timeout(end));
+        ssize_t r;
+        if (re & POLLIN) {
+            r = read(fd, buf + len, sizeof(buf) - len - 1);
+            if (r > 0) {
+                len += (size_t)r;
+                buf[len] = 0;
+                if (strstr(buf, want)) {
+                    close(fd);
+                    return 0;
+                }
+                continue;
+            }
+            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+                continue;
+        }
+        if (re & (POLLHUP | POLLERR | POLLNVAL))
+            break;
+    }
+    close(fd);
+    return -1;
+}
+
 static int do_host_first(const char *host_sock, const char *target_sock,
                          const uint8_t *early, size_t early_len)
 {
     uint8_t got[128];
     int h = connect_unix_test(host_sock);
     int t;
-    if (h < 0 || fd_has_hup(h, 200))
+    if (h < 0 || fd_has_hup(h, 200)) {
+        fprintf(stderr, "host-first: host connect/hup failed fd=%d\n", h);
         return -1;
-    if (early_len && write_all_timeout(h, early, early_len, 1000) < 0)
+    }
+    if (early_len && write_all_timeout(h, early, early_len, 1000) < 0) {
+        fprintf(stderr, "host-first: early write failed\n");
         return -1;
+    }
     t = connect_unix_test(target_sock);
-    if (t < 0)
+    if (t < 0) {
+        fprintf(stderr, "host-first: target connect failed\n");
         return -1;
+    }
     if (early_len &&
         (read_exact_timeout(t, got, early_len, 3000) < 0 ||
-         memcmp(got, early, early_len) != 0))
+         memcmp(got, early, early_len) != 0)) {
+        fprintf(stderr, "host-first: early read/mismatch failed\n");
         return -1;
-    if (exchange_pair(h, t, (const uint8_t *)"H", 1, (const uint8_t *)"T", 1) < 0)
+    }
+    if (exchange_pair(h, t, (const uint8_t *)"H", 1, (const uint8_t *)"T", 1) < 0) {
+        fprintf(stderr, "host-first: exchange failed\n");
         return -1;
+    }
     close(h);
     close(t);
     return 0;
@@ -300,6 +382,20 @@ static int inject_stale_max_stream_data(int host_carrier_dup, uint64_t stream_id
     return encode_and_write_frame(host_carrier_dup, &fr);
 }
 
+static int inject_peer_restart_hello(int host_carrier_dup, uint64_t conn_id)
+{
+    struct lmux2_frame fr;
+    memset(&fr, 0, sizeof(fr));
+    fr.type = LMUX2_T_HELLO;
+    if (lmux2_make_hello_payload(LMUX2_ROLE_TARGET, conn_id,
+                                 LMUX2_CORE_MAX_STREAMS,
+                                 LMUX2_STREAM_RX_CAP,
+                                 LMUX2_CONN_RX_CAP,
+                                 fr.payload, &fr.payload_len) < 0)
+        return -1;
+    return encode_and_write_frame(host_carrier_dup, &fr);
+}
+
 static int inject_service_delete(int host_carrier_dup, uint64_t service_id)
 {
     struct lmux2_frame fr;
@@ -337,6 +433,18 @@ static int wait_socket_absent(const char *path)
     return -1;
 }
 
+static int wait_path_exists(const char *path, int timeout_ms)
+{
+    long long end = now_ms() + timeout_ms;
+    while (now_ms() < end) {
+        struct stat st;
+        if (lstat(path, &st) == 0)
+            return 0;
+        usleep(20000);
+    }
+    return -1;
+}
+
 static int abandon_once(const char *path)
 {
     int fd = connect_unix_test(path);
@@ -358,6 +466,7 @@ static int integration_test(void)
     char unix_arg[512], unix_dup[512], unix_conflict[512], unix_aux[512];
     int carrier[2] = { -1, -1 };
     int inject_fd = -1;
+    int inject_to_host_fd = -1;
     pid_t host = -1, target = -1;
     int rc = 1, i, host_fd_base = -1, target_fd_base = -1;
     static const uint8_t early_h[] = { 'H', 0x00, 0x03, 0xff, 'x' };
@@ -381,6 +490,9 @@ static int integration_test(void)
         goto out;
     inject_fd = dup(carrier[0]);
     if (inject_fd < 0)
+        goto out;
+    inject_to_host_fd = dup(carrier[1]);
+    if (inject_to_host_fd < 0)
         goto out;
     host = spawn_lmuxd("host", carrier[0], unix_arg, unix_dup, unix_conflict, unix_aux);
     target = spawn_lmuxd("target", carrier[1], NULL, NULL, NULL, NULL);
@@ -448,6 +560,11 @@ static int integration_test(void)
     if (do_target_first(host_aux, target_aux, early_t, sizeof(early_t)) < 0)
         goto out;
 
+    where = "peer restart HELLO on established carrier";
+    if (inject_peer_restart_hello(inject_to_host_fd, 0xabcdef1234567890ULL) < 0 ||
+        do_host_first(host_sock, target_sock, early_h, sizeof(early_h)) < 0)
+        goto out;
+
     where = "fd leak check";
     usleep(200000);
     if (host_fd_base >= 0 && count_fds(host) > host_fd_base + 2)
@@ -484,6 +601,7 @@ out:
     if (rc)
         fprintf(stderr, "where: %s\n", where);
     close(inject_fd);
+    close(inject_to_host_fd);
     if (carrier[0] >= 0) close(carrier[0]);
     if (carrier[1] >= 0) close(carrier[1]);
     stop_child(host);
@@ -494,9 +612,104 @@ out:
     return rc ? fail(where) : 0;
 }
 
+static int delayed_peer_test(void)
+{
+    char dir[] = "/tmp/lmux2-delay-it-XXXXXX";
+    char carrier[160], host_sock[160], target_sock[160], control[160], unix_arg[512];
+    pid_t host = -1, target = -1;
+    int h = -1, t = -1, rc = 1;
+    static const uint8_t early1[] = { 'p', 'r', 'e', 0x00, 0x03, '1' };
+    static const uint8_t early2[] = { 'r', 'e', 0x00, 'c', 0x03, '2' };
+    uint8_t got[sizeof(early2)];
+    const char *where = "setup";
+
+    if (!mkdtemp(dir))
+        return fail("mkdtemp delayed");
+    snprintf(carrier, sizeof(carrier), "%s/carrier.sock", dir);
+    snprintf(host_sock, sizeof(host_sock), "%s/gdb-host.sock", dir);
+    snprintf(target_sock, sizeof(target_sock), "%s/gdb-target.sock", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(unix_arg, sizeof(unix_arg), "gdb:%s:%s", host_sock, target_sock);
+
+    host = spawn_host_connect(carrier, control, unix_arg);
+    if (host < 0)
+        goto out;
+
+    where = "host listeners before peer";
+    if (wait_path_exists(control, 3000) < 0 ||
+        wait_path_exists(host_sock, 3000) < 0)
+        goto out;
+    if (read_status_contains(control, "wire:   LMUX/2", 3000) < 0 ||
+        read_status_contains(control, "carrier: down", 3000) < 0 ||
+        read_status_contains(control, "gdb type=unix-rendezvous", 3000) < 0 ||
+        read_status_contains(control, "configured=yes sent=no acknowledged=no", 3000) < 0)
+        goto out;
+
+    where = "pending host client before target";
+    h = connect_unix_test(host_sock);
+    if (h < 0 || fd_has_hup(h, 200) ||
+        write_all_timeout(h, early1, sizeof(early1), 1000) < 0)
+        goto out;
+
+    where = "delayed target startup";
+    target = spawn_target_listen(carrier);
+    if (target < 0 || wait_path_exists(carrier, 5000) < 0)
+        goto out;
+    t = wait_connect(target_sock, 10000);
+    if (t < 0 ||
+        read_exact_timeout(t, got, sizeof(early1), 5000) < 0 ||
+        memcmp(got, early1, sizeof(early1)) != 0)
+        goto out;
+    if (exchange_pair(h, t, (const uint8_t *)"A", 1, (const uint8_t *)"B", 1) < 0)
+        goto out;
+    close(h); h = -1;
+    close(t); t = -1;
+    if (read_status_contains(control, "factories: unix-rendezvous=yes", 3000) < 0)
+        goto out;
+    if (read_status_contains(control, "stale=0", 3000) < 0)
+        goto out;
+
+    where = "pending while carrier down";
+    stop_child(target);
+    target = -1;
+    usleep(300000);
+    if (wait_path_exists(host_sock, 1000) < 0)
+        goto out;
+    h = connect_unix_test(host_sock);
+    if (h < 0 || fd_has_hup(h, 200) ||
+        write_all_timeout(h, early2, sizeof(early2), 1000) < 0)
+        goto out;
+
+    where = "reconnect binds pending client";
+    target = spawn_target_listen(carrier);
+    if (target < 0 || wait_path_exists(carrier, 5000) < 0)
+        goto out;
+    t = wait_connect(target_sock, 10000);
+    if (t < 0 ||
+        read_exact_timeout(t, got, sizeof(early2), 5000) < 0 ||
+        memcmp(got, early2, sizeof(early2)) != 0)
+        goto out;
+    if (exchange_pair(h, t, (const uint8_t *)"C", 1, (const uint8_t *)"D", 1) < 0)
+        goto out;
+
+    rc = 0;
+out:
+    if (rc)
+        fprintf(stderr, "where delayed: %s\n", where);
+    if (h >= 0) close(h);
+    if (t >= 0) close(t);
+    stop_child(host);
+    stop_child(target);
+    unlink(carrier); unlink(host_sock); unlink(target_sock); unlink(control);
+    rmdir(dir);
+    return rc ? fail(where) : 0;
+}
+
 int main(void)
 {
     if (integration_test())
+        return 1;
+    if (delayed_peer_test())
         return 1;
     puts("lmux2 integration selftest ok");
     return 0;

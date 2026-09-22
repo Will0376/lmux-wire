@@ -21,6 +21,7 @@ static struct termios saved_termios;
 static int saved_termios_valid;
 static int term_detach;
 static int term_modal;
+static const char *term_label;
 static char host_cwd[LXF_PATH_MAX] = ".";
 static volatile sig_atomic_t term_winch_pending;
 
@@ -78,6 +79,15 @@ static const char *console_socket_for_arg(const char *arg)
         return "/run/lmux/console1.sock";
     if (strcmp(arg, "2") == 0)
         return "/run/lmux/console2.sock";
+    return arg;
+}
+
+static const char *console_label_for_arg(const char *arg)
+{
+    if (!arg || strcmp(arg, "1") == 0)
+        return "console1";
+    if (strcmp(arg, "2") == 0)
+        return "console2";
     return arg;
 }
 
@@ -380,7 +390,7 @@ static void usage(FILE *f)
         "\n"
         "lmux term Ctrl-T commands:\n"
         "  Ctrl-T ?        help\n"
-        "  Ctrl-T q/.      disconnect\n"
+        "  Ctrl-T q/.      detach\n"
         "  Ctrl-T Ctrl-T   send literal Ctrl-T\n"
         "  Ctrl-T p        upload file   HOST -> TARGET\n"
         "  Ctrl-T g        download file TARGET -> HOST\n",
@@ -591,11 +601,29 @@ static void term_help(void)
 {
     static const char msg[] =
         "\r\nCtrl-T ?       help\r\n"
-        "Ctrl-T q/.     disconnect\r\n"
+        "Ctrl-T q/.     detach\r\n"
         "Ctrl-T Ctrl-T  send literal Ctrl-T\r\n"
         "Ctrl-T p       upload file   HOST -> TARGET\r\n"
         "Ctrl-T g       download file TARGET -> HOST\r\n";
     (void)write(STDERR_FILENO, msg, sizeof(msg) - 1);
+}
+
+static void term_print_attached(const char *label)
+{
+    fprintf(stderr, "[attached: %s]\n", label ? label : "console1");
+    fflush(stderr);
+}
+
+static void term_print_detached(const char *label)
+{
+    fprintf(stderr, "\r\n[detached: %s]\r\n", label ? label : "console1");
+    fflush(stderr);
+}
+
+static void term_print_disconnected(const char *label)
+{
+    fprintf(stderr, "\r\n[disconnected: %s]\r\n", label ? label : "console1");
+    fflush(stderr);
 }
 
 static void append_byte(struct pipebuf *p, uint8_t b)
@@ -614,6 +642,7 @@ static void term_filter_input(struct pipebuf *out, const uint8_t *buf, size_t le
             if (b == '?') {
                 term_help();
             } else if (b == 'q' || b == '.') {
+                term_print_detached(term_label);
                 term_detach = 1;
             } else if (b == 'p' || b == 'g') {
                 term_modal = b;
@@ -743,7 +772,8 @@ cancel:
     return 1;
 }
 
-static int term_bridge_loop(int sock, const char *remote_dir, int channel, int verbose)
+static int term_bridge_loop(int sock, const char *remote_dir, int channel,
+                            int verbose, const char *label)
 {
     struct pipebuf a, b;
     int stdin_open = 1, sock_open = 1, stdout_open = 1;
@@ -753,6 +783,7 @@ static int term_bridge_loop(int sock, const char *remote_dir, int channel, int v
     memset(&b, 0, sizeof(b));
     term_detach = 0;
     term_modal = 0;
+    term_label = label;
     term_winch_pending = 1;
     if (set_nonblock(STDIN_FILENO) < 0 || set_nonblock(STDOUT_FILENO) < 0 || set_nonblock(sock) < 0) {
         perror("fcntl");
@@ -854,15 +885,22 @@ static int term_bridge_loop(int sock, const char *remote_dir, int channel, int v
         if (sock_idx >= 0 && (pfds[sock_idx].revents & (POLLERR | POLLNVAL)))
             sock_open = 0;
     }
+    if (!term_detach && !sock_open)
+        term_print_disconnected(label);
     return 0;
 }
 
-static int cmd_connect(const char *path, int raw_term, const char *remote_dir, int channel, int verbose)
+static int cmd_connect(const char *path, int raw_term, const char *remote_dir,
+                       int channel, int verbose, const char *label)
 {
-    int fd = connect_unix(path);
+    int fd = raw_term ? connect_unix_mode(path, 1) : connect_unix(path);
 
-    if (fd < 0)
+    if (fd < 0) {
+        if (raw_term)
+            fprintf(stderr, "lmux term: %s: connect: %s\n",
+                    label ? label : path, strerror(errno));
         return 1;
+    }
     if (raw_term && isatty(STDIN_FILENO)) {
         if (tcgetattr(STDIN_FILENO, &saved_termios) == 0) {
             saved_termios_valid = 1;
@@ -875,7 +913,11 @@ static int cmd_connect(const char *path, int raw_term, const char *remote_dir, i
             signal(SIGWINCH, on_winch);
         }
     }
-    return raw_term ? term_bridge_loop(fd, remote_dir, channel, verbose) : bridge_loop(fd);
+    if (raw_term) {
+        term_print_attached(label ? label : path);
+        return term_bridge_loop(fd, remote_dir, channel, verbose, label ? label : path);
+    }
+    return bridge_loop(fd);
 }
 
 static int full_write(int fd, const uint8_t *buf, size_t len)
@@ -1426,7 +1468,7 @@ int main(int argc, char **argv)
             usage(stderr);
             return 1;
         }
-        return cmd_connect(argv[2], 0, NULL, 0, 0);
+        return cmd_connect(argv[2], 0, NULL, 0, 0, argv[2]);
     }
     if (strcmp(argv[1], "status") == 0)
         return cmd_status(argc - 2, argv + 2);
@@ -1465,7 +1507,8 @@ int main(int argc, char **argv)
             channel = default_channel_for_console_arg(arg);
         }
         sock = console_socket_for_arg(arg);
-        return cmd_connect(sock, 1, remote_dir, channel, verbose);
+        return cmd_connect(sock, 1, remote_dir, channel, verbose,
+                           console_label_for_arg(arg));
     }
     if (strcmp(argv[1], "exec") == 0)
         return cmd_exec(argc - 2, argv + 2);
