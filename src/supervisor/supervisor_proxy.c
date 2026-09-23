@@ -77,7 +77,7 @@ size_t lmux_proxy_ring_space(const struct lmux_proxy_ring *r)
     return sizeof(r->buf) - r->len;
 }
 
-static size_t ring_write(struct lmux_proxy_ring *r, const uint8_t *buf, size_t n)
+size_t lmux_proxy_ring_write(struct lmux_proxy_ring *r, const uint8_t *buf, size_t n)
 {
     size_t done = 0;
     if (n > lmux_proxy_ring_space(r))
@@ -127,7 +127,7 @@ ssize_t lmux_proxy_read_into(int fd, struct lmux_proxy_ring *r)
         room = sizeof(tmp);
     n = read(fd, tmp, room);
     if (n > 0) {
-        (void)ring_write(r, tmp, (size_t)n);
+        (void)lmux_proxy_ring_write(r, tmp, (size_t)n);
         return n;
     }
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))

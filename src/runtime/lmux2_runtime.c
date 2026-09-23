@@ -38,7 +38,9 @@ struct v2_app {
     int worker_link_up_ack_sent;
     int worker_link_up_delay_done;
     int supervisor_ctrl_fd;
+    int outer_enabled;
     uint64_t worker_link_epoch;
+    struct lmux_link_endpoint outer;
     int factories_reported;
     int peer_restart_converging;
     uint64_t next_service_id;
@@ -67,6 +69,7 @@ static void retire_connection_streams(struct v2_app *a);
 static void build_next_output(struct v2_app *a);
 static void flush_carrier(struct v2_app *a);
 static void worker_maybe_finish_link_up(struct v2_app *a);
+static void feed_lmux_bytes(struct v2_app *a, const uint8_t *buf, size_t len);
 
 void v2_app_log(struct v2_app *a, int verbose, const char *fmt, ...)
 {
@@ -126,6 +129,13 @@ static const char *role_name(enum lmux2_role role)
     return role == LMUX2_ROLE_HOST ? "host" : "target";
 }
 
+static void begin_outer(struct v2_app *a)
+{
+    lmux_link_endpoint_begin(&a->outer, make_conn_id());
+    log_msg(a, 1, "outer HELLO sent local_conn=%llu",
+            (unsigned long long)a->outer.local_conn_id);
+}
+
 static void try_open_carrier(struct v2_app *a)
 {
     int rc;
@@ -136,7 +146,10 @@ static void try_open_carrier(struct v2_app *a)
     if (rc <= 0)
         return;
     log_msg(a, 1, "lmux2 carrier opened %s", lmux_carrier_label(&a->carrier));
-    reset_connection_streams(a);
+    if (a->outer_enabled)
+        begin_outer(a);
+    else
+        reset_connection_streams(a);
 }
 
 static void carrier_lost(struct v2_app *a)
@@ -144,7 +157,12 @@ static void carrier_lost(struct v2_app *a)
     if (lmux_carrier_fd(&a->carrier) < 0)
         return;
     log_msg(a, 1, "lmux2 carrier lost");
-    reset_connection_streams(a);
+    if (a->outer_enabled) {
+        lmux_link_endpoint_down(&a->outer);
+        retire_connection_streams(a);
+    } else {
+        reset_connection_streams(a);
+    }
     lmux_carrier_mark_lost(&a->carrier, now_ms());
     a->out_len = a->out_pos = 0;
     a->enc_in_len = 0;
@@ -157,7 +175,10 @@ static void accept_carrier(struct v2_app *a)
     if (rc <= 0)
         return;
     log_msg(a, 1, "lmux2 carrier accepted");
-    reset_connection_streams(a);
+    if (a->outer_enabled)
+        begin_outer(a);
+    else
+        reset_connection_streams(a);
 }
 
 static int queue_control(struct v2_app *a, uint8_t kind, uint32_t req_id,
@@ -997,38 +1018,43 @@ static void process_frame(struct v2_app *a, const struct lmux2_frame *fr)
     process_open_received(a);
 }
 
+static void feed_lmux_bytes(struct v2_app *a, const uint8_t *buf, size_t len)
+{
+    size_t i;
+    for (i = 0; i < len; i++) {
+        if (buf[i] == 0) {
+            if (!a->discard_until_delim && a->enc_in_len) {
+                struct lmux2_frame fr;
+                if (lmux2_decode_frame(a->enc_in, a->enc_in_len, &fr) == 0)
+                    process_frame(a, &fr);
+                else
+                    a->conn.state = LMUX2_CONN_ERROR;
+                if (a->conn.state == LMUX2_CONN_ERROR) {
+                    carrier_lost(a);
+                    return;
+                }
+            }
+            a->enc_in_len = 0;
+            a->discard_until_delim = 0;
+        } else if (!a->discard_until_delim) {
+            if (a->enc_in_len >= sizeof(a->enc_in)) {
+                a->discard_until_delim = 1;
+                a->enc_in_len = 0;
+                a->conn.state = LMUX2_CONN_ERROR;
+            } else {
+                a->enc_in[a->enc_in_len++] = buf[i];
+            }
+        }
+    }
+}
+
 static void feed_carrier(struct v2_app *a)
 {
     uint8_t buf[256];
     for (;;) {
         struct lmux_carrier_io io = lmux_carrier_read(&a->carrier, buf, sizeof(buf));
-        ssize_t i;
         if (io.status == LMUX_CARRIER_IO_PROGRESS) {
-            for (i = 0; i < io.n; i++) {
-                if (buf[i] == 0) {
-                    if (!a->discard_until_delim && a->enc_in_len) {
-                        struct lmux2_frame fr;
-                        if (lmux2_decode_frame(a->enc_in, a->enc_in_len, &fr) == 0)
-                            process_frame(a, &fr);
-                        else
-                            a->conn.state = LMUX2_CONN_ERROR;
-                        if (a->conn.state == LMUX2_CONN_ERROR) {
-                            carrier_lost(a);
-                            return;
-                        }
-                    }
-                    a->enc_in_len = 0;
-                    a->discard_until_delim = 0;
-                } else if (!a->discard_until_delim) {
-                    if (a->enc_in_len >= sizeof(a->enc_in)) {
-                        a->discard_until_delim = 1;
-                        a->enc_in_len = 0;
-                        a->conn.state = LMUX2_CONN_ERROR;
-                    } else {
-                        a->enc_in[a->enc_in_len++] = buf[i];
-                    }
-                }
-            }
+            feed_lmux_bytes(a, buf, (size_t)io.n);
             continue;
         }
         if (io.status == LMUX_CARRIER_IO_LOST || io.status == LMUX_CARRIER_IO_FATAL) {
@@ -1070,6 +1096,128 @@ static void flush_carrier(struct v2_app *a)
     }
 }
 
+static void outer_session_down(struct v2_app *a)
+{
+    log_msg(a, 1, "outer session down reason=%s",
+            a->outer.last_error[0] ? a->outer.last_error : "-");
+    retire_connection_streams(a);
+    if (lmux_carrier_fd(&a->carrier) >= 0)
+        begin_outer(a);
+}
+
+static void outer_peer_restart(struct v2_app *a)
+{
+    uint64_t old_local = a->outer.local_conn_id;
+    uint64_t old_peer = a->outer.peer_conn_id;
+    uint64_t new_peer = a->outer.pending_peer_hello.conn_id;
+    uint64_t new_local = make_conn_id();
+    unsigned events = 0;
+
+    log_msg(a, 1, "outer peer restart detected old_peer=%llu new_peer=%llu",
+            (unsigned long long)old_peer, (unsigned long long)new_peer);
+    log_msg(a, 1, "outer old session retired local=%llu peer=%llu",
+            (unsigned long long)old_local, (unsigned long long)old_peer);
+    retire_connection_streams(a);
+    if (lmux_link_endpoint_restart_from_pending(&a->outer, new_local, &events) < 0) {
+        outer_session_down(a);
+        return;
+    }
+    log_msg(a, 1, "outer new incarnation local=%llu",
+            (unsigned long long)a->outer.local_conn_id);
+    log_msg(a, 1, "outer HELLO sent local=%llu seq=0",
+            (unsigned long long)a->outer.local_conn_id);
+    log_msg(a, 1, "outer peer HELLO accepted peer=%llu",
+            (unsigned long long)a->outer.peer_conn_id);
+    if (events & LMUX_LINK_EV_ESTABLISHED) {
+        log_msg(a, 1, "outer established local_conn=%llu peer_conn=%llu",
+                (unsigned long long)a->outer.local_conn_id,
+                (unsigned long long)a->outer.peer_conn_id);
+        reset_connection_streams(a);
+    }
+}
+
+static void handle_outer_events(struct v2_app *a, unsigned events)
+{
+    if (events & LMUX_LINK_EV_PEER_RESTART) {
+        outer_peer_restart(a);
+        return;
+    }
+    if (events & LMUX_LINK_EV_DOWN) {
+        outer_session_down(a);
+        return;
+    }
+    if (events & LMUX_LINK_EV_ESTABLISHED) {
+        log_msg(a, 1, "outer established local_conn=%llu peer_conn=%llu",
+                (unsigned long long)a->outer.local_conn_id,
+                (unsigned long long)a->outer.peer_conn_id);
+        reset_connection_streams(a);
+    }
+}
+
+static void drain_outer_transport_rx(struct v2_app *a)
+{
+    uint8_t buf[256];
+    size_t n;
+    while ((n = v2_host_link_pull_lmux(&a->outer, buf, sizeof(buf))) > 0)
+        feed_lmux_bytes(a, buf, n);
+}
+
+static void feed_outer_carrier(struct v2_app *a)
+{
+    uint8_t buf[256];
+    for (;;) {
+        struct lmux_carrier_io io = lmux_carrier_read(&a->carrier, buf, sizeof(buf));
+        if (io.status == LMUX_CARRIER_IO_PROGRESS) {
+            unsigned events = 0;
+            (void)lmux_link_input_bytes(&a->outer, buf, (size_t)io.n, &events);
+            handle_outer_events(a, events);
+            drain_outer_transport_rx(a);
+            continue;
+        }
+        if (io.status == LMUX_CARRIER_IO_LOST || io.status == LMUX_CARRIER_IO_FATAL) {
+            carrier_lost(a);
+            return;
+        }
+        return;
+    }
+}
+
+static void pump_lmux_output_to_outer(struct v2_app *a)
+{
+    while (a->out_pos < a->out_len &&
+           lmux_link_transport_tx_space(&a->outer) > 0) {
+        size_t n = v2_host_link_push_lmux(&a->outer, a->out + a->out_pos,
+                                          a->out_len - a->out_pos);
+        if (n == 0)
+            break;
+        a->out_pos += n;
+        if (a->out_pos == a->out_len)
+            a->out_pos = a->out_len = 0;
+    }
+}
+
+static void flush_outer_carrier(struct v2_app *a)
+{
+    while (lmux_carrier_fd(&a->carrier) >= 0) {
+        struct lmux_carrier_io io;
+        if (!lmux_link_has_pending_output(&a->outer))
+            (void)lmux_link_build_output(&a->outer);
+        if (!lmux_link_has_pending_output(&a->outer))
+            return;
+        io = lmux_carrier_write(&a->carrier,
+                                lmux_link_output_ptr(&a->outer),
+                                lmux_link_output_len(&a->outer));
+        if (io.status == LMUX_CARRIER_IO_PROGRESS) {
+            lmux_link_output_consume(&a->outer, (size_t)io.n);
+            continue;
+        }
+        if (io.status == LMUX_CARRIER_IO_WOULD_BLOCK)
+            return;
+        carrier_lost(a);
+        return;
+    }
+}
+
 static int add_poll(struct pollfd *pfds, int *kind, int *svc, int *bind,
                     nfds_t *n, int fd, short events, int k, int s, int b)
 {
@@ -1090,6 +1238,7 @@ static void fill_host_status(struct v2_app *a, struct v2_host_status *st)
     memset(st, 0, sizeof(*st));
     st->role = a->role;
     st->carrier = &a->carrier;
+    st->outer = a->outer_enabled ? &a->outer : NULL;
     st->conn = &a->conn;
     st->target_services = a->target_status;
     st->connection_recreated_count = a->connection_recreated_count;
@@ -1146,13 +1295,27 @@ static void run_loop(struct v2_app *a)
         if (a->role == LMUX2_ROLE_HOST)
             v2_host_attach_pending_clients(a, &a->host, &a->conn);
         (void)step_file_services(a);
-        if (!a->worker_mode || a->worker_link_active || a->worker_link_up_flush)
+        if ((!a->worker_mode || a->worker_link_active || a->worker_link_up_flush) &&
+            (!a->outer_enabled || a->outer.state == LMUX_LINK_ESTABLISHED))
             build_next_output(a);
+        if (a->outer_enabled) {
+            pump_lmux_output_to_outer(a);
+            (void)lmux_link_build_output(&a->outer);
+        }
         if (lmux_carrier_fd(&a->carrier) >= 0 &&
             (!a->worker_mode || a->worker_link_active || a->worker_link_up_flush)) {
-            short ev = a->worker_link_active || !a->worker_mode ? POLLIN : 0;
-            if (a->out_pos < a->out_len)
-                ev |= POLLOUT;
+            short ev = 0;
+            if (a->outer_enabled) {
+                if (lmux_link_can_accept_physical(&a->outer) &&
+                    lmux_link_transport_rx_space(&a->outer) > 0)
+                    ev |= POLLIN;
+                if (lmux_link_wants_physical_write(&a->outer))
+                    ev |= POLLOUT;
+            } else {
+                ev = a->worker_link_active || !a->worker_mode ? POLLIN : 0;
+                if (a->out_pos < a->out_len)
+                    ev |= POLLOUT;
+            }
             add_poll(pfds, kind, svc, bind, &n, lmux_carrier_fd(&a->carrier),
                      ev, 1, -1, -1);
         }
@@ -1229,10 +1392,17 @@ static void run_loop(struct v2_app *a)
             if (!pfds[i].revents)
                 continue;
             if (kind[i] == 1) {
-                if ((pfds[i].revents & POLLIN) && (!a->worker_mode || a->worker_link_active))
-                    feed_carrier(a);
-                if (pfds[i].revents & POLLOUT)
-                    flush_carrier(a);
+                if (a->outer_enabled) {
+                    if (pfds[i].revents & POLLIN)
+                        feed_outer_carrier(a);
+                    if (pfds[i].revents & POLLOUT)
+                        flush_outer_carrier(a);
+                } else {
+                    if ((pfds[i].revents & POLLIN) && (!a->worker_mode || a->worker_link_active))
+                        feed_carrier(a);
+                    if (pfds[i].revents & POLLOUT)
+                        flush_carrier(a);
+                }
                 if (pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL))
                     carrier_lost(a);
             } else if (kind[i] == 2) {
@@ -1244,10 +1414,12 @@ static void run_loop(struct v2_app *a)
             } else if (kind[i] == 3) {
                 if (a->role == LMUX2_ROLE_HOST) {
                     struct v2_host_service *s = &a->host.services[svc[i]];
-                    if ((pfds[i].revents & (POLLERR | POLLNVAL)) ||
-                        ((pfds[i].revents & POLLHUP) &&
-                         v2_host_socket_peer_closed(s->pending_fd)))
+                    if (pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+                        v2_app_log(a, 1,
+                                   "lmux2 host pending client abandoned service=%s fd=%d events=0 revents=0x%x",
+                                   s->name, s->pending_fd, pfds[i].revents);
                         v2_host_clear_pending(s);
+                    }
                 } else {
                     struct v2_service *s = &a->services[svc[i]];
                     if ((pfds[i].revents & (POLLERR | POLLNVAL)) ||
@@ -1315,9 +1487,15 @@ static void run_loop(struct v2_app *a)
         cleanup_terminal_bindings(a);
         (void)step_file_services(a);
         v2_pty_supervise(a, a->services);
-        if (!a->worker_mode || a->worker_link_active || a->worker_link_up_flush) {
+        if ((!a->worker_mode || a->worker_link_active || a->worker_link_up_flush) &&
+            (!a->outer_enabled || a->outer.state == LMUX_LINK_ESTABLISHED)) {
             build_next_output(a);
-            flush_carrier(a);
+            if (a->outer_enabled) {
+                pump_lmux_output_to_outer(a);
+                flush_outer_carrier(a);
+            } else {
+                flush_carrier(a);
+            }
         }
         worker_maybe_finish_link_up(a);
     }
@@ -1347,6 +1525,7 @@ static void usage(FILE *f)
             "Usage: lmuxd --role host|target --carrier PATH [--control PATH] [--unix NAME:HOST_SOCKET:TARGET_SOCKET] [--pty NAME:HOST_SOCKET:ARGV] [--file NAME:HOST_SOCKET] [--verbose]\n"
             "       lmuxd --role host|target --carrier-fd FD [--control PATH] [--unix NAME:HOST_SOCKET:TARGET_SOCKET] [--pty NAME:HOST_SOCKET:ARGV] [--file NAME:HOST_SOCKET] [--verbose]\n"
             "       lmuxd --role host|target --carrier-listen PATH|--carrier-connect PATH [test carrier]\n"
+            "       lmuxd --role host --outer --carrier PATH [host options]\n"
             "       lmuxd --worker --carrier-fd FD --supervisor-control-fd FD [--verbose]\n"
             "       lmuxd --help\n"
             "       lmuxd --version\n",
@@ -1360,6 +1539,7 @@ int lmux2_runtime_main(int argc, char **argv)
     memset(&a, 0, sizeof(a));
     lmux_carrier_init(&a.carrier);
     v2_host_init(&a.host);
+    lmux_link_endpoint_init(&a.outer, LMUX_LINK_ROLE_HOST);
     a.supervisor_ctrl_fd = -1;
     a.next_service_id = 1;
     v2_service_slots_init(a.services);
@@ -1376,6 +1556,8 @@ int lmux2_runtime_main(int argc, char **argv)
             a.worker_mode = 1;
             a.role = LMUX2_ROLE_TARGET;
             have_role = 1;
+        } else if (strcmp(argv[i], "--outer") == 0) {
+            a.outer_enabled = 1;
         } else if (strcmp(argv[i], "--carrier") == 0) {
             if (++i >= argc)
                 return usage(stderr), 1;
@@ -1428,6 +1610,8 @@ int lmux2_runtime_main(int argc, char **argv)
     }
     if (!have_role || !lmux_carrier_is_configured(&a.carrier))
         return usage(stderr), 1;
+    if (a.outer_enabled && (a.role != LMUX2_ROLE_HOST || a.worker_mode))
+        return usage(stderr), 1;
     if (a.worker_mode &&
         (a.role != LMUX2_ROLE_TARGET || a.supervisor_ctrl_fd < 0 ||
          a.carrier.kind != LMUX_CARRIER_FD))
@@ -1455,13 +1639,17 @@ int lmux2_runtime_main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
     global_v2_app = &a;
     lmux2_conn_init(&a.conn, a.role, make_conn_id());
-    if (!a.worker_mode)
+    if (!a.worker_mode && !a.outer_enabled)
         (void)lmux2_conn_start(&a.conn);
     if (lmux_carrier_fd(&a.carrier) < 0 &&
         lmux_carrier_listen_fd(&a.carrier) < 0 && !a.worker_mode)
         try_open_carrier(&a);
-    fprintf(stderr, "lmuxd %s (%s) LMUX/2 role=%s%s\n", LMUX_BUILD_VERSION,
-            LMUX_PROJECT_NAME, role_name(a.role), a.worker_mode ? " worker" : "");
+    if (a.outer_enabled && lmux_carrier_fd(&a.carrier) >= 0 &&
+        a.outer.state == LMUX_LINK_DOWN)
+        begin_outer(&a);
+    fprintf(stderr, "lmuxd %s (%s) LMUX/2 role=%s%s%s\n", LMUX_BUILD_VERSION,
+            LMUX_PROJECT_NAME, role_name(a.role), a.worker_mode ? " worker" : "",
+            a.outer_enabled ? " outer=OUTER/1" : "");
     run_loop(&a);
     cleanup_app(&a);
     return 0;

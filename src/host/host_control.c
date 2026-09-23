@@ -179,6 +179,23 @@ void v2_host_status_write(struct v2_app *a, struct v2_host *h,
                    st->carrier->open_count, st->carrier->lost_count,
                    st->carrier->open_fail_count, st->carrier->rx_bytes,
                    st->carrier->tx_bytes);
+    if (st->outer) {
+        control_printf(h, "outer: %s local_conn=%llu peer_conn=%llu tx_seq=%llu rx_expected_seq=%llu tx_frames=%llu rx_frames=%llu crc_errors=%llu seq_errors=%llu resync_drops=%llu protocol_errors=%llu tx_payload_max=%u transport_tx_bytes=%llu transport_rx_bytes=%llu last_error=%s\n",
+                       lmux_link_state_name(st->outer->state),
+                       (unsigned long long)st->outer->local_conn_id,
+                       (unsigned long long)st->outer->peer_conn_id,
+                       (unsigned long long)st->outer->next_tx_seq,
+                       (unsigned long long)st->outer->expected_rx_seq,
+                       st->outer->tx_frames, st->outer->rx_frames,
+                       st->outer->crc_errors, st->outer->seq_errors,
+                       st->outer->resync_drops, st->outer->protocol_errors,
+                       st->outer->effective_transport_payload,
+                       st->outer->transport_tx_bytes,
+                       st->outer->transport_rx_bytes,
+                       st->outer->last_error[0] ? st->outer->last_error : "-");
+    } else {
+        control_printf(h, "outer: disabled\n");
+    }
     control_printf(h, "connection: %s local_conn=%llu peer_conn=%llu established=%llu recreations=%llu peer_restarts=%llu last_error=%s\n",
                    conn_state_name(st->conn->state),
                    (unsigned long long)st->conn->local_conn_id,

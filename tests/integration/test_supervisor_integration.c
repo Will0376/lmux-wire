@@ -36,6 +36,14 @@ static int wait_fd_event(int fd, short events, int timeout_ms)
     return poll(&pfd, 1, timeout_ms) > 0 ? pfd.revents : 0;
 }
 
+static int test_set_nonblock(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0)
+        return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
 static int connect_unix_test(const char *path)
 {
     int fd, err = 0;
@@ -137,6 +145,101 @@ static int shell_cmd_expect(int fd, const char *cmd, const char *needle,
            read_until(fd, needle, out, cap, 7000) < 0 ? -1 : 0;
 }
 
+static int read_status(const char *control, char *out, size_t cap)
+{
+    int fd = connect_unix_test(control);
+    size_t len = 0;
+    long long end = now_ms() + 2000;
+    if (fd < 0 || cap == 0)
+        return -1;
+    out[0] = 0;
+    if (write_all(fd, "STATUS\n", 7) < 0) {
+        close(fd);
+        return -1;
+    }
+    while (now_ms() < end && len + 1 < cap) {
+        int re = wait_fd_event(fd, POLLIN | POLLHUP | POLLERR | POLLNVAL, 100);
+        if (re & POLLIN) {
+            ssize_t r = read(fd, out + len, cap - len - 1);
+            if (r > 0) {
+                len += (size_t)r;
+                out[len] = 0;
+                continue;
+            }
+            if (r == 0) {
+                close(fd);
+                return len ? 0 : -1;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                continue;
+            close(fd);
+            return -1;
+        }
+        if (re & (POLLHUP | POLLERR | POLLNVAL)) {
+            close(fd);
+            return len ? 0 : -1;
+        }
+    }
+    close(fd);
+    return len ? 0 : -1;
+}
+
+static unsigned long long status_value(const char *status, const char *key)
+{
+    const char *p = strstr(status, key);
+    if (!p)
+        return 0;
+    p += strlen(key);
+    return strtoull(p, NULL, 10);
+}
+
+static int status_has_ready_layers(const char *status, int outer)
+{
+    if (!strstr(status, "connection: ESTABLISHED") ||
+        !strstr(status, "factories: unix-rendezvous=yes pty=yes file=yes") ||
+        !strstr(status, "desired_sent=yes"))
+        return 0;
+    if (!outer)
+        return 1;
+    return strstr(status, "outer: ESTABLISHED") &&
+           strstr(status, "pre_established_drops=0") &&
+           status_value(status, "transport_tx_bytes=") > 0 &&
+           status_value(status, "transport_rx_bytes=") > 0;
+}
+
+static int wait_ready_layers(const char *control, int outer, int timeout_ms,
+                             char *last, size_t cap)
+{
+    long long end = now_ms() + timeout_ms;
+    if (cap)
+        last[0] = 0;
+    while (now_ms() < end) {
+        if (read_status(control, last, cap) == 0 &&
+            status_has_ready_layers(last, outer))
+            return 0;
+        usleep(50000);
+    }
+    return -1;
+}
+
+static int wait_pending_state(const char *control, int want_pending,
+                              int timeout_ms, char *last, size_t cap)
+{
+    long long end = now_ms() + timeout_ms;
+    if (cap)
+        last[0] = 0;
+    while (now_ms() < end) {
+        if (read_status(control, last, cap) == 0) {
+            int pending = strstr(last, "console1") &&
+                          strstr(last, "pending_fd=yes");
+            if (!!pending == !!want_pending)
+                return 0;
+        }
+        usleep(20000);
+    }
+    return -1;
+}
+
 static long parse_pid_marker(const char *buf, const char *prefix)
 {
     const char *p = strstr(buf, prefix);
@@ -182,11 +285,19 @@ static pid_t spawn_supervisor(const char *carrier)
 {
     pid_t pid = fork();
     if (pid == 0) {
-        if (getenv("LMUX2_IT_VERBOSE"))
+        if (getenv("LMUX_SUP_IT_OUTER")) {
+            if (getenv("LMUX2_IT_VERBOSE"))
+                execl("build/host/lmuxd", "lmuxd", "--supervisor",
+                      "--outer", "--carrier-listen", carrier, "--verbose", (char *)NULL);
             execl("build/host/lmuxd", "lmuxd", "--supervisor",
-                  "--carrier-listen", carrier, "--verbose", (char *)NULL);
-        execl("build/host/lmuxd", "lmuxd", "--supervisor",
-              "--carrier-listen", carrier, (char *)NULL);
+                  "--outer", "--carrier-listen", carrier, (char *)NULL);
+        } else {
+            if (getenv("LMUX2_IT_VERBOSE"))
+                execl("build/host/lmuxd", "lmuxd", "--supervisor",
+                      "--carrier-listen", carrier, "--verbose", (char *)NULL);
+            execl("build/host/lmuxd", "lmuxd", "--supervisor",
+                  "--carrier-listen", carrier, (char *)NULL);
+        }
         _exit(127);
     }
     return pid;
@@ -197,16 +308,303 @@ static pid_t spawn_host(const char *carrier, const char *control,
 {
     pid_t pid = fork();
     if (pid == 0) {
-        if (getenv("LMUX2_IT_VERBOSE"))
+        if (getenv("LMUX_SUP_IT_OUTER")) {
+            if (getenv("LMUX2_IT_VERBOSE"))
+                execl("build/host/lmuxd", "lmuxd", "--role", "host",
+                      "--outer", "--carrier-connect", carrier, "--control", control,
+                      "--pty", pty1, "--file", file1, "--verbose", (char *)NULL);
+            execl("build/host/lmuxd", "lmuxd", "--role", "host",
+                  "--outer", "--carrier-connect", carrier, "--control", control,
+                  "--pty", pty1, "--file", file1, (char *)NULL);
+        } else {
+            if (getenv("LMUX2_IT_VERBOSE"))
+                execl("build/host/lmuxd", "lmuxd", "--role", "host",
+                      "--carrier-connect", carrier, "--control", control,
+                      "--pty", pty1, "--file", file1, "--verbose", (char *)NULL);
             execl("build/host/lmuxd", "lmuxd", "--role", "host",
                   "--carrier-connect", carrier, "--control", control,
-                  "--pty", pty1, "--file", file1, "--verbose", (char *)NULL);
-        execl("build/host/lmuxd", "lmuxd", "--role", "host",
-              "--carrier-connect", carrier, "--control", control,
-              "--pty", pty1, "--file", file1, (char *)NULL);
+                  "--pty", pty1, "--file", file1, (char *)NULL);
+        }
         _exit(127);
     }
     return pid;
+}
+
+static pid_t spawn_host_listen(const char *carrier, const char *control,
+                               const char *pty1, const char *file1, int outer)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (outer) {
+            if (getenv("LMUX2_IT_VERBOSE"))
+                execl("build/host/lmuxd", "lmuxd", "--role", "host",
+                      "--outer", "--carrier-listen", carrier, "--control", control,
+                      "--pty", pty1, "--file", file1, "--verbose", (char *)NULL);
+            execl("build/host/lmuxd", "lmuxd", "--role", "host",
+                  "--outer", "--carrier-listen", carrier, "--control", control,
+                  "--pty", pty1, "--file", file1, (char *)NULL);
+        } else {
+            if (getenv("LMUX2_IT_VERBOSE"))
+                execl("build/host/lmuxd", "lmuxd", "--role", "host",
+                      "--carrier-listen", carrier, "--control", control,
+                      "--pty", pty1, "--file", file1, "--verbose", (char *)NULL);
+            execl("build/host/lmuxd", "lmuxd", "--role", "host",
+                  "--carrier-listen", carrier, "--control", control,
+                  "--pty", pty1, "--file", file1, (char *)NULL);
+        }
+        _exit(127);
+    }
+    return pid;
+}
+
+static pid_t spawn_supervisor_fd(int fd, int outer)
+{
+    pid_t pid = fork();
+    char fdarg[32];
+    snprintf(fdarg, sizeof(fdarg), "%d", fd);
+    if (pid == 0) {
+        if (outer) {
+            if (getenv("LMUX2_IT_VERBOSE"))
+                execl("build/host/lmuxd", "lmuxd", "--supervisor",
+                      "--outer", "--carrier-fd", fdarg, "--verbose", (char *)NULL);
+            execl("build/host/lmuxd", "lmuxd", "--supervisor",
+                  "--outer", "--carrier-fd", fdarg, (char *)NULL);
+        } else {
+            execl("build/host/lmuxd", "lmuxd", "--supervisor",
+                  "--carrier-fd", fdarg, (char *)NULL);
+        }
+        _exit(127);
+    }
+    return pid;
+}
+
+static pid_t spawn_supervisor_connect(const char *carrier, int outer)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (outer) {
+            if (getenv("LMUX2_IT_VERBOSE"))
+                execl("build/host/lmuxd", "lmuxd", "--supervisor",
+                      "--outer", "--carrier-connect", carrier, "--verbose", (char *)NULL);
+            execl("build/host/lmuxd", "lmuxd", "--supervisor",
+                  "--outer", "--carrier-connect", carrier, (char *)NULL);
+        } else {
+            execl("build/host/lmuxd", "lmuxd", "--supervisor",
+                  "--carrier-connect", carrier, (char *)NULL);
+        }
+        _exit(127);
+    }
+    return pid;
+}
+
+static pid_t spawn_host_fd(int fd, const char *control,
+                           const char *pty1, const char *file1, int outer)
+{
+    pid_t pid = fork();
+    char fdarg[32];
+    snprintf(fdarg, sizeof(fdarg), "%d", fd);
+    if (pid == 0) {
+        if (outer) {
+            if (getenv("LMUX2_IT_VERBOSE"))
+                execl("build/host/lmuxd", "lmuxd", "--role", "host",
+                      "--outer", "--carrier-fd", fdarg, "--control", control,
+                      "--pty", pty1, "--file", file1, "--verbose", (char *)NULL);
+            execl("build/host/lmuxd", "lmuxd", "--role", "host",
+                  "--outer", "--carrier-fd", fdarg, "--control", control,
+                  "--pty", pty1, "--file", file1, (char *)NULL);
+        } else {
+            execl("build/host/lmuxd", "lmuxd", "--role", "host",
+                  "--carrier-fd", fdarg, "--control", control,
+                  "--pty", pty1, "--file", file1, (char *)NULL);
+        }
+        _exit(127);
+    }
+    return pid;
+}
+
+struct test_ring {
+    unsigned char buf[8192];
+    size_t r;
+    size_t w;
+    size_t len;
+};
+
+static void test_ring_clear(struct test_ring *r)
+{
+    r->r = r->w = r->len = 0;
+}
+
+static size_t test_ring_space(const struct test_ring *r)
+{
+    return sizeof(r->buf) - r->len;
+}
+
+static size_t test_ring_write(struct test_ring *r, const unsigned char *buf, size_t len)
+{
+    size_t done = 0;
+    if (len > test_ring_space(r))
+        len = test_ring_space(r);
+    while (done < len) {
+        size_t chunk = sizeof(r->buf) - r->w;
+        if (chunk > len - done)
+            chunk = len - done;
+        memcpy(r->buf + r->w, buf + done, chunk);
+        r->w = (r->w + chunk) % sizeof(r->buf);
+        r->len += chunk;
+        done += chunk;
+    }
+    return done;
+}
+
+static size_t test_ring_peek(const struct test_ring *r, const unsigned char **p)
+{
+    size_t chunk = sizeof(r->buf) - r->r;
+    if (chunk > r->len)
+        chunk = r->len;
+    *p = r->buf + r->r;
+    return chunk;
+}
+
+static void test_ring_consume(struct test_ring *r, size_t len)
+{
+    if (len > r->len)
+        len = r->len;
+    r->r = (r->r + len) % sizeof(r->buf);
+    r->len -= len;
+    if (r->len == 0)
+        r->r = r->w = 0;
+}
+
+static pid_t spawn_persistent_proxy(const char *path, int stable_fd)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        int lfd, cfd = -1;
+        struct sockaddr_un sa;
+        struct test_ring to_stable = {{0}, 0, 0, 0};
+        struct test_ring to_client = {{0}, 0, 0, 0};
+        signal(SIGPIPE, SIG_IGN);
+        unlink(path);
+        lfd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        if (lfd < 0)
+            _exit(127);
+        memset(&sa, 0, sizeof(sa));
+        sa.sun_family = AF_UNIX;
+        strcpy(sa.sun_path, path);
+        if (bind(lfd, (struct sockaddr *)&sa, sizeof(sa)) < 0 ||
+            listen(lfd, 4) < 0)
+            _exit(127);
+        (void)test_set_nonblock(stable_fd);
+        for (;;) {
+            struct pollfd pfds[3];
+            nfds_t n = 0, i;
+            pfds[n].fd = lfd;
+            pfds[n].events = cfd < 0 ? POLLIN : 0;
+            pfds[n++].revents = 0;
+            pfds[n].fd = stable_fd;
+            pfds[n].events = 0;
+            if (cfd >= 0 && test_ring_space(&to_client) > 0)
+                pfds[n].events |= POLLIN;
+            if (to_stable.len > 0)
+                pfds[n].events |= POLLOUT;
+            pfds[n++].revents = 0;
+            if (cfd >= 0) {
+                pfds[n].fd = cfd;
+                pfds[n].events = 0;
+                if (test_ring_space(&to_stable) > 0)
+                    pfds[n].events |= POLLIN;
+                if (to_client.len > 0)
+                    pfds[n].events |= POLLOUT;
+                pfds[n++].revents = 0;
+            }
+            if (poll(pfds, n, 1000) < 0) {
+                if (errno == EINTR)
+                    continue;
+                _exit(127);
+            }
+            for (i = 0; i < n; i++) {
+                if (!pfds[i].revents)
+                    continue;
+                if (pfds[i].fd == lfd && (pfds[i].revents & POLLIN)) {
+                    int fd = accept(lfd, NULL, NULL);
+                    if (fd >= 0) {
+                        (void)test_set_nonblock(fd);
+                        if (cfd >= 0)
+                            close(cfd);
+                        cfd = fd;
+                        test_ring_clear(&to_client);
+                    }
+                } else if (pfds[i].fd == stable_fd) {
+                    if (pfds[i].revents & POLLIN) {
+                        unsigned char tmp[512];
+                        ssize_t r = read(stable_fd, tmp, sizeof(tmp));
+                        if (r > 0)
+                            (void)test_ring_write(&to_client, tmp, (size_t)r);
+                        else if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+                            _exit(0);
+                    }
+                    if (pfds[i].revents & POLLOUT) {
+                        const unsigned char *p;
+                        size_t chunk = test_ring_peek(&to_stable, &p);
+                        ssize_t w = write(stable_fd, p, chunk);
+                        if (w > 0)
+                            test_ring_consume(&to_stable, (size_t)w);
+                        else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+                            _exit(0);
+                    }
+                    if (pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL))
+                        _exit(0);
+                } else if (cfd >= 0 && pfds[i].fd == cfd) {
+                    if (pfds[i].revents & POLLIN) {
+                        unsigned char tmp[512];
+                        ssize_t r = read(cfd, tmp, sizeof(tmp));
+                        if (r > 0)
+                            (void)test_ring_write(&to_stable, tmp, (size_t)r);
+                        else if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                            close(cfd);
+                            cfd = -1;
+                            test_ring_clear(&to_client);
+                        }
+                    }
+                    if (cfd >= 0 && (pfds[i].revents & POLLOUT)) {
+                        const unsigned char *p;
+                        size_t chunk = test_ring_peek(&to_client, &p);
+                        ssize_t w = write(cfd, p, chunk);
+                        if (w > 0)
+                            test_ring_consume(&to_client, (size_t)w);
+                        else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                            close(cfd);
+                            cfd = -1;
+                        }
+                    }
+                    if (cfd >= 0 && (pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL))) {
+                        close(cfd);
+                        cfd = -1;
+                        test_ring_clear(&to_client);
+                    }
+                }
+            }
+        }
+    }
+    return pid;
+}
+
+static int count_fds(pid_t pid)
+{
+    char path[64];
+    DIR *d;
+    struct dirent *de;
+    int n = 0;
+    snprintf(path, sizeof(path), "/proc/%ld/fd", (long)pid);
+    d = opendir(path);
+    if (!d)
+        return -1;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") != 0 && strcmp(de->d_name, "..") != 0)
+            n++;
+    }
+    closedir(d);
+    return n;
 }
 
 static pid_t find_child_pid(pid_t ppid)
@@ -365,6 +763,12 @@ static int integration_test(void)
         wait_path_exists(console, 5000) < 0 ||
         wait_path_exists(file_sock, 5000) < 0)
         goto out;
+    where = "startup layers";
+    if (wait_ready_layers(control, getenv("LMUX_SUP_IT_OUTER") != NULL,
+                          12000, out, sizeof(out)) < 0) {
+        dump_excerpt("startup status", out);
+        goto out;
+    }
     where = "console through supervisor";
     cfd = wait_connect(console, 10000);
     if (cfd < 0)
@@ -498,8 +902,13 @@ static int host_first_startup_test(void)
     unsetenv("LMUX_SUP_TEST_UP_ACK_DELAY_MS");
     if (sup < 0)
         goto out;
+    where = "host-first startup layers";
+    if (wait_ready_layers(control, getenv("LMUX_SUP_IT_OUTER") != NULL,
+                          12000, out, sizeof(out)) < 0) {
+        dump_excerpt("host-first status", out);
+        goto out;
+    }
     where = "host-first console";
-    sleep(3);
     cfd = wait_connect(console, 12000);
     if (cfd < 0)
         goto out;
@@ -523,11 +932,238 @@ out:
     return rc;
 }
 
+static int pending_abandon_test(int outer)
+{
+    char dir[] = "/tmp/lmux-supervisor-pending-XXXXXX";
+    char carrier[160], control[160], console[160], pty_arg[320], file_sock[160], file_arg[320];
+    pid_t host = -1;
+    int dummy = -1, base_fds = -1, end_fds = -1, rc = 1, i;
+    char out[4096];
+    const char *where = "setup";
+
+    if (!mkdtemp(dir))
+        return fail("mkdtemp pending");
+    snprintf(carrier, sizeof(carrier), "%s/carrier.sock", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(console, sizeof(console), "%s/console1.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+
+    host = spawn_host_listen(carrier, control, pty_arg, file_arg, outer);
+    if (host < 0)
+        goto out;
+    if (wait_path_exists(control, 5000) < 0 ||
+        wait_path_exists(console, 5000) < 0)
+        goto out;
+    dummy = wait_connect(carrier, 5000);
+    if (dummy < 0)
+        goto out;
+    if (outer) {
+        long long end = now_ms() + 5000;
+        do {
+            if (read_status(control, out, sizeof(out)) == 0 &&
+                strstr(out, "outer: WAIT_HELLO"))
+                break;
+            usleep(20000);
+        } while (now_ms() < end);
+        if (!strstr(out, "outer: WAIT_HELLO"))
+            goto out;
+    }
+    base_fds = count_fds(host);
+    if (base_fds < 0)
+        goto out;
+    where = outer ? "outer pending abandon" : "raw pending abandon";
+    for (i = 0; i < 100; i++) {
+        int cfd = wait_connect(console, 1000);
+        if (cfd < 0)
+            goto out;
+        if (wait_pending_state(control, 1, 1000, out, sizeof(out)) < 0) {
+            close(cfd);
+            dump_excerpt("pending yes status", out);
+            goto out;
+        }
+        close(cfd);
+        if (wait_pending_state(control, 0, 1000, out, sizeof(out)) < 0) {
+            dump_excerpt("pending no status", out);
+            goto out;
+        }
+    }
+    end_fds = count_fds(host);
+    if (end_fds != base_fds) {
+        fprintf(stderr, "pending fd baseline base=%d end=%d\n", base_fds, end_fds);
+        goto out;
+    }
+    rc = 0;
+out:
+    if (rc != 0)
+        fprintf(stderr, "pending where=%s\n", where);
+    if (dummy >= 0)
+        close(dummy);
+    stop_pid(host);
+    unlink(console);
+    unlink(file_sock);
+    unlink(control);
+    unlink(carrier);
+    rmdir(dir);
+    return rc;
+}
+
+static int outer_host_restart_same_physical_test(void)
+{
+    char dir[] = "/tmp/lmux-supervisor-host-restart-XXXXXX";
+    char carrier[160], control[160], console[160], pty_arg[320], file_sock[160], file_arg[320];
+    int stable[2] = {-1, -1};
+    pid_t proxy = -1, sup = -1, host = -1;
+    int cfd = -1, rc = 1;
+    char out[4096];
+    const char *where = "setup";
+
+    if (!mkdtemp(dir))
+        return fail("mkdtemp host restart same physical");
+    snprintf(carrier, sizeof(carrier), "%s/proxy.sock", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(console, sizeof(console), "%s/console1.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, stable) < 0)
+        goto out;
+    proxy = spawn_persistent_proxy(carrier, stable[0]);
+    close(stable[0]);
+    stable[0] = -1;
+    if (proxy < 0 || wait_path_exists(carrier, 5000) < 0)
+        goto out;
+    sup = spawn_supervisor_fd(stable[1], 1);
+    close(stable[1]);
+    stable[1] = -1;
+    if (sup < 0)
+        goto out;
+    setenv("LMUX_SUP_IT_OUTER", "1", 1);
+    host = spawn_host(carrier, control, pty_arg, file_arg);
+    unsetenv("LMUX_SUP_IT_OUTER");
+    if (host < 0)
+        goto out;
+    where = "initial host ready";
+    if (wait_path_exists(control, 5000) < 0 ||
+        wait_ready_layers(control, 1, 12000, out, sizeof(out)) < 0) {
+        dump_excerpt("host restart initial status", out);
+        goto out;
+    }
+    stop_pid(host);
+    host = -1;
+    where = "restarted host ready same physical";
+    setenv("LMUX_SUP_IT_OUTER", "1", 1);
+    host = spawn_host(carrier, control, pty_arg, file_arg);
+    unsetenv("LMUX_SUP_IT_OUTER");
+    if (host < 0 ||
+        wait_ready_layers(control, 1, 12000, out, sizeof(out)) < 0) {
+        dump_excerpt("host restart status", out);
+        goto out;
+    }
+    cfd = wait_connect(console, 12000);
+    if (cfd < 0 ||
+        shell_cmd_expect(cfd, "printf '%s%s\\n' HOST RESTART", "HOSTRESTART", out, sizeof(out)) < 0)
+        goto out;
+    rc = 0;
+out:
+    if (rc != 0)
+        fprintf(stderr, "host_restart_same_physical where=%s\n", where);
+    if (cfd >= 0)
+        close(cfd);
+    stop_pid(host);
+    stop_pid(sup);
+    stop_pid(proxy);
+    if (stable[0] >= 0) close(stable[0]);
+    if (stable[1] >= 0) close(stable[1]);
+    unlink(console);
+    unlink(file_sock);
+    unlink(control);
+    unlink(carrier);
+    rmdir(dir);
+    return rc;
+}
+
+static int outer_supervisor_restart_same_host_physical_test(void)
+{
+    char dir[] = "/tmp/lmux-supervisor-target-restart-XXXXXX";
+    char carrier[160], control[160], console[160], pty_arg[320], file_sock[160], file_arg[320];
+    int stable[2] = {-1, -1};
+    pid_t proxy = -1, sup = -1, host = -1;
+    int cfd = -1, rc = 1;
+    char out[4096];
+    const char *where = "setup";
+
+    if (!mkdtemp(dir))
+        return fail("mkdtemp supervisor restart same physical");
+    snprintf(carrier, sizeof(carrier), "%s/proxy.sock", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(console, sizeof(console), "%s/console1.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, stable) < 0)
+        goto out;
+    proxy = spawn_persistent_proxy(carrier, stable[0]);
+    close(stable[0]);
+    stable[0] = -1;
+    if (proxy < 0 || wait_path_exists(carrier, 5000) < 0)
+        goto out;
+    host = spawn_host_fd(stable[1], control, pty_arg, file_arg, 1);
+    close(stable[1]);
+    stable[1] = -1;
+    if (host < 0 || wait_path_exists(control, 5000) < 0)
+        goto out;
+    sup = spawn_supervisor_connect(carrier, 1);
+    if (sup < 0)
+        goto out;
+    where = "initial supervisor ready";
+    if (wait_ready_layers(control, 1, 12000, out, sizeof(out)) < 0) {
+        dump_excerpt("supervisor restart initial status", out);
+        goto out;
+    }
+    stop_pid(sup);
+    sup = -1;
+    where = "restarted supervisor ready same host physical";
+    sup = spawn_supervisor_connect(carrier, 1);
+    if (sup < 0 ||
+        wait_ready_layers(control, 1, 12000, out, sizeof(out)) < 0) {
+        dump_excerpt("supervisor restart status", out);
+        goto out;
+    }
+    rc = 0;
+out:
+    if (rc != 0)
+        fprintf(stderr, "supervisor_restart_same_physical where=%s\n", where);
+    if (cfd >= 0)
+        close(cfd);
+    stop_pid(host);
+    stop_pid(sup);
+    stop_pid(proxy);
+    if (stable[0] >= 0) close(stable[0]);
+    if (stable[1] >= 0) close(stable[1]);
+    unlink(console);
+    unlink(file_sock);
+    unlink(control);
+    unlink(carrier);
+    rmdir(dir);
+    return rc;
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
+    if (pending_abandon_test(0) || pending_abandon_test(1))
+        return 1;
+    if (outer_host_restart_same_physical_test() ||
+        outer_supervisor_restart_same_host_physical_test())
+        return 1;
     if (host_first_startup_test() || integration_test())
         return 1;
+    setenv("LMUX_SUP_IT_OUTER", "1", 1);
+    if (host_first_startup_test() || integration_test())
+        return 1;
+    unsetenv("LMUX_SUP_IT_OUTER");
     puts("supervisor integration selftest ok");
     return 0;
 }

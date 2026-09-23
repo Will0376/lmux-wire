@@ -1,5 +1,6 @@
 #include "supervisor.h"
 #include "carrier.h"
+#include "link_endpoint.h"
 #include "version.h"
 
 #include <errno.h>
@@ -40,18 +41,44 @@ struct supervisor {
     long long restart_delay_ms;
     long long worker_started_ms;
     int shutting_down;
+    int outer_enabled;
     int up_flush_worker_eagain;
+    struct lmux_link_endpoint outer;
     struct lmux_proxy_ring phys_to_worker;
     struct lmux_proxy_ring worker_to_phys;
 };
 
 static struct supervisor *global_sup;
 
+static void sup_log(struct supervisor *s, int verbose, const char *fmt, ...);
+static void drain_outer_transport_to_worker_ring(struct supervisor *s);
+
 static long long now_ms(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static uint64_t make_outer_conn_id(void)
+{
+    uint64_t v = 0;
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        if (read(fd, &v, sizeof(v)) != (ssize_t)sizeof(v))
+            v = 0;
+        close(fd);
+    }
+    if (!v)
+        v = ((uint64_t)(uint32_t)getpid() << 32) ^ (uint64_t)time(NULL) ^ 0x4f555431u;
+    return v ? v : 1;
+}
+
+static void begin_outer(struct supervisor *s)
+{
+    lmux_link_endpoint_begin(&s->outer, make_outer_conn_id());
+    sup_log(s, 1, "outer HELLO sent local_conn=%llu",
+            (unsigned long long)s->outer.local_conn_id);
 }
 
 static void sup_log(struct supervisor *s, int verbose, const char *fmt, ...)
@@ -225,6 +252,8 @@ static void physical_lost(struct supervisor *s)
         return;
     sup_log(s, 1, "supervisor physical carrier lost");
     lmux_carrier_mark_lost(&s->carrier, now);
+    if (s->outer_enabled)
+        lmux_link_endpoint_down(&s->outer);
     clear_proxy(s);
     if (s->worker_pid > 0 && s->worker_ctrl_fd >= 0 &&
         s->state != SUP_LINK_DOWN && s->state != SUP_DOWN_BARRIER &&
@@ -245,6 +274,8 @@ static void maybe_send_link_up(struct supervisor *s)
 {
     if (s->state != SUP_LINK_DOWN || s->worker_pid <= 0 ||
         s->worker_ctrl_fd < 0 || lmux_carrier_fd(&s->carrier) < 0)
+        return;
+    if (s->outer_enabled && s->outer.state != LMUX_LINK_ESTABLISHED)
         return;
     if (next_epoch(s) < 0) {
         s->stop = 1;
@@ -318,11 +349,182 @@ static void handle_ctrl_msg(struct supervisor *s)
 
 static void maybe_finish_up_flush(struct supervisor *s)
 {
-    if (s->state == SUP_UP_FLUSH &&
-        s->up_flush_worker_eagain &&
-        lmux_proxy_ring_len(&s->worker_to_phys) == 0) {
+    int empty = lmux_proxy_ring_len(&s->worker_to_phys) == 0;
+    if (s->outer_enabled)
+        empty = empty &&
+            lmux_link_transport_tx_len(&s->outer) == 0 &&
+            !lmux_link_has_pending_output(&s->outer);
+    if (s->state == SUP_UP_FLUSH && s->up_flush_worker_eagain && empty) {
         s->state = SUP_ACTIVE;
         sup_log(s, 1, "supervisor ACTIVE");
+        if (s->outer_enabled)
+            drain_outer_transport_to_worker_ring(s);
+    }
+}
+
+static void outer_session_down(struct supervisor *s)
+{
+    sup_log(s, 1, "outer session down reason=%s",
+            s->outer.last_error[0] ? s->outer.last_error : "-");
+    clear_proxy(s);
+    if (s->worker_pid > 0 && s->worker_ctrl_fd >= 0 &&
+        s->state != SUP_LINK_DOWN && s->state != SUP_DOWN_BARRIER &&
+        s->state != SUP_WORKER_DOWN) {
+        if (send_msg(s, LMUX_SUP_LINK_DOWN, s->link_epoch) == 0) {
+            s->state = SUP_DOWN_BARRIER;
+            sup_log(s, 1, "supervisor LINK_DOWN epoch=%llu",
+                    (unsigned long long)s->link_epoch);
+        } else {
+            schedule_restart(s, now_ms());
+            return;
+        }
+    } else if (s->state != SUP_WORKER_DOWN) {
+        s->state = SUP_LINK_DOWN;
+    }
+    if (lmux_carrier_fd(&s->carrier) >= 0)
+        begin_outer(s);
+}
+
+static void outer_peer_restart(struct supervisor *s)
+{
+    uint64_t old_local = s->outer.local_conn_id;
+    uint64_t old_peer = s->outer.peer_conn_id;
+    uint64_t new_peer = s->outer.pending_peer_hello.conn_id;
+    uint64_t new_local = make_outer_conn_id();
+    unsigned events = 0;
+
+    sup_log(s, 1, "outer peer restart detected old_peer=%llu new_peer=%llu",
+            (unsigned long long)old_peer, (unsigned long long)new_peer);
+    sup_log(s, 1, "outer old session retired local=%llu peer=%llu",
+            (unsigned long long)old_local, (unsigned long long)old_peer);
+    clear_proxy(s);
+    if (s->worker_pid > 0 && s->worker_ctrl_fd >= 0 &&
+        s->state != SUP_LINK_DOWN && s->state != SUP_DOWN_BARRIER &&
+        s->state != SUP_WORKER_DOWN) {
+        if (send_msg(s, LMUX_SUP_LINK_DOWN, s->link_epoch) == 0) {
+            s->state = SUP_DOWN_BARRIER;
+            sup_log(s, 1, "supervisor LINK_DOWN epoch=%llu",
+                    (unsigned long long)s->link_epoch);
+        } else {
+            schedule_restart(s, now_ms());
+            return;
+        }
+    } else if (s->state != SUP_WORKER_DOWN) {
+        s->state = SUP_LINK_DOWN;
+    }
+    if (lmux_link_endpoint_restart_from_pending(&s->outer, new_local, &events) < 0) {
+        outer_session_down(s);
+        return;
+    }
+    sup_log(s, 1, "outer new incarnation local=%llu",
+            (unsigned long long)s->outer.local_conn_id);
+    sup_log(s, 1, "outer HELLO sent local=%llu seq=0",
+            (unsigned long long)s->outer.local_conn_id);
+    sup_log(s, 1, "outer peer HELLO accepted peer=%llu",
+            (unsigned long long)s->outer.peer_conn_id);
+    if (events & LMUX_LINK_EV_ESTABLISHED) {
+        sup_log(s, 1, "outer established local_conn=%llu peer_conn=%llu",
+                (unsigned long long)s->outer.local_conn_id,
+                (unsigned long long)s->outer.peer_conn_id);
+        maybe_send_link_up(s);
+    }
+}
+
+static void handle_outer_events(struct supervisor *s, unsigned events)
+{
+    if (events & LMUX_LINK_EV_PEER_RESTART) {
+        outer_peer_restart(s);
+        return;
+    }
+    if (events & LMUX_LINK_EV_DOWN) {
+        outer_session_down(s);
+        return;
+    }
+    if (events & LMUX_LINK_EV_ESTABLISHED) {
+        sup_log(s, 1, "outer peer HELLO accepted peer_conn=%llu",
+                (unsigned long long)s->outer.peer_conn_id);
+        sup_log(s, 1, "outer established local_conn=%llu peer_conn=%llu",
+                (unsigned long long)s->outer.local_conn_id,
+                (unsigned long long)s->outer.peer_conn_id);
+        maybe_send_link_up(s);
+    }
+}
+
+static void drain_outer_transport_to_worker_ring(struct supervisor *s)
+{
+    uint8_t buf[256];
+    size_t n;
+    if (s->state != SUP_ACTIVE)
+        return;
+    while (lmux_proxy_ring_space(&s->phys_to_worker) > 0 &&
+           (n = lmux_supervisor_link_pull_worker(&s->outer, buf, sizeof(buf))) > 0) {
+        if (n > lmux_proxy_ring_space(&s->phys_to_worker))
+            n = lmux_proxy_ring_space(&s->phys_to_worker);
+        (void)lmux_proxy_ring_write(&s->phys_to_worker, buf, n);
+    }
+}
+
+static void feed_outer_physical(struct supervisor *s)
+{
+    uint8_t buf[256];
+    for (;;) {
+        struct lmux_carrier_io io = lmux_carrier_read(&s->carrier, buf, sizeof(buf));
+        if (io.status == LMUX_CARRIER_IO_PROGRESS) {
+            unsigned events = 0;
+            (void)lmux_link_input_bytes(&s->outer, buf, (size_t)io.n, &events);
+            handle_outer_events(s, events);
+            drain_outer_transport_to_worker_ring(s);
+            continue;
+        }
+        if (io.status == LMUX_CARRIER_IO_LOST || io.status == LMUX_CARRIER_IO_FATAL) {
+            physical_lost(s);
+            return;
+        }
+        return;
+    }
+}
+
+static void flush_outer_physical(struct supervisor *s)
+{
+    while (lmux_carrier_fd(&s->carrier) >= 0) {
+        struct lmux_carrier_io io;
+        if (!lmux_link_has_pending_output(&s->outer)) {
+            size_t plain = lmux_link_transport_tx_len(&s->outer);
+            uint64_t seq = s->outer.next_tx_seq;
+            int built = lmux_link_build_output(&s->outer);
+            if (built > 0 && s->state == SUP_UP_FLUSH) {
+                sup_log(s, 1,
+                        "outer TRANSPORT encoded state=UP_FLUSH seq=%llu plain_before=%zu pending=%zu",
+                        (unsigned long long)seq, plain,
+                        lmux_link_output_len(&s->outer));
+            }
+        }
+        if (!lmux_link_has_pending_output(&s->outer))
+            return;
+        if (s->state == SUP_UP_FLUSH) {
+            sup_log(s, 1, "outer physical write attempt pending=%zu",
+                    lmux_link_output_len(&s->outer));
+        }
+        io = lmux_carrier_write(&s->carrier, lmux_link_output_ptr(&s->outer),
+                                lmux_link_output_len(&s->outer));
+        if (io.status == LMUX_CARRIER_IO_PROGRESS) {
+            lmux_link_output_consume(&s->outer, (size_t)io.n);
+            if (s->state == SUP_UP_FLUSH) {
+                sup_log(s, 1, "outer physical write result=%ld remaining=%zu",
+                        (long)io.n, lmux_link_output_len(&s->outer));
+                if (!lmux_link_has_pending_output(&s->outer) &&
+                    lmux_link_transport_tx_len(&s->outer) == 0)
+                    sup_log(s, 1, "outer TRANSPORT committed to physical");
+            }
+            continue;
+        }
+        if (io.status == LMUX_CARRIER_IO_WOULD_BLOCK) {
+            if (s->state == SUP_UP_FLUSH)
+                sup_log(s, 1, "outer physical write would block");
+            return;
+        }
+        physical_lost(s);
+        return;
     }
 }
 
@@ -336,7 +538,10 @@ static void try_open_physical(struct supervisor *s)
     if (rc > 0) {
         sup_log(s, 1, "supervisor physical carrier opened %s",
                 lmux_carrier_label(&s->carrier));
-        maybe_send_link_up(s);
+        if (s->outer_enabled)
+            begin_outer(s);
+        else
+            maybe_send_link_up(s);
     }
 }
 
@@ -345,7 +550,10 @@ static void accept_physical(struct supervisor *s)
     int rc = lmux_carrier_accept(&s->carrier);
     if (rc > 0) {
         sup_log(s, 1, "supervisor physical carrier accepted");
-        maybe_send_link_up(s);
+        if (s->outer_enabled)
+            begin_outer(s);
+        else
+            maybe_send_link_up(s);
     }
 }
 
@@ -393,14 +601,30 @@ static int supervisor_loop(struct supervisor *s)
                      POLLIN, 2);
         if (lmux_carrier_fd(&s->carrier) >= 0) {
             short ev = 0;
-            if (s->state == SUP_ACTIVE &&
-                lmux_proxy_ring_space(&s->phys_to_worker) > 0)
-                ev |= POLLIN;
-            else if (s->state == SUP_UP_BARRIER)
-                sup_log(s, 1, "supervisor physical POLLIN suppressed during UP_BARRIER");
-            if ((s->state == SUP_ACTIVE || s->state == SUP_UP_FLUSH) &&
-                lmux_proxy_ring_len(&s->worker_to_phys) > 0)
-                ev |= POLLOUT;
+            if (s->outer_enabled) {
+                if ((s->outer.state != LMUX_LINK_ESTABLISHED ||
+                     s->state == SUP_ACTIVE) &&
+                    lmux_link_can_accept_physical(&s->outer) &&
+                    lmux_link_transport_rx_space(&s->outer) > 0)
+                    ev |= POLLIN;
+                if (lmux_link_wants_physical_write(&s->outer))
+                    ev |= POLLOUT;
+                if ((ev & POLLOUT) && s->state == SUP_UP_FLUSH) {
+                    sup_log(s, 1,
+                            "outer physical POLLOUT armed pending=%zu tx_plain=%zu",
+                            lmux_link_output_len(&s->outer),
+                            lmux_link_transport_tx_len(&s->outer));
+                }
+            } else {
+                if (s->state == SUP_ACTIVE &&
+                    lmux_proxy_ring_space(&s->phys_to_worker) > 0)
+                    ev |= POLLIN;
+                else if (s->state == SUP_UP_BARRIER)
+                    sup_log(s, 1, "supervisor physical POLLIN suppressed during UP_BARRIER");
+                if ((s->state == SUP_ACTIVE || s->state == SUP_UP_FLUSH) &&
+                    lmux_proxy_ring_len(&s->worker_to_phys) > 0)
+                    ev |= POLLOUT;
+            }
             add_poll(pfds, kind, &n, lmux_carrier_fd(&s->carrier), ev, 3);
         }
         if (s->worker_ctrl_fd >= 0)
@@ -408,8 +632,12 @@ static int supervisor_loop(struct supervisor *s)
         if (s->worker_data_fd >= 0 &&
             (s->state == SUP_ACTIVE || s->state == SUP_UP_FLUSH)) {
             short ev = 0;
-            if (lmux_proxy_ring_space(&s->worker_to_phys) > 0)
+            if (s->outer_enabled) {
+                if (lmux_link_transport_tx_space(&s->outer) > 0)
+                    ev |= POLLIN;
+            } else if (lmux_proxy_ring_space(&s->worker_to_phys) > 0) {
                 ev |= POLLIN;
+            }
             if (s->state == SUP_ACTIVE && lmux_proxy_ring_len(&s->phys_to_worker) > 0)
                 ev |= POLLOUT;
             else if (s->state == SUP_UP_BARRIER)
@@ -434,17 +662,24 @@ static int supervisor_loop(struct supervisor *s)
                 if (pfds[i].revents & POLLIN)
                     accept_physical(s);
             } else if (kind[i] == 3) {
-                if (pfds[i].revents & POLLIN) {
-                    ssize_t r = lmux_proxy_read_into(lmux_carrier_fd(&s->carrier),
-                                                     &s->phys_to_worker);
-                    if (r == 0 || r == -1)
-                        physical_lost(s);
-                }
-                if (pfds[i].revents & POLLOUT) {
-                    ssize_t w = lmux_proxy_write_from(lmux_carrier_fd(&s->carrier),
-                                                      &s->worker_to_phys);
-                    if (w == -1)
-                        physical_lost(s);
+                if (s->outer_enabled) {
+                    if (pfds[i].revents & POLLIN)
+                        feed_outer_physical(s);
+                    if (pfds[i].revents & POLLOUT)
+                        flush_outer_physical(s);
+                } else {
+                    if (pfds[i].revents & POLLIN) {
+                        ssize_t r = lmux_proxy_read_into(lmux_carrier_fd(&s->carrier),
+                                                         &s->phys_to_worker);
+                        if (r == 0 || r == -1)
+                            physical_lost(s);
+                    }
+                    if (pfds[i].revents & POLLOUT) {
+                        ssize_t w = lmux_proxy_write_from(lmux_carrier_fd(&s->carrier),
+                                                          &s->worker_to_phys);
+                        if (w == -1)
+                            physical_lost(s);
+                    }
                 }
                 if (pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL))
                     physical_lost(s);
@@ -458,22 +693,53 @@ static int supervisor_loop(struct supervisor *s)
                 }
             } else if (kind[i] == 5) {
                 if (pfds[i].revents & POLLIN) {
-                    for (;;) {
-                        ssize_t r;
-                        if (lmux_proxy_ring_space(&s->worker_to_phys) == 0)
-                            break;
-                        r = lmux_proxy_read_into(s->worker_data_fd,
-                                                 &s->worker_to_phys);
-                        if (r > 0)
-                            continue;
-                        if (r == -2) {
-                            if (s->state == SUP_UP_FLUSH)
-                                s->up_flush_worker_eagain = 1;
-                            break;
-                        }
-                        if (r == 0 || r == -1) {
+                    if (s->outer_enabled) {
+                        for (;;) {
+                            uint8_t tmp[512];
+                            ssize_t r;
+                            size_t room = lmux_link_transport_tx_space(&s->outer);
+                            if (room == 0)
+                                break;
+                            if (room > sizeof(tmp))
+                                room = sizeof(tmp);
+                            r = read(s->worker_data_fd, tmp, room);
+                            if (r > 0) {
+                                size_t queued = lmux_supervisor_link_push_worker(&s->outer, tmp, (size_t)r);
+                                if (s->state == SUP_UP_FLUSH) {
+                                    sup_log(s, 1,
+                                            "supervisor worker bytes read=%ld queued_outer=%zu state=UP_FLUSH",
+                                            (long)r, queued);
+                                }
+                                flush_outer_physical(s);
+                                continue;
+                            }
+                            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+                                if (s->state == SUP_UP_FLUSH)
+                                    s->up_flush_worker_eagain = 1;
+                                flush_outer_physical(s);
+                                break;
+                            }
                             schedule_restart(s, now_ms());
                             break;
+                        }
+                    } else {
+                        for (;;) {
+                            ssize_t r;
+                            if (lmux_proxy_ring_space(&s->worker_to_phys) == 0)
+                                break;
+                            r = lmux_proxy_read_into(s->worker_data_fd,
+                                                     &s->worker_to_phys);
+                            if (r > 0)
+                                continue;
+                            if (r == -2) {
+                                if (s->state == SUP_UP_FLUSH)
+                                    s->up_flush_worker_eagain = 1;
+                                break;
+                            }
+                            if (r == 0 || r == -1) {
+                                schedule_restart(s, now_ms());
+                                break;
+                            }
                         }
                     }
                 }
@@ -533,9 +799,9 @@ static void usage(FILE *f)
 {
     fprintf(f,
             "lmuxd %s (%s)\n"
-            "Usage: lmuxd --supervisor --carrier PATH [--worker-path PATH] [--verbose]\n"
-            "       lmuxd --supervisor --carrier-fd FD [--worker-path PATH] [--verbose]\n"
-            "       lmuxd --supervisor --carrier-listen PATH|--carrier-connect PATH [test carrier]\n",
+            "Usage: lmuxd --supervisor [--outer] --carrier PATH [--worker-path PATH] [--verbose]\n"
+            "       lmuxd --supervisor [--outer] --carrier-fd FD [--worker-path PATH] [--verbose]\n"
+            "       lmuxd --supervisor [--outer] --carrier-listen PATH|--carrier-connect PATH [test carrier]\n",
             LMUX_BUILD_VERSION, LMUX_PROJECT_NAME);
 }
 
@@ -546,6 +812,7 @@ int lmux_supervisor_main(int argc, char **argv)
     int i;
     memset(&s, 0, sizeof(s));
     lmux_carrier_init(&s.carrier);
+    lmux_link_endpoint_init(&s.outer, LMUX_LINK_ROLE_SUPERVISOR);
     s.worker_pid = -1;
     s.worker_data_fd = -1;
     s.worker_ctrl_fd = -1;
@@ -557,6 +824,8 @@ int lmux_supervisor_main(int argc, char **argv)
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--supervisor") == 0) {
             continue;
+        } else if (strcmp(argv[i], "--outer") == 0) {
+            s.outer_enabled = 1;
         } else if (strcmp(argv[i], "--carrier") == 0) {
             if (++i >= argc || lmux_carrier_set_tty_path(&s.carrier, argv[i]) < 0)
                 return usage(stderr), 1;
@@ -608,11 +877,14 @@ int lmux_supervisor_main(int argc, char **argv)
     signal(SIGINT, stop_handler);
     signal(SIGTERM, stop_handler);
     signal(SIGPIPE, SIG_IGN);
-    fprintf(stderr, "lmuxd %s (%s) supervisor\n", LMUX_BUILD_VERSION,
-            LMUX_PROJECT_NAME);
+    fprintf(stderr, "lmuxd %s (%s) supervisor%s\n", LMUX_BUILD_VERSION,
+            LMUX_PROJECT_NAME, s.outer_enabled ? " outer=OUTER/1" : "");
     (void)spawn_worker(&s);
     if (lmux_carrier_fd(&s.carrier) < 0 && lmux_carrier_listen_fd(&s.carrier) < 0)
         try_open_physical(&s);
+    if (s.outer_enabled && lmux_carrier_fd(&s.carrier) >= 0 &&
+        s.outer.state == LMUX_LINK_DOWN)
+        begin_outer(&s);
     (void)supervisor_loop(&s);
     cleanup_supervisor(&s);
     return 0;

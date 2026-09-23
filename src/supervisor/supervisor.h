@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+struct lmux_link_endpoint;
+
 #define LMUX_SUP_MSG_LEN 16
 #define LMUX_SUP_PROXY_CAP 4096
 #define LMUX_SUP_WORKER_DATA_FD 3
@@ -40,11 +42,17 @@ int lmux_supervisor_msg_decode(const uint8_t in[LMUX_SUP_MSG_LEN],
 void lmux_proxy_ring_clear(struct lmux_proxy_ring *r);
 size_t lmux_proxy_ring_len(const struct lmux_proxy_ring *r);
 size_t lmux_proxy_ring_space(const struct lmux_proxy_ring *r);
+size_t lmux_proxy_ring_write(struct lmux_proxy_ring *r,
+                             const uint8_t *buf, size_t len);
 ssize_t lmux_proxy_read_into(int fd, struct lmux_proxy_ring *r);
 ssize_t lmux_proxy_write_from(int fd, struct lmux_proxy_ring *r);
 int lmux_supervisor_drain_fd(int fd);
 
 pid_t lmux_supervisor_spawn_worker(const char *worker_path, int data_fd,
                                    int ctrl_fd, int verbose);
+size_t lmux_supervisor_link_push_worker(struct lmux_link_endpoint *link,
+                                        const uint8_t *buf, size_t len);
+size_t lmux_supervisor_link_pull_worker(struct lmux_link_endpoint *link,
+                                        uint8_t *buf, size_t len);
 
 #endif

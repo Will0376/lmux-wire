@@ -2,6 +2,7 @@
 #define LMUX_HOST_H
 
 #include "carrier.h"
+#include "link_endpoint.h"
 #include "lmux2_core.h"
 #include "lmux2_service.h"
 
@@ -91,6 +92,7 @@ struct v2_host {
 struct v2_host_status {
     enum lmux2_role role;
     const struct lmux_carrier *carrier;
+    const struct lmux_link_endpoint *outer;
     const struct lmux2_conn *conn;
     const struct v2_target_service_status *target_services;
     unsigned long long connection_recreated_count;
@@ -100,6 +102,11 @@ struct v2_host_status {
     unsigned long long stream_close_count;
     unsigned long long stream_reset_count;
 };
+
+size_t v2_host_link_push_lmux(struct lmux_link_endpoint *link,
+                              const uint8_t *buf, size_t len);
+size_t v2_host_link_pull_lmux(struct lmux_link_endpoint *link,
+                              uint8_t *buf, size_t len);
 
 int v2_runtime_send_service_ensure(struct v2_app *a, struct v2_desired *d);
 int v2_runtime_send_winsize_control(struct v2_app *a, uint64_t service_id,

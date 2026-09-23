@@ -58,6 +58,7 @@ umask 000
 
 nohup "$LMUXD" \
 --role host \
+--outer \
 --carrier "$CARRIER" \
 --control "$RUNDIR/control.sock" \
 --pty console1:"$RUNDIR/console1.sock":/bin/sh \
