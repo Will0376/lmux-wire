@@ -5,6 +5,7 @@
 #include "lmux2_core.h"
 #include "lmux.h"
 #include "services.h"
+#include "supervisor.h"
 #include "version.h"
 
 #include <errno.h>
@@ -31,6 +32,13 @@ struct v2_app {
     struct lmux_carrier carrier;
     int verbose;
     int stop;
+    int worker_mode;
+    int worker_link_active;
+    int worker_link_up_flush;
+    int worker_link_up_ack_sent;
+    int worker_link_up_delay_done;
+    int supervisor_ctrl_fd;
+    uint64_t worker_link_epoch;
     int factories_reported;
     int peer_restart_converging;
     uint64_t next_service_id;
@@ -55,6 +63,10 @@ struct v2_app {
 static struct v2_app *global_v2_app;
 
 static void reset_connection_streams(struct v2_app *a);
+static void retire_connection_streams(struct v2_app *a);
+static void build_next_output(struct v2_app *a);
+static void flush_carrier(struct v2_app *a);
+static void worker_maybe_finish_link_up(struct v2_app *a);
 
 void v2_app_log(struct v2_app *a, int verbose, const char *fmt, ...)
 {
@@ -784,6 +796,110 @@ static void reset_connection_streams(struct v2_app *a)
             (unsigned long long)a->conn.local_conn_id);
 }
 
+static void retire_connection_streams(struct v2_app *a)
+{
+    invalidate_connection_runtime(a);
+    a->out_len = a->out_pos = 0;
+    a->enc_in_len = 0;
+    a->discard_until_delim = 0;
+    lmux2_conn_begin_physical(&a->conn, make_conn_id());
+    log_msg(a, 1, "lmux2 session retired local_conn=%llu",
+            (unsigned long long)a->conn.local_conn_id);
+}
+
+static int send_supervisor_msg(struct v2_app *a, uint8_t type, uint64_t epoch)
+{
+    uint8_t buf[LMUX_SUP_MSG_LEN];
+    struct lmux_supervisor_msg msg;
+    ssize_t w;
+    msg.type = type;
+    msg.link_epoch = epoch;
+    if (lmux_supervisor_msg_encode(buf, &msg) < 0)
+        return -1;
+    w = send(a->supervisor_ctrl_fd, buf, sizeof(buf), 0);
+    return w == (ssize_t)sizeof(buf) ? 0 : -1;
+}
+
+static void worker_link_down(struct v2_app *a, uint64_t epoch)
+{
+    a->worker_link_active = 0;
+    a->worker_link_epoch = epoch;
+    log_msg(a, 1, "lmux2 supervisor LINK_DOWN epoch=%llu",
+            (unsigned long long)epoch);
+    retire_connection_streams(a);
+    if (lmux_carrier_fd(&a->carrier) >= 0)
+        (void)lmux_supervisor_drain_fd(lmux_carrier_fd(&a->carrier));
+    (void)send_supervisor_msg(a, LMUX_SUP_LINK_DOWN_ACK, epoch);
+    log_msg(a, 1, "lmux2 supervisor LINK_DOWN_ACK epoch=%llu",
+            (unsigned long long)epoch);
+}
+
+static void worker_link_up(struct v2_app *a, uint64_t epoch)
+{
+    a->worker_link_epoch = epoch;
+    a->worker_link_active = 0;
+    a->worker_link_up_flush = 1;
+    a->worker_link_up_ack_sent = 0;
+    a->worker_link_up_delay_done = 0;
+    log_msg(a, 1, "lmux2 supervisor LINK_UP epoch=%llu",
+            (unsigned long long)epoch);
+    reset_connection_streams(a);
+    build_next_output(a);
+    flush_carrier(a);
+    worker_maybe_finish_link_up(a);
+}
+
+static void worker_maybe_finish_link_up(struct v2_app *a)
+{
+    if (!a->worker_mode || !a->worker_link_up_flush || a->worker_link_up_ack_sent)
+        return;
+    build_next_output(a);
+    flush_carrier(a);
+    if (a->out_len == 0 && a->conn.outq_len == 0) {
+        if (!a->worker_link_up_delay_done) {
+            const char *delay = getenv("LMUX_SUP_TEST_UP_ACK_DELAY_MS");
+            a->worker_link_up_delay_done = 1;
+            if (delay && *delay) {
+                long ms = strtol(delay, NULL, 10);
+                if (ms > 0 && ms < 5000)
+                    usleep((useconds_t)ms * 1000u);
+            }
+        }
+        a->worker_link_up_ack_sent = 1;
+        a->worker_link_up_flush = 0;
+        a->worker_link_active = 1;
+        (void)send_supervisor_msg(a, LMUX_SUP_LINK_UP_ACK, a->worker_link_epoch);
+        log_msg(a, 1, "lmux2 supervisor LINK_UP_ACK epoch=%llu hello-committed",
+                (unsigned long long)a->worker_link_epoch);
+    }
+}
+
+static void handle_supervisor_control(struct v2_app *a)
+{
+    uint8_t buf[LMUX_SUP_MSG_LEN];
+    ssize_t r;
+    struct lmux_supervisor_msg msg;
+    for (;;) {
+        r = recv(a->supervisor_ctrl_fd, buf, sizeof(buf), 0);
+        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+            return;
+        if (r != (ssize_t)sizeof(buf) ||
+            lmux_supervisor_msg_decode(buf, &msg) < 0) {
+            log_msg(a, 1, "lmux2 malformed supervisor sideband");
+            a->stop = 1;
+            return;
+        }
+        if (msg.type == LMUX_SUP_LINK_DOWN)
+            worker_link_down(a, msg.link_epoch);
+        else if (msg.type == LMUX_SUP_LINK_UP)
+            worker_link_up(a, msg.link_epoch);
+        else if (msg.type == LMUX_SUP_SHUTDOWN)
+            a->stop = 1;
+        else
+            log_msg(a, 1, "lmux2 unexpected supervisor message type=%u", msg.type);
+    }
+}
+
 static int step_file_services(struct v2_app *a)
 {
     int i, progress = 0;
@@ -1025,13 +1141,16 @@ static void run_loop(struct v2_app *a)
         struct pollfd pfds[64];
         int kind[64], svc[64], bind[64];
         nfds_t n = 0, i;
-        try_open_carrier(a);
+        if (!a->worker_mode)
+            try_open_carrier(a);
         if (a->role == LMUX2_ROLE_HOST)
             v2_host_attach_pending_clients(a, &a->host, &a->conn);
         (void)step_file_services(a);
-        build_next_output(a);
-        if (lmux_carrier_fd(&a->carrier) >= 0) {
-            short ev = POLLIN;
+        if (!a->worker_mode || a->worker_link_active || a->worker_link_up_flush)
+            build_next_output(a);
+        if (lmux_carrier_fd(&a->carrier) >= 0 &&
+            (!a->worker_mode || a->worker_link_active || a->worker_link_up_flush)) {
+            short ev = a->worker_link_active || !a->worker_mode ? POLLIN : 0;
             if (a->out_pos < a->out_len)
                 ev |= POLLOUT;
             add_poll(pfds, kind, svc, bind, &n, lmux_carrier_fd(&a->carrier),
@@ -1045,6 +1164,8 @@ static void run_loop(struct v2_app *a)
             add_poll(pfds, kind, svc, bind, &n, a->host.control_listen_fd, POLLIN, 6, -1, -1);
         if (a->host.control_fd >= 0)
             add_poll(pfds, kind, svc, bind, &n, a->host.control_fd, POLLIN, 7, -1, -1);
+        if (a->worker_mode && a->supervisor_ctrl_fd >= 0)
+            add_poll(pfds, kind, svc, bind, &n, a->supervisor_ctrl_fd, POLLIN, 9, -1, -1);
         for (i = 0; i < V2_MAX_SERVICES; i++) {
             int j;
             struct v2_host_service *hs;
@@ -1108,7 +1229,7 @@ static void run_loop(struct v2_app *a)
             if (!pfds[i].revents)
                 continue;
             if (kind[i] == 1) {
-                if (pfds[i].revents & POLLIN)
+                if ((pfds[i].revents & POLLIN) && (!a->worker_mode || a->worker_link_active))
                     feed_carrier(a);
                 if (pfds[i].revents & POLLOUT)
                     flush_carrier(a);
@@ -1181,6 +1302,11 @@ static void run_loop(struct v2_app *a)
             } else if (kind[i] == 8) {
                 if (pfds[i].revents & POLLIN)
                     accept_carrier(a);
+            } else if (kind[i] == 9) {
+                if (pfds[i].revents & POLLIN)
+                    handle_supervisor_control(a);
+                if (pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL))
+                    a->stop = 1;
             }
         }
         v2_unix_pair_unbound_target_streams(a, &a->conn, a->services);
@@ -1189,8 +1315,11 @@ static void run_loop(struct v2_app *a)
         cleanup_terminal_bindings(a);
         (void)step_file_services(a);
         v2_pty_supervise(a, a->services);
-        build_next_output(a);
-        flush_carrier(a);
+        if (!a->worker_mode || a->worker_link_active || a->worker_link_up_flush) {
+            build_next_output(a);
+            flush_carrier(a);
+        }
+        worker_maybe_finish_link_up(a);
     }
 }
 
@@ -1218,6 +1347,7 @@ static void usage(FILE *f)
             "Usage: lmuxd --role host|target --carrier PATH [--control PATH] [--unix NAME:HOST_SOCKET:TARGET_SOCKET] [--pty NAME:HOST_SOCKET:ARGV] [--file NAME:HOST_SOCKET] [--verbose]\n"
             "       lmuxd --role host|target --carrier-fd FD [--control PATH] [--unix NAME:HOST_SOCKET:TARGET_SOCKET] [--pty NAME:HOST_SOCKET:ARGV] [--file NAME:HOST_SOCKET] [--verbose]\n"
             "       lmuxd --role host|target --carrier-listen PATH|--carrier-connect PATH [test carrier]\n"
+            "       lmuxd --worker --carrier-fd FD --supervisor-control-fd FD [--verbose]\n"
             "       lmuxd --help\n"
             "       lmuxd --version\n",
             LMUX_BUILD_VERSION, LMUX_PROJECT_NAME);
@@ -1226,17 +1356,25 @@ static void usage(FILE *f)
 int lmux2_runtime_main(int argc, char **argv)
 {
     struct v2_app a;
-    int i, have_role = 0;
+    int i, have_role = 0, explicit_role = 0;
     memset(&a, 0, sizeof(a));
     lmux_carrier_init(&a.carrier);
     v2_host_init(&a.host);
+    a.supervisor_ctrl_fd = -1;
     a.next_service_id = 1;
     v2_service_slots_init(a.services);
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--role") == 0) {
-            if (++i >= argc || parse_role(argv[i], &a.role) < 0)
+            if (a.worker_mode || ++i >= argc || parse_role(argv[i], &a.role) < 0)
                 return usage(stderr), 1;
+            have_role = 1;
+            explicit_role = 1;
+        } else if (strcmp(argv[i], "--worker") == 0) {
+            if (explicit_role)
+                return usage(stderr), 1;
+            a.worker_mode = 1;
+            a.role = LMUX2_ROLE_TARGET;
             have_role = 1;
         } else if (strcmp(argv[i], "--carrier") == 0) {
             if (++i >= argc)
@@ -1258,6 +1396,10 @@ int lmux2_runtime_main(int argc, char **argv)
                 return usage(stderr), 1;
             if (lmux_carrier_set_unix_connect(&a.carrier, argv[i]) < 0)
                 return usage(stderr), 1;
+        } else if (strcmp(argv[i], "--supervisor-control-fd") == 0) {
+            if (++i >= argc)
+                return usage(stderr), 1;
+            a.supervisor_ctrl_fd = atoi(argv[i]);
         } else if (strcmp(argv[i], "--control") == 0) {
             if (++i >= argc)
                 return usage(stderr), 1;
@@ -1286,6 +1428,12 @@ int lmux2_runtime_main(int argc, char **argv)
     }
     if (!have_role || !lmux_carrier_is_configured(&a.carrier))
         return usage(stderr), 1;
+    if (a.worker_mode &&
+        (a.role != LMUX2_ROLE_TARGET || a.supervisor_ctrl_fd < 0 ||
+         a.carrier.kind != LMUX_CARRIER_FD))
+        return usage(stderr), 1;
+    if (!a.worker_mode && a.supervisor_ctrl_fd >= 0)
+        return usage(stderr), 1;
     if (lmux_carrier_start(&a.carrier) < 0) {
         perror(lmux_carrier_label(&a.carrier));
         return 1;
@@ -1307,12 +1455,13 @@ int lmux2_runtime_main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
     global_v2_app = &a;
     lmux2_conn_init(&a.conn, a.role, make_conn_id());
-    (void)lmux2_conn_start(&a.conn);
+    if (!a.worker_mode)
+        (void)lmux2_conn_start(&a.conn);
     if (lmux_carrier_fd(&a.carrier) < 0 &&
-        lmux_carrier_listen_fd(&a.carrier) < 0)
+        lmux_carrier_listen_fd(&a.carrier) < 0 && !a.worker_mode)
         try_open_carrier(&a);
-    fprintf(stderr, "lmuxd %s (%s) LMUX/2 role=%s\n", LMUX_BUILD_VERSION,
-            LMUX_PROJECT_NAME, role_name(a.role));
+    fprintf(stderr, "lmuxd %s (%s) LMUX/2 role=%s%s\n", LMUX_BUILD_VERSION,
+            LMUX_PROJECT_NAME, role_name(a.role), a.worker_mode ? " worker" : "");
     run_loop(&a);
     cleanup_app(&a);
     return 0;
