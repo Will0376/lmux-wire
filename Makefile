@@ -34,15 +34,15 @@ LMUX2_SRC := $(TRANSPORT_DIR)/lmux2_protocol.c $(TRANSPORT_DIR)/lmux2_core.c $(T
 CARRIER_SRC := $(CARRIER_DIR)/carrier.c $(CARRIER_DIR)/carrier_tty.c $(CARRIER_DIR)/carrier_fd.c $(CARRIER_DIR)/carrier_unix.c
 SERVICES_SRC := $(SERVICES_DIR)/services.c $(SERVICES_DIR)/service_pty.c $(SERVICES_DIR)/service_unix.c $(SERVICES_DIR)/service_file.c
 HOST_SUBSYS_SRC := $(HOST_SUBSYS_DIR)/host_services.c $(HOST_SUBSYS_DIR)/host_endpoints.c $(HOST_SUBSYS_DIR)/host_control.c $(HOST_SUBSYS_DIR)/host_link.c
-SUPERVISOR_SRC := $(SUPERVISOR_DIR)/supervisor.c $(SUPERVISOR_DIR)/supervisor_worker.c $(SUPERVISOR_DIR)/supervisor_proxy.c $(SUPERVISOR_DIR)/supervisor_link.c
-LINK_SRC := $(LINK_DIR)/link_protocol.c $(LINK_DIR)/link_endpoint.c
+SUPERVISOR_SRC := $(SUPERVISOR_DIR)/supervisor.c $(SUPERVISOR_DIR)/supervisor_worker.c $(SUPERVISOR_DIR)/supervisor_proxy.c $(SUPERVISOR_DIR)/supervisor_link.c $(SUPERVISOR_DIR)/supervisor_storage.c
+LINK_SRC := $(LINK_DIR)/link_protocol.c $(LINK_DIR)/link_endpoint.c $(LINK_DIR)/boot_protocol.c
 LMUX2_RUNTIME_SRC := $(RUNTIME_DIR)/lmux2_runtime.c
 CARRIER_HDRS := $(CARRIER_DIR)/carrier.h
 TRANSPORT_HDRS := $(TRANSPORT_DIR)/lmux.h $(TRANSPORT_DIR)/lmux2_protocol.h $(TRANSPORT_DIR)/lmux2_core.h $(TRANSPORT_DIR)/lmux2_control.h $(TRANSPORT_DIR)/lmux2_service.h
 SERVICES_HDRS := $(SERVICES_DIR)/services.h
 HOST_SUBSYS_HDRS := $(HOST_SUBSYS_DIR)/host.h
 SUPERVISOR_HDRS := $(SUPERVISOR_DIR)/supervisor.h
-LINK_HDRS := $(LINK_DIR)/link_protocol.h $(LINK_DIR)/link_endpoint.h
+LINK_HDRS := $(LINK_DIR)/link_protocol.h $(LINK_DIR)/link_endpoint.h $(LINK_DIR)/boot_protocol.h
 RUNTIME_HDRS := $(RUNTIME_DIR)/lmux2_runtime.h
 TEST_PROTOCOL := $(UNIT_TEST_DIR)/test_protocol.c
 TEST_LMUX2 := $(UNIT_TEST_DIR)/test_lmux2.c
@@ -105,8 +105,8 @@ $(HOST_DIR)/test_lmux2: $(TEST_LMUX2) $(COMMON_SRC) $(LMUX2_SRC) $(TRANSPORT_HDR
 $(HOST_DIR)/test_carrier: $(TEST_CARRIER) $(CARRIER_SRC) $(CARRIER_HDRS) $(GEN_VERSION) | $(HOST_DIR)
 	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_CARRIER) $(CARRIER_SRC)
 
-$(HOST_DIR)/test_supervisor: $(TEST_SUPERVISOR) $(SUPERVISOR_DIR)/supervisor_proxy.c $(SUPERVISOR_DIR)/supervisor_worker.c $(SUPERVISOR_HDRS) $(GEN_VERSION) | $(HOST_DIR)
-	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_SUPERVISOR) $(SUPERVISOR_DIR)/supervisor_proxy.c $(SUPERVISOR_DIR)/supervisor_worker.c
+$(HOST_DIR)/test_supervisor: $(TEST_SUPERVISOR) $(SUPERVISOR_DIR)/supervisor_proxy.c $(SUPERVISOR_DIR)/supervisor_worker.c $(SUPERVISOR_DIR)/supervisor_storage.c $(SUPERVISOR_HDRS) $(GEN_VERSION) | $(HOST_DIR)
+	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_SUPERVISOR) $(SUPERVISOR_DIR)/supervisor_proxy.c $(SUPERVISOR_DIR)/supervisor_worker.c $(SUPERVISOR_DIR)/supervisor_storage.c
 
 $(HOST_DIR)/test_link: $(TEST_LINK) $(LINK_SRC) $(LINK_HDRS) $(TRANSPORT_DIR)/lmux.h $(GEN_VERSION) | $(HOST_DIR)
 	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_LINK) $(LINK_SRC) $(TRANSPORT_DIR)/protocol.c
@@ -120,8 +120,8 @@ $(HOST_DIR)/test_lmux2_pty_integration: $(TEST_LMUX2_PTY_INTEGRATION) $(GEN_VERS
 $(HOST_DIR)/test_lmux2_file_integration: $(TEST_LMUX2_FILE_INTEGRATION) $(COMMON_SRC) $(TRANSPORT_DIR)/lmux.h $(LXF_HDR) $(GEN_VERSION) | $(HOST_DIR)
 	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_LMUX2_FILE_INTEGRATION) $(COMMON_SRC)
 
-$(HOST_DIR)/test_supervisor_integration: $(TEST_SUPERVISOR_INTEGRATION) $(COMMON_SRC) $(TRANSPORT_DIR)/lmux.h $(LXF_HDR) $(GEN_VERSION) | $(HOST_DIR)
-	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_SUPERVISOR_INTEGRATION) $(COMMON_SRC)
+$(HOST_DIR)/test_supervisor_integration: $(TEST_SUPERVISOR_INTEGRATION) $(COMMON_SRC) $(TRANSPORT_DIR)/lmux.h $(LXF_HDR) $(LINK_DIR)/link_protocol.c $(LINK_HDRS) $(GEN_VERSION) | $(HOST_DIR)
+	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_SUPERVISOR_INTEGRATION) $(COMMON_SRC) $(LINK_DIR)/link_protocol.c
 
 $(HOST_DIR)/test_lmux_client: $(TEST_LMUX_CLIENT) $(LMUX) $(COMMON_SRC) $(TRANSPORT_DIR)/lmux.h $(LXF_HDR) $(GEN_VERSION) | $(HOST_DIR)
 	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_LMUX_CLIENT) $(COMMON_SRC)

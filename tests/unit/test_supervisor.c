@@ -5,8 +5,10 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -140,12 +142,70 @@ static int test_spawn_fd_hygiene(void)
     return 0;
 }
 
+static int test_storage_helpers(void)
+{
+    char dir[] = "/tmp/lmux-supervisor-storage-XXXXXX";
+    char root[LMUX_SUP_STORAGE_PATH_MAX];
+    char too_long[LMUX_SUP_STORAGE_PATH_MAX + 16];
+    char path[LMUX_SUP_STORAGE_PATH_MAX];
+    char file[LMUX_SUP_STORAGE_PATH_MAX];
+    char err[160];
+    int fd;
+
+    if (lmux_supervisor_storage_root_from_exe_path("/some/path/lmuxd",
+                                                   root, sizeof(root)) < 0 ||
+        strcmp(root, "/some/path") != 0)
+        return fail("storage exe dirname");
+    if (lmux_supervisor_storage_root_from_exe_path("/lmuxd",
+                                                   root, sizeof(root)) < 0 ||
+        strcmp(root, "/") != 0)
+        return fail("storage exe root dirname");
+    if (lmux_supervisor_storage_root_from_exe_path("lmuxd",
+                                                   root, sizeof(root)) == 0)
+        return fail("storage relative exe accepted");
+    memset(too_long, 'a', sizeof(too_long));
+    too_long[0] = '/';
+    too_long[sizeof(too_long) - 1] = 0;
+    if (lmux_supervisor_validate_storage_root(too_long, err, sizeof(err)) == 0)
+        return fail("storage overlong root accepted");
+    if (lmux_supervisor_build_workers_dir("/tmp/lmux", path, sizeof(path)) < 0 ||
+        strcmp(path, "/tmp/lmux/workers") != 0)
+        return fail("storage workers path");
+    if (lmux_supervisor_build_worker_artifact_path(
+            "/tmp/lmux",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            path, sizeof(path)) < 0 ||
+        strcmp(path,
+               "/tmp/lmux/workers/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.lmuxd") != 0)
+        return fail("storage artifact path");
+    if (!mkdtemp(dir))
+        return fail("storage mkdtemp");
+    if (lmux_supervisor_validate_storage_root(dir, err, sizeof(err)) < 0)
+        return fail("storage valid root rejected");
+    if (lmux_supervisor_validate_storage_root("relative", err, sizeof(err)) == 0)
+        return fail("storage relative root accepted");
+    snprintf(path, sizeof(path), "%s/missing", dir);
+    if (lmux_supervisor_validate_storage_root(path, err, sizeof(err)) == 0)
+        return fail("storage missing root accepted");
+    snprintf(file, sizeof(file), "%s/file", dir);
+    fd = open(file, O_CREAT | O_WRONLY, 0600);
+    if (fd < 0)
+        return fail("storage file create");
+    close(fd);
+    if (lmux_supervisor_validate_storage_root(file, err, sizeof(err)) == 0)
+        return fail("storage file root accepted");
+    unlink(file);
+    rmdir(dir);
+    return 0;
+}
+
 int main(void)
 {
     if (test_msg_codec() ||
         test_proxy_ring() ||
         test_proxy_ring_wrap() ||
-        test_spawn_fd_hygiene())
+        test_spawn_fd_hygiene() ||
+        test_storage_helpers())
         return 1;
     puts("supervisor selftest ok");
     return 0;

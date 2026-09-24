@@ -13,6 +13,53 @@ static void ring_clear(struct lmux_link_ring *r)
     r->r = r->w = r->len = 0;
 }
 
+static void boot_queue_clear(struct lmux_link_boot_queue *q)
+{
+    q->r = q->w = q->len = 0;
+}
+
+static unsigned boot_queue_space(const struct lmux_link_boot_queue *q)
+{
+    return LMUX_LINK_BOOT_QUEUE_DEPTH - q->len;
+}
+
+static int boot_queue_push(struct lmux_link_boot_queue *q, uint8_t type,
+                           const uint8_t *payload, uint32_t len)
+{
+    struct lmux_link_boot_msg *m;
+    if (q->len >= LMUX_LINK_BOOT_QUEUE_DEPTH ||
+        len > LMUX_LINK_MAX_PAYLOAD || (len && !payload))
+        return -1;
+    m = &q->msg[q->w];
+    m->type = type;
+    m->len = len;
+    if (len)
+        memcpy(m->payload, payload, len);
+    q->w = (q->w + 1) % LMUX_LINK_BOOT_QUEUE_DEPTH;
+    q->len++;
+    return 0;
+}
+
+static int boot_queue_pop(struct lmux_link_boot_queue *q, uint8_t *type,
+                          uint8_t *payload, size_t cap, uint32_t *len)
+{
+    struct lmux_link_boot_msg *m;
+    if (q->len == 0 || !type || !len)
+        return -1;
+    m = &q->msg[q->r];
+    if (m->len > cap || (m->len && !payload))
+        return -1;
+    *type = m->type;
+    *len = m->len;
+    if (m->len)
+        memcpy(payload, m->payload, m->len);
+    q->r = (q->r + 1) % LMUX_LINK_BOOT_QUEUE_DEPTH;
+    q->len--;
+    if (q->len == 0)
+        q->r = q->w = 0;
+    return 0;
+}
+
 static size_t ring_space(const struct lmux_link_ring *r)
 {
     return sizeof(r->buf) - r->len;
@@ -121,6 +168,10 @@ void lmux_link_endpoint_down(struct lmux_link_endpoint *ep)
     unsigned long long protocol_errors = ep->protocol_errors;
     unsigned long long ttx = ep->transport_tx_bytes;
     unsigned long long trx = ep->transport_rx_bytes;
+    unsigned long long btf = ep->boot_tx_frames;
+    unsigned long long brf = ep->boot_rx_frames;
+    unsigned long long btb = ep->boot_tx_bytes;
+    unsigned long long brb = ep->boot_rx_bytes;
     char err[sizeof(ep->last_error)];
     memcpy(err, ep->last_error, sizeof(err));
     memset(ep, 0, sizeof(*ep));
@@ -140,6 +191,10 @@ void lmux_link_endpoint_down(struct lmux_link_endpoint *ep)
     ep->protocol_errors = protocol_errors;
     ep->transport_tx_bytes = ttx;
     ep->transport_rx_bytes = trx;
+    ep->boot_tx_frames = btf;
+    ep->boot_rx_frames = brf;
+    ep->boot_tx_bytes = btb;
+    ep->boot_rx_bytes = brb;
     memcpy(ep->last_error, err, sizeof(err));
 }
 
@@ -209,6 +264,41 @@ size_t lmux_link_transport_rx_space(const struct lmux_link_endpoint *ep)
     return ring_space(&ep->rx_plain);
 }
 
+int lmux_link_boot_queue_frame(struct lmux_link_endpoint *ep, uint8_t type,
+                               const uint8_t *payload, uint32_t len)
+{
+    if (ep->state != LMUX_LINK_ESTABLISHED ||
+        type < LMUX_LINK_T_BOOT_REQUEST || type > LMUX_LINK_T_BOOT_EVENT)
+        return -1;
+    return boot_queue_push(&ep->tx_boot, type, payload, len);
+}
+
+int lmux_link_boot_read_frame(struct lmux_link_endpoint *ep, uint8_t *type,
+                              uint8_t *payload, size_t cap, uint32_t *len)
+{
+    return boot_queue_pop(&ep->rx_boot, type, payload, cap, len);
+}
+
+unsigned lmux_link_boot_tx_len(const struct lmux_link_endpoint *ep)
+{
+    return ep->tx_boot.len;
+}
+
+unsigned lmux_link_boot_tx_space(const struct lmux_link_endpoint *ep)
+{
+    return boot_queue_space(&ep->tx_boot);
+}
+
+unsigned lmux_link_boot_rx_len(const struct lmux_link_endpoint *ep)
+{
+    return ep->rx_boot.len;
+}
+
+unsigned lmux_link_boot_rx_space(const struct lmux_link_endpoint *ep)
+{
+    return boot_queue_space(&ep->rx_boot);
+}
+
 int lmux_link_has_pending_output(const struct lmux_link_endpoint *ep)
 {
     return ep->out_pos < ep->out_len;
@@ -216,7 +306,8 @@ int lmux_link_has_pending_output(const struct lmux_link_endpoint *ep)
 
 int lmux_link_wants_physical_write(const struct lmux_link_endpoint *ep)
 {
-    return lmux_link_has_pending_output(ep) || ep->tx_plain.len > 0;
+    return lmux_link_has_pending_output(ep) ||
+           ep->tx_plain.len > 0 || ep->tx_boot.len > 0;
 }
 
 int lmux_link_can_accept_physical(const struct lmux_link_endpoint *ep)
@@ -230,29 +321,55 @@ int lmux_link_build_output(struct lmux_link_endpoint *ep)
 {
     struct lmux_link_frame fr;
     size_t chunk;
+    int send_boot;
     if (ep->out_pos < ep->out_len)
         return 0;
     ep->out_pos = ep->out_len = 0;
-    if (ep->state != LMUX_LINK_ESTABLISHED || ep->tx_plain.len == 0)
+    if (ep->state != LMUX_LINK_ESTABLISHED ||
+        (ep->tx_plain.len == 0 && ep->tx_boot.len == 0))
         return 0;
-    chunk = ep->effective_transport_payload;
-    if (chunk == 0 || chunk > LMUX_LINK_TRANSPORT_TARGET)
-        chunk = LMUX_LINK_TRANSPORT_TARGET;
-    if (chunk > ep->tx_plain.len)
-        chunk = ep->tx_plain.len;
     memset(&fr, 0, sizeof(fr));
-    fr.type = LMUX_LINK_T_TRANSPORT;
     fr.header_len = LMUX_LINK_HEADER_LEN;
     fr.conn_id = ep->local_conn_id;
     fr.frame_seq = ep->next_tx_seq++;
-    fr.payload_len = (uint32_t)ring_read(&ep->tx_plain, fr.payload, chunk);
+    send_boot = ep->tx_boot.len > 0 &&
+        (ep->tx_plain.len == 0 || ep->prefer_boot_tx);
+    if (send_boot) {
+        const struct lmux_link_boot_msg *m = &ep->tx_boot.msg[ep->tx_boot.r];
+        fr.type = m->type;
+        fr.payload_len = m->len;
+        if (m->len)
+            memcpy(fr.payload, m->payload, m->len);
+    } else {
+        chunk = ep->effective_transport_payload;
+        if (chunk == 0 || chunk > LMUX_LINK_TRANSPORT_TARGET)
+            chunk = LMUX_LINK_TRANSPORT_TARGET;
+        if (chunk > ep->tx_plain.len)
+            chunk = ep->tx_plain.len;
+        fr.type = LMUX_LINK_T_TRANSPORT;
+        fr.payload_len = (uint32_t)ring_read(&ep->tx_plain, fr.payload, chunk);
+    }
     if (lmux_link_encode_frame(&fr, ep->out, sizeof(ep->out), &ep->out_len) < 0) {
+        if (!send_boot && fr.payload_len)
+            (void)ring_write(&ep->tx_plain, fr.payload, fr.payload_len);
+        ep->next_tx_seq--;
         ep->state = LMUX_LINK_ERROR_RESETTING;
         set_error(ep, "encode");
         return -1;
     }
+    if (send_boot) {
+        ep->tx_boot.r = (ep->tx_boot.r + 1) % LMUX_LINK_BOOT_QUEUE_DEPTH;
+        ep->tx_boot.len--;
+        if (ep->tx_boot.len == 0)
+            ep->tx_boot.r = ep->tx_boot.w = 0;
+        ep->boot_tx_frames++;
+        ep->boot_tx_bytes += fr.payload_len;
+        ep->prefer_boot_tx = 0;
+    } else {
+        ep->transport_tx_bytes += fr.payload_len;
+        ep->prefer_boot_tx = 1;
+    }
     ep->tx_frames++;
-    ep->transport_tx_bytes += fr.payload_len;
     return 1;
 }
 
@@ -283,6 +400,8 @@ static void fail_session(struct lmux_link_endpoint *ep, unsigned *events,
     set_error(ep, reason);
     ring_clear(&ep->tx_plain);
     ring_clear(&ep->rx_plain);
+    boot_queue_clear(&ep->tx_boot);
+    boot_queue_clear(&ep->rx_boot);
     ep->out_len = ep->out_pos = 0;
     if (events)
         *events |= LMUX_LINK_EV_DOWN;
@@ -312,6 +431,8 @@ static int accept_hello(struct lmux_link_endpoint *ep,
         set_error(ep, "peer restart");
         ring_clear(&ep->tx_plain);
         ring_clear(&ep->rx_plain);
+        boot_queue_clear(&ep->tx_boot);
+        boot_queue_clear(&ep->rx_boot);
         ep->out_len = ep->out_pos = 0;
         *events |= LMUX_LINK_EV_PEER_RESTART | LMUX_LINK_EV_DOWN;
         return 0;
@@ -367,8 +488,17 @@ static void handle_frame(struct lmux_link_endpoint *ep,
     }
     if (fr->type >= LMUX_LINK_T_BOOT_REQUEST &&
         fr->type <= LMUX_LINK_T_BOOT_EVENT) {
-        if (fr->flags & LMUX_LINK_F_CRITICAL_EXTENSION)
+        if (fr->flags & LMUX_LINK_F_CRITICAL_EXTENSION) {
             fail_session(ep, events, "unsupported critical boot");
+            return;
+        }
+        if (boot_queue_push(&ep->rx_boot, fr->type, fr->payload,
+                            fr->payload_len) < 0) {
+            fail_session(ep, events, "boot rx full");
+            return;
+        }
+        ep->boot_rx_frames++;
+        ep->boot_rx_bytes += fr->payload_len;
         return;
     }
     if (fr->flags & LMUX_LINK_F_CRITICAL_EXTENSION)

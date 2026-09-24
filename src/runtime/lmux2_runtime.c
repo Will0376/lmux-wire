@@ -1,4 +1,5 @@
 #include "lmux2_runtime.h"
+#include "boot_protocol.h"
 #include "carrier.h"
 #include "host.h"
 #include "lmux2_control.h"
@@ -158,6 +159,8 @@ static void carrier_lost(struct v2_app *a)
         return;
     log_msg(a, 1, "lmux2 carrier lost");
     if (a->outer_enabled) {
+        if (a->role == LMUX2_ROLE_HOST)
+            v2_host_control_outer_down(&a->host);
         lmux_link_endpoint_down(&a->outer);
         retire_connection_streams(a);
     } else {
@@ -167,6 +170,64 @@ static void carrier_lost(struct v2_app *a)
     a->out_len = a->out_pos = 0;
     a->enc_in_len = 0;
     a->discard_until_delim = 0;
+}
+
+int v2_runtime_boot_supported(struct v2_app *a)
+{
+    return a && a->outer_enabled &&
+           a->outer.state == LMUX_LINK_ESTABLISHED &&
+           (a->outer.negotiated_caps & LMUX_LINK_CAP_BOOT_INFO);
+}
+
+int v2_runtime_boot_upload_supported(struct v2_app *a)
+{
+    return v2_runtime_boot_supported(a) &&
+           (a->outer.negotiated_caps & LMUX_LINK_CAP_BOOT_UPLOAD);
+}
+
+int v2_runtime_boot_managed_supported(struct v2_app *a)
+{
+    return v2_runtime_boot_supported(a) &&
+           (a->outer.negotiated_caps & LMUX_LINK_CAP_BOOT_MANAGED_WORKER);
+}
+
+int v2_runtime_boot_supervisor_supported(struct v2_app *a)
+{
+    return v2_runtime_boot_supported(a) &&
+           (a->outer.negotiated_caps & LMUX_LINK_CAP_BOOT_SUPERVISOR_CONTROL);
+}
+
+int v2_runtime_queue_boot_request_body(struct v2_app *a, uint16_t opcode,
+                                       uint64_t request_id,
+                                       const uint8_t *body, uint32_t body_len)
+{
+    uint8_t payload[LMUX_LINK_MAX_PAYLOAD];
+    uint32_t len = 0;
+    if (!v2_runtime_boot_supported(a))
+        return -1;
+    if (lmux_boot_make_request(payload, sizeof(payload), &len, opcode,
+                               request_id, body, body_len) < 0)
+        return -1;
+    return lmux_link_boot_queue_frame(&a->outer, LMUX_LINK_T_BOOT_REQUEST,
+                                      payload, len);
+}
+
+int v2_runtime_queue_boot_request(struct v2_app *a, uint16_t opcode,
+                                  uint64_t request_id)
+{
+    return v2_runtime_queue_boot_request_body(a, opcode, request_id, NULL, 0);
+}
+
+void v2_runtime_lmux_marker(struct v2_app *a, uint64_t *local_conn,
+                            uint64_t *peer_conn,
+                            uint64_t *established_count)
+{
+    if (local_conn)
+        *local_conn = a->conn.local_conn_id;
+    if (peer_conn)
+        *peer_conn = a->conn.peer_conn_id;
+    if (established_count)
+        *established_count = a->connection_established_count;
 }
 
 static void accept_carrier(struct v2_app *a)
@@ -1100,6 +1161,8 @@ static void outer_session_down(struct v2_app *a)
 {
     log_msg(a, 1, "outer session down reason=%s",
             a->outer.last_error[0] ? a->outer.last_error : "-");
+    if (a->role == LMUX2_ROLE_HOST)
+        v2_host_control_outer_down(&a->host);
     retire_connection_streams(a);
     if (lmux_carrier_fd(&a->carrier) >= 0)
         begin_outer(a);
@@ -1117,6 +1180,8 @@ static void outer_peer_restart(struct v2_app *a)
             (unsigned long long)old_peer, (unsigned long long)new_peer);
     log_msg(a, 1, "outer old session retired local=%llu peer=%llu",
             (unsigned long long)old_local, (unsigned long long)old_peer);
+    if (a->role == LMUX2_ROLE_HOST)
+        v2_host_control_outer_down(&a->host);
     retire_connection_streams(a);
     if (lmux_link_endpoint_restart_from_pending(&a->outer, new_local, &events) < 0) {
         outer_session_down(a);
@@ -1162,6 +1227,25 @@ static void drain_outer_transport_rx(struct v2_app *a)
         feed_lmux_bytes(a, buf, n);
 }
 
+static void drain_outer_boot_frames(struct v2_app *a)
+{
+    uint8_t type;
+    uint8_t payload[LMUX_LINK_MAX_PAYLOAD];
+    uint32_t len;
+    while (lmux_link_boot_read_frame(&a->outer, &type, payload,
+                                     sizeof(payload), &len) == 0) {
+        if (type == LMUX_LINK_T_BOOT_RESPONSE) {
+            struct lmux_boot_response resp;
+            if (lmux_boot_parse_response(payload, len, &resp) == 0)
+                v2_host_control_on_boot_response(a, &a->host, resp.opcode,
+                                                 resp.status, resp.request_id,
+                                                 resp.body, resp.body_len);
+            continue;
+        }
+        log_msg(a, 1, "outer ignored BOOT frame type=%u", type);
+    }
+}
+
 static void feed_outer_carrier(struct v2_app *a)
 {
     uint8_t buf[256];
@@ -1171,6 +1255,8 @@ static void feed_outer_carrier(struct v2_app *a)
             unsigned events = 0;
             (void)lmux_link_input_bytes(&a->outer, buf, (size_t)io.n, &events);
             handle_outer_events(a, events);
+            if (a->role == LMUX2_ROLE_HOST)
+                drain_outer_boot_frames(a);
             drain_outer_transport_rx(a);
             continue;
         }
@@ -1294,6 +1380,13 @@ static void run_loop(struct v2_app *a)
             try_open_carrier(a);
         if (a->role == LMUX2_ROLE_HOST)
             v2_host_attach_pending_clients(a, &a->host, &a->conn);
+        if (a->role == LMUX2_ROLE_HOST) {
+            struct v2_host_status st;
+            v2_host_control_check_timeout(&a->host);
+            fill_target_service_status(a);
+            fill_host_status(a, &st);
+            v2_host_control_tick(a, &a->host, &st);
+        }
         (void)step_file_services(a);
         if ((!a->worker_mode || a->worker_link_active || a->worker_link_up_flush) &&
             (!a->outer_enabled || a->outer.state == LMUX_LINK_ESTABLISHED))
@@ -1307,7 +1400,8 @@ static void run_loop(struct v2_app *a)
             short ev = 0;
             if (a->outer_enabled) {
                 if (lmux_link_can_accept_physical(&a->outer) &&
-                    lmux_link_transport_rx_space(&a->outer) > 0)
+                    lmux_link_transport_rx_space(&a->outer) > 0 &&
+                    lmux_link_boot_rx_space(&a->outer) > 0)
                     ev |= POLLIN;
                 if (lmux_link_wants_physical_write(&a->outer))
                     ev |= POLLOUT;
@@ -1326,7 +1420,8 @@ static void run_loop(struct v2_app *a)
         if (a->host.control_listen_fd >= 0)
             add_poll(pfds, kind, svc, bind, &n, a->host.control_listen_fd, POLLIN, 6, -1, -1);
         if (a->host.control_fd >= 0)
-            add_poll(pfds, kind, svc, bind, &n, a->host.control_fd, POLLIN, 7, -1, -1);
+            add_poll(pfds, kind, svc, bind, &n, a->host.control_fd,
+                     v2_host_control_poll_events(&a->host), 7, -1, -1);
         if (a->worker_mode && a->supervisor_ctrl_fd >= 0)
             add_poll(pfds, kind, svc, bind, &n, a->supervisor_ctrl_fd, POLLIN, 9, -1, -1);
         for (i = 0; i < V2_MAX_SERVICES; i++) {
@@ -1470,7 +1565,7 @@ static void run_loop(struct v2_app *a)
                     v2_host_control_service(a, &a->host, &st);
                 }
                 if (pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL))
-                    v2_close_fd(&a->host.control_fd);
+                    v2_host_control_on_hup(&a->host);
             } else if (kind[i] == 8) {
                 if (pfds[i].revents & POLLIN)
                     accept_carrier(a);
@@ -1540,6 +1635,9 @@ int lmux2_runtime_main(int argc, char **argv)
     lmux_carrier_init(&a.carrier);
     v2_host_init(&a.host);
     lmux_link_endpoint_init(&a.outer, LMUX_LINK_ROLE_HOST);
+    a.outer.local_caps |= LMUX_LINK_CAP_BOOT_INFO | LMUX_LINK_CAP_BOOT_UPLOAD |
+                          LMUX_LINK_CAP_BOOT_MANAGED_WORKER |
+                          LMUX_LINK_CAP_BOOT_SUPERVISOR_CONTROL;
     a.supervisor_ctrl_fd = -1;
     a.next_service_id = 1;
     v2_service_slots_init(a.services);

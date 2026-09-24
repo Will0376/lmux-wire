@@ -2,7 +2,9 @@
 #define LMUX_HOST_H
 
 #include "carrier.h"
+#include "boot_protocol.h"
 #include "link_endpoint.h"
+#include "lxf.h"
 #include "lmux2_core.h"
 #include "lmux2_service.h"
 
@@ -13,6 +15,7 @@
 struct v2_app;
 
 void v2_app_log(struct v2_app *a, int verbose, const char *fmt, ...);
+long long v2_now_ms(void);
 
 struct v2_host_binding {
     uint64_t stream_id;
@@ -85,6 +88,39 @@ struct v2_host {
     int control_fd;
     char control_in[256];
     size_t control_in_len;
+    int boot_pending;
+    int boot_control_gone;
+    uint16_t boot_opcode;
+    uint64_t boot_request_id;
+    long long boot_deadline_ms;
+    uint64_t boot_next_request_id;
+    int boot_upload_active;
+    int boot_upload_ready_sent;
+    int boot_upload_abort_needed;
+    uint64_t boot_upload_id;
+    uint64_t boot_upload_declared_size;
+    uint64_t boot_upload_sent;
+    uint32_t boot_upload_max_chunk;
+    uint32_t boot_upload_last_chunk;
+    struct sha256_ctx boot_upload_sha;
+    uint8_t boot_upload_digest[32];
+    int deploy_active;
+    int deploy_client_gone;
+    int deploy_cancel_before_activate;
+    int deploy_notified_link_down;
+    int deploy_reported_reconciled;
+    int deploy_restart_supervisor;
+    int deploy_no_file_restart;
+    int deploy_install_already;
+    uint32_t deploy_phase;
+    uint32_t deploy_confirm_timeout_ms;
+    uint64_t deploy_activation_id;
+    uint64_t deploy_generation;
+    uint64_t deploy_pre_local_conn;
+    uint64_t deploy_pre_peer_conn;
+    uint64_t deploy_pre_established_count;
+    long long deploy_deadline_ms;
+    uint8_t deploy_sha[32];
     struct v2_host_service services[V2_MAX_SERVICES];
     struct v2_desired desired[V2_MAX_DESIRED];
 };
@@ -112,6 +148,18 @@ int v2_runtime_send_service_ensure(struct v2_app *a, struct v2_desired *d);
 int v2_runtime_send_winsize_control(struct v2_app *a, uint64_t service_id,
                                     unsigned rows, unsigned cols,
                                     unsigned xp, unsigned yp);
+int v2_runtime_boot_supported(struct v2_app *a);
+int v2_runtime_boot_upload_supported(struct v2_app *a);
+int v2_runtime_boot_managed_supported(struct v2_app *a);
+int v2_runtime_boot_supervisor_supported(struct v2_app *a);
+int v2_runtime_queue_boot_request(struct v2_app *a, uint16_t opcode,
+                                  uint64_t request_id);
+int v2_runtime_queue_boot_request_body(struct v2_app *a, uint16_t opcode,
+                                       uint64_t request_id,
+                                       const uint8_t *body, uint32_t body_len);
+void v2_runtime_lmux_marker(struct v2_app *a, uint64_t *local_conn,
+                            uint64_t *peer_conn,
+                            uint64_t *established_count);
 void v2_runtime_count_stream_open(struct v2_app *a);
 void v2_runtime_count_stream_close(struct v2_app *a);
 
@@ -184,5 +232,15 @@ void v2_host_control_service(struct v2_app *a, struct v2_host *h,
                              const struct v2_host_status *st);
 void v2_host_status_write(struct v2_app *a, struct v2_host *h,
                           const struct v2_host_status *st);
+void v2_host_control_on_hup(struct v2_host *h);
+void v2_host_control_outer_down(struct v2_host *h);
+void v2_host_control_check_timeout(struct v2_host *h);
+void v2_host_control_tick(struct v2_app *a, struct v2_host *h,
+                          const struct v2_host_status *st);
+short v2_host_control_poll_events(const struct v2_host *h);
+void v2_host_control_on_boot_response(struct v2_app *a, struct v2_host *h,
+                                      uint16_t opcode,
+                                      uint16_t status, uint64_t request_id,
+                                      const uint8_t *body, uint32_t body_len);
 
 #endif

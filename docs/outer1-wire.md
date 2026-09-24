@@ -323,7 +323,7 @@ Initial capability bits:
 ```text
 bit 0  TRANSPORT
 bit 1  BOOT_INFO
-bit 2  BOOT_UPDATE_RESERVED
+bit 2  BOOT_UPLOAD
 bit 3  BOOT_WORKER_CONTROL_RESERVED
 bits 4-31 reserved
 ```
@@ -594,6 +594,7 @@ Reserved future update/control operations:
 16 UPLOAD_BEGIN
 17 UPLOAD_DATA
 18 UPLOAD_END
+24 UPLOAD_ABORT
 19 CANDIDATE_STATUS
 20 ACTIVATE_CANDIDATE
 21 CONFIRM_CANDIDATE
@@ -625,6 +626,60 @@ u32 max_transport_payload
 u32 reserved = 0
 ```
 
+P3 implements `UPLOAD_BEGIN`, `UPLOAD_DATA`, `UPLOAD_END`, and
+`UPLOAD_ABORT` when `BOOT_UPLOAD` is negotiated. Upload is supervisor-local:
+the worker, LMS1, LMUX/2, and LMUX services do not observe upload state.
+
+`UPLOAD_BEGIN` request body:
+
+```text
+u64 declared_size
+```
+
+OK response body:
+
+```text
+u64 upload_id       nonzero, scoped to the current OUTER incarnation
+u32 max_chunk
+```
+
+`UPLOAD_DATA` request body:
+
+```text
+u64 upload_id
+u64 offset
+u8  data[]
+```
+
+OK response body:
+
+```text
+u64 next_offset
+```
+
+`UPLOAD_END` request body:
+
+```text
+u64 upload_id
+u8  expected_sha256[32]
+```
+
+OK response body:
+
+```text
+u64 size
+u8  sha256[32]
+```
+
+`UPLOAD_ABORT` request body:
+
+```text
+u64 upload_id
+```
+
+OK response body is empty. `UPLOAD_ABORT` for no active upload is idempotent OK;
+an active different `upload_id` returns `ID_MISMATCH`.
+
 `WORKER_STATUS` request body is empty.
 
 `WORKER_STATUS` response body:
@@ -632,7 +687,7 @@ u32 reserved = 0
 ```text
 u32 worker_state
 u32 flags
-u64 worker_generation
+u64 worker_incarnation
 u64 uptime_ms
 u32 restart_count
 u32 reserved = 0
@@ -659,14 +714,20 @@ for initial BOOT update work.
 Recommended persistent layout:
 
 ```text
-/root/lmux/workers/<sha256>.lmuxd
-/root/lmux/worker.state
+<storage-root>/workers/<sha256>.lmuxd
+<storage-root>/worker.state
 ```
 
 `worker.state` is the single authoritative state file. Human-friendly symlinks
 may exist but are non-authoritative.
 
-Conceptual state:
+The target supervisor storage root is selected outside OUTER/1. Current
+supervisor startup accepts an explicit `--storage-root DIR`; otherwise it uses
+the directory containing the actual running supervisor executable as reported by
+Linux `/proc/self/exe`. BOOT messages identify artifacts by SHA-256 and size,
+not by an absolute target pathname.
+
+Conceptual persistent update state:
 
 ```text
 generation
@@ -703,6 +764,12 @@ fsync(parent directory)
 ## Upload Resume
 
 Future upload operations use offset resume.
+
+P3 upload does not implement resume across OUTER incarnations. Active upload
+state is cleared on OUTER retirement, peer restart, CRC/sequence failure, and
+physical carrier loss.
+
+Future resumable upload operations use offset resume.
 
 `UPLOAD_BEGIN(size, sha256)`:
 
@@ -833,7 +900,7 @@ Example constants:
 ```text
 host conn_id       = 0x1122334455667788
 supervisor conn_id = 0x99aabbccddeeff00
-capabilities       = TRANSPORT | BOOT_INFO = 0x00000003
+capabilities       = TRANSPORT | BOOT_INFO | BOOT_UPLOAD = 0x00000007
 max_outer_payload  = 4096
 max_transport      = 1024
 preferred_transport = 1024
@@ -922,4 +989,3 @@ supervisor integration with LMS1 and worker lifecycle stays under
 
 OUTER is not a carrier backend and not LMUX/2 transport. It sits between the
 byte-stream carrier and the opaque LMUX/2 worker byte stream.
-

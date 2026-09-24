@@ -11,6 +11,7 @@ struct lmux_link_endpoint;
 #define LMUX_SUP_PROXY_CAP 4096
 #define LMUX_SUP_WORKER_DATA_FD 3
 #define LMUX_SUP_WORKER_CTRL_FD 4
+#define LMUX_SUP_STORAGE_PATH_MAX 512
 
 enum lmux_supervisor_msg_type {
     LMUX_SUP_LINK_DOWN = 1,
@@ -50,6 +51,20 @@ int lmux_supervisor_drain_fd(int fd);
 
 pid_t lmux_supervisor_spawn_worker(const char *worker_path, int data_fd,
                                    int ctrl_fd, int verbose);
+int lmux_supervisor_storage_root_from_exe_path(const char *exe_path,
+                                               char *out, size_t cap);
+int lmux_supervisor_resolve_default_storage_root(char *out, size_t cap,
+                                                 char *err, size_t err_cap);
+int lmux_supervisor_resolve_exe_path(char *out, size_t cap,
+                                     char *err, size_t err_cap);
+int lmux_supervisor_validate_storage_root(const char *root,
+                                          char *err, size_t err_cap);
+int lmux_supervisor_build_workers_dir(const char *root, char *out, size_t cap);
+int lmux_supervisor_build_upload_tmp_path(const char *root,
+                                          char *out, size_t cap);
+int lmux_supervisor_build_worker_artifact_path(const char *root,
+                                               const char *sha256_hex,
+                                               char *out, size_t cap);
 size_t lmux_supervisor_link_push_worker(struct lmux_link_endpoint *link,
                                         const uint8_t *buf, size_t len);
 size_t lmux_supervisor_link_pull_worker(struct lmux_link_endpoint *link,

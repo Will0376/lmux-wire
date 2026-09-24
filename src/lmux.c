@@ -368,6 +368,17 @@ static void usage(FILE *f)
         "Usage:\n"
         "  lmux connect SOCKET\n"
         "  lmux status [--control SOCKET]\n"
+        "  lmux deploy FILE [--restart-supervisor] [--timeout-ms N] [--control SOCKET]\n"
+        "  lmux deploy --restart-supervisor [--control SOCKET]\n"
+        "  lmux boot info [--control SOCKET]\n"
+        "  lmux boot worker-status [--control SOCKET]\n"
+        "  lmux boot upload FILE [--control SOCKET]\n"
+        "  lmux boot activate SHA256 [--timeout-ms N] [--control SOCKET]\n"
+        "  lmux boot update-status [--control SOCKET]\n"
+        "  lmux boot confirm ACTIVATION_ID [--control SOCKET]\n"
+        "  lmux boot rollback ACTIVATION_ID [--control SOCKET]\n"
+        "  lmux boot supervisor-install SHA256 [--control SOCKET]\n"
+        "  lmux boot supervisor-restart SHA256 [--control SOCKET]\n"
         "  lmux term [-v|--verbose] [--remote-dir DIR] [--channel 1|2] [1|2|SOCKET]\n"
         "  lmux exec SOCKET -- PROGRAM [ARGS...]\n"
         "  lmux put [OPTIONS] HOST_SRC [TARGET_DST]\n"
@@ -384,7 +395,7 @@ static void usage(FILE *f)
         "\n"
         "Examples:\n"
         "  lmux put ./lmuxd\n"
-        "  lmux put ./lmuxd /root/lmux/lmuxd\n"
+        "  lmux put ./lmuxd /tmp/lmuxd\n"
         "  lmux get log.log\n"
         "  lmux get /tmp/core.bin ./core.bin\n"
         "\n"
@@ -451,6 +462,181 @@ static int control_request(const char *path, const char *req, int print_reply, i
     }
     close(fd);
     return 0;
+}
+
+static int read_control_line(int fd, char *out, size_t cap)
+{
+    size_t len = 0;
+    while (len + 1 < cap) {
+        char ch;
+        ssize_t r = read(fd, &ch, 1);
+        if (r == 1) {
+            out[len++] = ch;
+            out[len] = 0;
+            if (ch == '\n')
+                return 0;
+            continue;
+        }
+        if (r < 0 && errno == EINTR)
+            continue;
+        return -1;
+    }
+    return -1;
+}
+
+static int boot_upload_file(const char *control, const char *path)
+{
+    int fd = -1, cfd = -1, rc = 1;
+    struct stat st;
+    char req[128], line[256];
+    uint8_t buf[4096];
+    uint64_t done = 0;
+    int saw_ok = 0, saw_err = 0;
+    struct progress_state prog;
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        perror(path);
+        return 1;
+    }
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
+        fprintf(stderr, "lmux boot upload: not a regular file: %s\n", path);
+        goto out;
+    }
+    cfd = connect_unix(control);
+    if (cfd < 0)
+        goto out;
+    snprintf(req, sizeof(req), "BOOT UPLOAD %llu\n",
+             (unsigned long long)st.st_size);
+    if (full_write(cfd, (const uint8_t *)req, strlen(req)) < 0) {
+        perror("control write");
+        goto out;
+    }
+    if (read_control_line(cfd, line, sizeof(line)) < 0) {
+        fprintf(stderr, "lmux boot upload: no READY\n");
+        goto out;
+    }
+    if (strncmp(line, "READY", 5) != 0) {
+        fputs(line, stderr);
+        goto out;
+    }
+    progress_init(&prog, "upload", 1, (uint64_t)st.st_size, 1);
+    while (done < (uint64_t)st.st_size) {
+        size_t want = sizeof(buf);
+        ssize_t r;
+        if ((uint64_t)want > (uint64_t)st.st_size - done)
+            want = (size_t)((uint64_t)st.st_size - done);
+        r = read(fd, buf, want);
+        if (r > 0) {
+            if (full_write(cfd, buf, (size_t)r) < 0) {
+                perror("control upload write");
+                goto out;
+            }
+            done += (uint64_t)r;
+            progress_update(&prog, done, 0);
+            continue;
+        }
+        if (r < 0 && errno == EINTR)
+            continue;
+        fprintf(stderr, "lmux boot upload: read failed\n");
+        goto out;
+    }
+    progress_finish(&prog, done);
+    while (read_control_line(cfd, line, sizeof(line)) == 0) {
+        if (strncmp(line, "OK UPLOAD", 9) == 0)
+            saw_ok = 1;
+        if (strncmp(line, "ERR", 3) == 0)
+            saw_err = 1;
+        fputs(line, stdout);
+    }
+    rc = saw_ok && !saw_err ? 0 : 1;
+out:
+    if (cfd >= 0)
+        close(cfd);
+    if (fd >= 0)
+        close(fd);
+    return rc;
+}
+
+static int deploy_file(const char *control, const char *path, unsigned timeout_ms,
+                       int restart_supervisor)
+{
+    int fd = -1, cfd = -1, rc = 1;
+    struct stat st;
+    char req[160], line[512];
+    uint8_t buf[4096];
+    uint64_t done = 0;
+    int saw_ok = 0, saw_err = 0;
+    struct progress_state prog;
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        perror(path);
+        return 1;
+    }
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
+        fprintf(stderr, "lmux deploy: not a regular file: %s\n", path);
+        goto out;
+    }
+    cfd = connect_unix(control);
+    if (cfd < 0)
+        goto out;
+    snprintf(req, sizeof(req), "DEPLOY %llu %u %u\n",
+             (unsigned long long)st.st_size, timeout_ms,
+             restart_supervisor ? 1u : 0u);
+    if (full_write(cfd, (const uint8_t *)req, strlen(req)) < 0) {
+        perror("control write");
+        goto out;
+    }
+    if (read_control_line(cfd, line, sizeof(line)) < 0) {
+        fprintf(stderr, "lmux deploy: no READY\n");
+        goto out;
+    }
+    if (strncmp(line, "READY", 5) != 0) {
+        fputs(line, stderr);
+        goto out;
+    }
+    progress_init(&prog, "deploy upload", 1, (uint64_t)st.st_size, 1);
+    while (done < (uint64_t)st.st_size) {
+        size_t want = sizeof(buf);
+        ssize_t r;
+        if ((uint64_t)want > (uint64_t)st.st_size - done)
+            want = (size_t)((uint64_t)st.st_size - done);
+        r = read(fd, buf, want);
+        if (r > 0) {
+            if (full_write(cfd, buf, (size_t)r) < 0) {
+                perror("control deploy write");
+                goto out;
+            }
+            done += (uint64_t)r;
+            progress_update(&prog, done, 0);
+            continue;
+        }
+        if (r < 0 && errno == EINTR)
+            continue;
+        fprintf(stderr, "lmux deploy: read failed\n");
+        goto out;
+    }
+    progress_finish(&prog, done);
+    while (read_control_line(cfd, line, sizeof(line)) == 0) {
+        if (strncmp(line, "OK DEPLOY", 9) == 0)
+            saw_ok = 1;
+        if (strncmp(line, "ERR", 3) == 0)
+            saw_err = 1;
+        fputs(line, stdout);
+    }
+    rc = saw_ok && !saw_err ? 0 : 1;
+out:
+    if (cfd >= 0)
+        close(cfd);
+    if (fd >= 0)
+        close(fd);
+    return rc;
+}
+
+static int deploy_restart_supervisor(const char *control)
+{
+    return control_request(control, "DEPLOY_RESTART\n", 1, 0) < 0 ? 1 : 0;
 }
 
 static int send_winsize_control(int channel)
@@ -1449,6 +1635,162 @@ static int cmd_status(int argc, char **argv)
     return control_request(control, "STATUS\n", 1, 0) < 0 ? 1 : 0;
 }
 
+static int cmd_deploy(int argc, char **argv)
+{
+    const char *control = LMUX_DEFAULT_CONTROL_SOCKET;
+    const char *file = NULL;
+    unsigned timeout_ms = 30000;
+    int restart_supervisor = 0;
+    while (argc > 0) {
+        if (strcmp(argv[0], "--control") == 0 && argc >= 2) {
+            control = argv[1];
+            argv += 2;
+            argc -= 2;
+        } else if (strcmp(argv[0], "--timeout-ms") == 0 && argc >= 2) {
+            char *end = NULL;
+            unsigned long v = strtoul(argv[1], &end, 10);
+            if (!end || *end || v > 0xffffffffUL) {
+                usage(stderr);
+                return 1;
+            }
+            timeout_ms = (unsigned)v;
+            argv += 2;
+            argc -= 2;
+        } else if (strcmp(argv[0], "--restart-supervisor") == 0) {
+            restart_supervisor = 1;
+            argv++;
+            argc--;
+        } else if (!file) {
+            file = argv[0];
+            argv++;
+            argc--;
+        } else {
+            usage(stderr);
+            return 1;
+        }
+    }
+    if (!file && !restart_supervisor) {
+        usage(stderr);
+        return 1;
+    }
+    if (!file && timeout_ms != 30000) {
+        fprintf(stderr, "lmux deploy: --timeout-ms requires FILE\n");
+        return 1;
+    }
+    if (!file)
+        return deploy_restart_supervisor(control);
+    return deploy_file(control, file, timeout_ms, restart_supervisor);
+}
+
+static int cmd_boot(int argc, char **argv)
+{
+    const char *control = LMUX_DEFAULT_CONTROL_SOCKET;
+    const char *file = NULL;
+    const char *sha = NULL;
+    const char *activation_id = NULL;
+    unsigned timeout_ms = 30000;
+    const char *cmd;
+    const char *req = NULL;
+    char reqbuf[160];
+    if (argc < 1) {
+        usage(stderr);
+        return 1;
+    }
+    cmd = argv[0];
+    argv++;
+    argc--;
+    if (strcmp(cmd, "upload") == 0) {
+        if (argc < 1) {
+            usage(stderr);
+            return 1;
+        }
+        file = argv[0];
+        argv++;
+        argc--;
+    } else if (strcmp(cmd, "activate") == 0) {
+        if (argc < 1) {
+            usage(stderr);
+            return 1;
+        }
+        sha = argv[0];
+        argv++;
+        argc--;
+    } else if (strcmp(cmd, "confirm") == 0 || strcmp(cmd, "rollback") == 0) {
+        if (argc < 1) {
+            usage(stderr);
+            return 1;
+        }
+        activation_id = argv[0];
+        argv++;
+        argc--;
+    } else if (strcmp(cmd, "supervisor-install") == 0 ||
+               strcmp(cmd, "supervisor-restart") == 0) {
+        if (argc < 1) {
+            usage(stderr);
+            return 1;
+        }
+        sha = argv[0];
+        argv++;
+        argc--;
+    }
+    while (argc > 0) {
+        if (strcmp(argv[0], "--control") == 0 && argc >= 2) {
+            control = argv[1];
+            argv += 2;
+            argc -= 2;
+        } else if (strcmp(argv[0], "--timeout-ms") == 0 && argc >= 2 &&
+                   strcmp(cmd, "activate") == 0) {
+            char *end = NULL;
+            unsigned long v = strtoul(argv[1], &end, 10);
+            if (!end || *end || v > 0xffffffffUL) {
+                usage(stderr);
+                return 1;
+            }
+            timeout_ms = (unsigned)v;
+            argv += 2;
+            argc -= 2;
+        } else {
+            usage(stderr);
+            return 1;
+        }
+    }
+    if (strcmp(cmd, "info") == 0)
+        req = "BOOT GET_INFO\n";
+    else if (strcmp(cmd, "worker-status") == 0)
+        req = "BOOT WORKER_STATUS\n";
+    else if (strcmp(cmd, "upload") == 0)
+        return boot_upload_file(control, file);
+    else if (strcmp(cmd, "update-status") == 0)
+        req = "BOOT UPDATE_STATUS\n";
+    else if (strcmp(cmd, "activate") == 0) {
+        if (!sha || strlen(sha) != 64)
+            return usage(stderr), 1;
+        snprintf(reqbuf, sizeof(reqbuf), "BOOT ACTIVATE %s %u\n", sha, timeout_ms);
+        req = reqbuf;
+    } else if (strcmp(cmd, "confirm") == 0) {
+        snprintf(reqbuf, sizeof(reqbuf), "BOOT CONFIRM %s\n", activation_id);
+        req = reqbuf;
+    } else if (strcmp(cmd, "rollback") == 0) {
+        snprintf(reqbuf, sizeof(reqbuf), "BOOT ROLLBACK %s\n", activation_id);
+        req = reqbuf;
+    } else if (strcmp(cmd, "supervisor-install") == 0) {
+        if (!sha || strlen(sha) != 64)
+            return usage(stderr), 1;
+        snprintf(reqbuf, sizeof(reqbuf), "BOOT SUPERVISOR_INSTALL %s\n", sha);
+        req = reqbuf;
+    } else if (strcmp(cmd, "supervisor-restart") == 0) {
+        if (!sha || strlen(sha) != 64)
+            return usage(stderr), 1;
+        snprintf(reqbuf, sizeof(reqbuf), "BOOT SUPERVISOR_RESTART %s\n", sha);
+        req = reqbuf;
+    }
+    else {
+        usage(stderr);
+        return 1;
+    }
+    return control_request(control, req, 1, 0) < 0 ? 1 : 0;
+}
+
 #ifndef LMUX_NO_MAIN
 int main(int argc, char **argv)
 {
@@ -1472,6 +1814,10 @@ int main(int argc, char **argv)
     }
     if (strcmp(argv[1], "status") == 0)
         return cmd_status(argc - 2, argv + 2);
+    if (strcmp(argv[1], "deploy") == 0)
+        return cmd_deploy(argc - 2, argv + 2);
+    if (strcmp(argv[1], "boot") == 0)
+        return cmd_boot(argc - 2, argv + 2);
     if (strcmp(argv[1], "term") == 0) {
         const char *remote_dir = NULL;
         const char *arg = NULL;

@@ -7,6 +7,7 @@
 #include <stdint.h>
 
 #define LMUX_LINK_TRANSPORT_RING_CAP 4096
+#define LMUX_LINK_BOOT_QUEUE_DEPTH 2
 
 enum lmux_link_state {
     LMUX_LINK_DOWN = 0,
@@ -33,6 +34,19 @@ struct lmux_link_pending_hello {
     int valid;
     uint64_t conn_id;
     struct lmux_link_hello hello;
+};
+
+struct lmux_link_boot_msg {
+    uint8_t type;
+    uint32_t len;
+    uint8_t payload[LMUX_LINK_MAX_PAYLOAD];
+};
+
+struct lmux_link_boot_queue {
+    struct lmux_link_boot_msg msg[LMUX_LINK_BOOT_QUEUE_DEPTH];
+    unsigned r;
+    unsigned w;
+    unsigned len;
 };
 
 struct lmux_link_endpoint {
@@ -62,6 +76,9 @@ struct lmux_link_endpoint {
     size_t out_pos;
     struct lmux_link_ring tx_plain;
     struct lmux_link_ring rx_plain;
+    struct lmux_link_boot_queue tx_boot;
+    struct lmux_link_boot_queue rx_boot;
+    int prefer_boot_tx;
     struct lmux_link_pending_hello pending_peer_hello;
     unsigned long long tx_frames;
     unsigned long long rx_frames;
@@ -71,6 +88,10 @@ struct lmux_link_endpoint {
     unsigned long long protocol_errors;
     unsigned long long transport_tx_bytes;
     unsigned long long transport_rx_bytes;
+    unsigned long long boot_tx_frames;
+    unsigned long long boot_rx_frames;
+    unsigned long long boot_tx_bytes;
+    unsigned long long boot_rx_bytes;
     char last_error[64];
 };
 
@@ -91,6 +112,15 @@ size_t lmux_link_transport_tx_len(const struct lmux_link_endpoint *ep);
 size_t lmux_link_transport_tx_space(const struct lmux_link_endpoint *ep);
 size_t lmux_link_transport_rx_len(const struct lmux_link_endpoint *ep);
 size_t lmux_link_transport_rx_space(const struct lmux_link_endpoint *ep);
+
+int lmux_link_boot_queue_frame(struct lmux_link_endpoint *ep, uint8_t type,
+                               const uint8_t *payload, uint32_t len);
+int lmux_link_boot_read_frame(struct lmux_link_endpoint *ep, uint8_t *type,
+                              uint8_t *payload, size_t cap, uint32_t *len);
+unsigned lmux_link_boot_tx_len(const struct lmux_link_endpoint *ep);
+unsigned lmux_link_boot_tx_space(const struct lmux_link_endpoint *ep);
+unsigned lmux_link_boot_rx_len(const struct lmux_link_endpoint *ep);
+unsigned lmux_link_boot_rx_space(const struct lmux_link_endpoint *ep);
 
 int lmux_link_wants_physical_write(const struct lmux_link_endpoint *ep);
 int lmux_link_can_accept_physical(const struct lmux_link_endpoint *ep);

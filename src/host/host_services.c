@@ -263,6 +263,7 @@ void v2_host_init(struct v2_host *h)
     h->control_listen_fd = -1;
     h->control_fd = -1;
     h->next_req_id = 0;
+    h->boot_next_request_id = 1;
     int i, j;
     for (i = 0; i < V2_MAX_SERVICES; i++) {
         h->services[i].listen_fd = -1;
