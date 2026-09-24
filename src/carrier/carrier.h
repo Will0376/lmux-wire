@@ -20,6 +20,26 @@ enum lmux_carrier_io_status {
     LMUX_CARRIER_IO_FATAL
 };
 
+enum lmux_serial_parity {
+    LMUX_SERIAL_PARITY_NONE = 0,
+    LMUX_SERIAL_PARITY_EVEN,
+    LMUX_SERIAL_PARITY_ODD
+};
+
+enum lmux_serial_flow {
+    LMUX_SERIAL_FLOW_NONE = 0,
+    LMUX_SERIAL_FLOW_RTSCTS,
+    LMUX_SERIAL_FLOW_XONXOFF
+};
+
+struct lmux_serial_config {
+    unsigned baud;
+    unsigned data_bits;
+    enum lmux_serial_parity parity;
+    unsigned stop_bits;
+    enum lmux_serial_flow flow;
+};
+
 struct lmux_carrier_io {
     enum lmux_carrier_io_status status;
     ssize_t n;
@@ -41,7 +61,11 @@ struct lmux_carrier {
     unsigned long long rx_bytes;
     unsigned long long tx_bytes;
     int last_errno;
+    struct lmux_serial_config serial;
 };
+
+void lmux_serial_config_default(struct lmux_serial_config *cfg);
+int lmux_serial_configure_fd(int fd, const struct lmux_serial_config *cfg);
 
 void lmux_carrier_init(struct lmux_carrier *c);
 void lmux_carrier_cleanup(struct lmux_carrier *c);

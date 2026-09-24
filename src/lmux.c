@@ -1,4 +1,5 @@
 #include "lxf.h"
+#include "zeromux/zeromux.h"
 #include "version.h"
 
 #include <errno.h>
@@ -379,6 +380,8 @@ static void usage(FILE *f)
         "  lmux boot rollback ACTIVATION_ID [--control SOCKET]\n"
         "  lmux boot supervisor-install SHA256 [--control SOCKET]\n"
         "  lmux boot supervisor-restart SHA256 [--control SOCKET]\n"
+        "  lmux zeromux probe --tty DEVICE [serial options]\n"
+        "  lmux zeromux send LOCAL_FILE TARGET_TEMP --tty DEVICE [serial options]\n"
         "  lmux term [-v|--verbose] [--remote-dir DIR] [--channel 1|2] [1|2|SOCKET]\n"
         "  lmux exec SOCKET -- PROGRAM [ARGS...]\n"
         "  lmux put [OPTIONS] HOST_SRC [TARGET_DST]\n"
@@ -404,7 +407,15 @@ static void usage(FILE *f)
         "  Ctrl-T q/.      detach\n"
         "  Ctrl-T Ctrl-T   send literal Ctrl-T\n"
         "  Ctrl-T p        upload file   HOST -> TARGET\n"
-        "  Ctrl-T g        download file TARGET -> HOST\n",
+        "  Ctrl-T g        download file TARGET -> HOST\n"
+        "\n"
+        "Zeromux serial options:\n"
+        "  --baud N                    bootstrap UART baud (default 115200)\n"
+        "  --data-bits 5|6|7|8         data bits (default 8)\n"
+        "  --parity none|even|odd      parity (default none)\n"
+        "  --stop-bits 1|2             stop bits (default 1)\n"
+        "  --flow none|rtscts|xonxoff  flow control (default none)\n"
+        "  --timeout-ms N              transaction timeout\n",
         LMUX_BUILD_VERSION, LMUX_PROJECT_NAME);
 }
 
@@ -1818,6 +1829,8 @@ int main(int argc, char **argv)
         return cmd_deploy(argc - 2, argv + 2);
     if (strcmp(argv[1], "boot") == 0)
         return cmd_boot(argc - 2, argv + 2);
+    if (strcmp(argv[1], "zeromux") == 0)
+        return lmux_zeromux_main(argc - 2, argv + 2);
     if (strcmp(argv[1], "term") == 0) {
         const char *remote_dir = NULL;
         const char *arg = NULL;

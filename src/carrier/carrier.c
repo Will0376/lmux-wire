@@ -24,6 +24,7 @@ void lmux_carrier_init(struct lmux_carrier *c)
     c->kind = LMUX_CARRIER_NONE;
     c->fd = -1;
     c->listen_fd = -1;
+    lmux_serial_config_default(&c->serial);
 }
 
 void lmux_carrier_cleanup(struct lmux_carrier *c)
