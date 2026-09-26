@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#define LMUX_LINK_HELLO_RETRY_MS 250
+
 static void set_error(struct lmux_link_endpoint *ep, const char *msg)
 {
     snprintf(ep->last_error, sizeof(ep->last_error), "%s", msg);
@@ -106,9 +108,111 @@ static int min_u32(uint32_t a, uint32_t b)
     return a < b ? (int)a : (int)b;
 }
 
-static void apply_peer_hello(struct lmux_link_endpoint *ep, uint64_t conn_id,
-                             const struct lmux_link_hello *h,
-                             unsigned *events)
+static int encode_local_hello(struct lmux_link_endpoint *ep)
+{
+    struct lmux_link_frame fr;
+    struct lmux_link_hello hello;
+    uint32_t len = 0;
+
+    memset(&hello, 0, sizeof(hello));
+    hello.role = ep->local_role;
+    hello.capabilities = ep->local_caps;
+    hello.max_outer_payload = ep->local_max_outer_payload;
+    hello.max_transport_payload = ep->local_max_transport_payload;
+    hello.preferred_transport_payload = ep->local_preferred_transport_payload;
+
+    memset(&fr, 0, sizeof(fr));
+    fr.type = LMUX_LINK_T_HELLO;
+    fr.header_len = LMUX_LINK_HEADER_LEN;
+    fr.conn_id = ep->local_conn_id;
+    fr.frame_seq = 0;
+    if (lmux_link_make_hello_payload(&hello, fr.payload, sizeof(fr.payload), &len) < 0)
+        return -1;
+    fr.payload_len = len;
+
+    ep->out_len = ep->out_pos = 0;
+    if (lmux_link_encode_frame(&fr, ep->out, sizeof(ep->out), &ep->out_len) < 0)
+        return -1;
+    ep->local_hello_sent = 1;
+    ep->pending_hello = 0;
+    ep->next_hello_retry_ms = 0;
+    return 0;
+}
+
+static int queue_local_hello(struct lmux_link_endpoint *ep)
+{
+    if (ep->out_pos < ep->out_len) {
+        ep->pending_hello = 1;
+        return 0;
+    }
+    return encode_local_hello(ep);
+}
+
+static int encode_hello_ack(struct lmux_link_endpoint *ep, uint64_t peer_conn_id)
+{
+    struct lmux_link_frame fr;
+    uint32_t len = 0;
+
+    memset(&fr, 0, sizeof(fr));
+    fr.type = LMUX_LINK_T_HELLO_ACK;
+    fr.header_len = LMUX_LINK_HEADER_LEN;
+    fr.conn_id = ep->local_conn_id;
+    fr.frame_seq = 0;
+    if (lmux_link_make_hello_ack_payload(peer_conn_id, fr.payload,
+                                         sizeof(fr.payload), &len) < 0)
+        return -1;
+    fr.payload_len = len;
+
+    ep->out_len = ep->out_pos = 0;
+    if (lmux_link_encode_frame(&fr, ep->out, sizeof(ep->out), &ep->out_len) < 0)
+        return -1;
+    ep->pending_ack = 0;
+    ep->out_is_ack = 1;
+    ep->out_ack_peer_conn_id = peer_conn_id;
+    return 0;
+}
+
+static int queue_hello_ack(struct lmux_link_endpoint *ep, uint64_t peer_conn_id)
+{
+    if ((ep->pending_ack && ep->pending_ack_peer_conn_id == peer_conn_id) ||
+        (ep->out_is_ack && ep->out_ack_peer_conn_id == peer_conn_id))
+        return 0;
+    ep->pending_ack = 1;
+    ep->pending_ack_peer_conn_id = peer_conn_id;
+    if (ep->out_pos < ep->out_len)
+        return 1;
+    return encode_hello_ack(ep, peer_conn_id) < 0 ? -1 : 1;
+}
+
+static int build_pending_handshake_output(struct lmux_link_endpoint *ep)
+{
+    if (ep->out_pos < ep->out_len)
+        return 0;
+    ep->out_pos = ep->out_len = 0;
+    ep->out_is_ack = 0;
+    ep->out_ack_peer_conn_id = 0;
+    if (ep->pending_ack)
+        return encode_hello_ack(ep, ep->pending_ack_peer_conn_id);
+    if (ep->pending_hello)
+        return encode_local_hello(ep);
+    return 0;
+}
+
+static void maybe_establish(struct lmux_link_endpoint *ep, unsigned *events)
+{
+    if (ep->state == LMUX_LINK_WAIT_HELLO &&
+        ep->peer_hello_accepted &&
+        ep->local_ack_committed &&
+        ep->peer_ack_received) {
+        ep->state = LMUX_LINK_ESTABLISHED;
+        if (events)
+            *events |= LMUX_LINK_EV_ESTABLISHED;
+    }
+}
+
+static int apply_peer_hello(struct lmux_link_endpoint *ep, uint64_t conn_id,
+                            const struct lmux_link_hello *h,
+                            unsigned *events)
 {
     uint32_t eff_outer, eff_transport;
     ep->peer_role = h->role;
@@ -131,12 +235,23 @@ static void apply_peer_hello(struct lmux_link_endpoint *ep, uint64_t conn_id,
         eff_transport = LMUX_LINK_TRANSPORT_TARGET;
     ep->effective_transport_payload = eff_transport;
     ep->negotiated_caps = ep->local_caps & ep->peer_caps;
-    if (ep->local_hello_sent && ep->peer_hello_accepted &&
-        ep->state != LMUX_LINK_ESTABLISHED) {
-        ep->state = LMUX_LINK_ESTABLISHED;
-        if (events)
-            *events |= LMUX_LINK_EV_ESTABLISHED;
+    if (events)
+        *events |= LMUX_LINK_EV_PEER_HELLO;
+    {
+        int queued = queue_hello_ack(ep, conn_id);
+        if (queued < 0) {
+            ep->state = LMUX_LINK_ERROR_RESETTING;
+            ep->protocol_errors++;
+            set_error(ep, "hello ack encode");
+            if (events)
+                *events |= LMUX_LINK_EV_DOWN;
+            return -1;
+        }
+        if (queued && events)
+            *events |= LMUX_LINK_EV_HELLO_ACK_QUEUED;
     }
+    maybe_establish(ep, events);
+    return 0;
 }
 
 void lmux_link_endpoint_init(struct lmux_link_endpoint *ep,
@@ -201,33 +316,16 @@ void lmux_link_endpoint_down(struct lmux_link_endpoint *ep)
 void lmux_link_endpoint_begin(struct lmux_link_endpoint *ep,
                               uint64_t conn_id)
 {
-    struct lmux_link_frame fr;
-    struct lmux_link_hello hello;
-    uint32_t len = 0;
     lmux_link_endpoint_down(ep);
     ep->local_conn_id = conn_id ? conn_id : 1;
     ep->state = LMUX_LINK_WAIT_HELLO;
     ep->next_tx_seq = 1;
     ep->expected_rx_seq = 0;
     ep->pending_peer_hello.valid = 0;
+    ep->next_hello_retry_ms = 0;
 
-    memset(&hello, 0, sizeof(hello));
-    hello.role = ep->local_role;
-    hello.capabilities = ep->local_caps;
-    hello.max_outer_payload = ep->local_max_outer_payload;
-    hello.max_transport_payload = ep->local_max_transport_payload;
-    hello.preferred_transport_payload = ep->local_preferred_transport_payload;
-
-    memset(&fr, 0, sizeof(fr));
-    fr.type = LMUX_LINK_T_HELLO;
-    fr.header_len = LMUX_LINK_HEADER_LEN;
-    fr.conn_id = ep->local_conn_id;
-    fr.frame_seq = 0;
-    if (lmux_link_make_hello_payload(&hello, fr.payload, sizeof(fr.payload), &len) < 0)
-        return;
-    fr.payload_len = len;
-    if (lmux_link_encode_frame(&fr, ep->out, sizeof(ep->out), &ep->out_len) == 0)
-        ep->local_hello_sent = 1;
+    if (queue_local_hello(ep) < 0)
+        set_error(ep, "hello encode");
 }
 
 size_t lmux_link_transport_write(struct lmux_link_endpoint *ep,
@@ -307,6 +405,7 @@ int lmux_link_has_pending_output(const struct lmux_link_endpoint *ep)
 int lmux_link_wants_physical_write(const struct lmux_link_endpoint *ep)
 {
     return lmux_link_has_pending_output(ep) ||
+           ep->pending_ack || ep->pending_hello ||
            ep->tx_plain.len > 0 || ep->tx_boot.len > 0;
 }
 
@@ -324,6 +423,8 @@ int lmux_link_build_output(struct lmux_link_endpoint *ep)
     int send_boot;
     if (ep->out_pos < ep->out_len)
         return 0;
+    if (ep->pending_ack || ep->pending_hello)
+        return build_pending_handshake_output(ep);
     ep->out_pos = ep->out_len = 0;
     if (ep->state != LMUX_LINK_ESTABLISHED ||
         (ep->tx_plain.len == 0 && ep->tx_boot.len == 0))
@@ -385,11 +486,50 @@ const uint8_t *lmux_link_output_ptr(const struct lmux_link_endpoint *ep)
 
 void lmux_link_output_consume(struct lmux_link_endpoint *ep, size_t n)
 {
+    lmux_link_output_consume_events(ep, n, NULL);
+}
+
+void lmux_link_output_consume_events(struct lmux_link_endpoint *ep, size_t n,
+                                     unsigned *events)
+{
     if (n > ep->out_len - ep->out_pos)
         n = ep->out_len - ep->out_pos;
     ep->out_pos += n;
-    if (ep->out_pos == ep->out_len)
+    if (ep->out_pos == ep->out_len) {
         ep->out_pos = ep->out_len = 0;
+        if (ep->out_is_ack) {
+            ep->out_is_ack = 0;
+            if (ep->out_ack_peer_conn_id == ep->peer_conn_id) {
+                ep->local_ack_committed = 1;
+                if (events)
+                    *events |= LMUX_LINK_EV_HELLO_ACK_COMMITTED;
+                maybe_establish(ep, events);
+            }
+            ep->out_ack_peer_conn_id = 0;
+        }
+    }
+}
+
+int lmux_link_endpoint_tick(struct lmux_link_endpoint *ep, long long now_ms)
+{
+    if (ep->state != LMUX_LINK_WAIT_HELLO || ep->out_pos < ep->out_len ||
+        ep->pending_ack || ep->pending_hello)
+        return 0;
+    if (!ep->next_hello_retry_ms) {
+        ep->next_hello_retry_ms = now_ms + LMUX_LINK_HELLO_RETRY_MS;
+        return 0;
+    }
+    if (now_ms < ep->next_hello_retry_ms)
+        return 0;
+    if (queue_local_hello(ep) < 0) {
+        ep->state = LMUX_LINK_ERROR_RESETTING;
+        ep->protocol_errors++;
+        set_error(ep, "hello retry encode");
+        return -1;
+    }
+    ep->hello_retry_count++;
+    ep->next_hello_retry_ms = now_ms + LMUX_LINK_HELLO_RETRY_MS;
+    return 1;
 }
 
 static void fail_session(struct lmux_link_endpoint *ep, unsigned *events,
@@ -403,6 +543,11 @@ static void fail_session(struct lmux_link_endpoint *ep, unsigned *events,
     boot_queue_clear(&ep->tx_boot);
     boot_queue_clear(&ep->rx_boot);
     ep->out_len = ep->out_pos = 0;
+    ep->pending_hello = 0;
+    ep->pending_ack = 0;
+    ep->pending_ack_peer_conn_id = 0;
+    ep->out_is_ack = 0;
+    ep->out_ack_peer_conn_id = 0;
     if (events)
         *events |= LMUX_LINK_EV_DOWN;
 }
@@ -422,8 +567,19 @@ static int accept_hello(struct lmux_link_endpoint *ep,
         return -1;
     }
     if (ep->state == LMUX_LINK_ESTABLISHED) {
-        if (fr->conn_id == ep->peer_conn_id)
+        if (fr->conn_id == ep->peer_conn_id) {
+            int queued;
+            if (events)
+                *events |= LMUX_LINK_EV_PEER_HELLO;
+            queued = queue_hello_ack(ep, fr->conn_id);
+            if (queued < 0) {
+                fail_session(ep, events, "hello ack encode");
+                return -1;
+            }
+            if (queued && events)
+                *events |= LMUX_LINK_EV_HELLO_ACK_QUEUED;
             return 0;
+        }
         ep->pending_peer_hello.valid = 1;
         ep->pending_peer_hello.conn_id = fr->conn_id;
         ep->pending_peer_hello.hello = h;
@@ -434,10 +590,46 @@ static int accept_hello(struct lmux_link_endpoint *ep,
         boot_queue_clear(&ep->tx_boot);
         boot_queue_clear(&ep->rx_boot);
         ep->out_len = ep->out_pos = 0;
+        ep->pending_hello = 0;
+        ep->pending_ack = 0;
+        ep->pending_ack_peer_conn_id = 0;
+        ep->out_is_ack = 0;
+        ep->out_ack_peer_conn_id = 0;
         *events |= LMUX_LINK_EV_PEER_RESTART | LMUX_LINK_EV_DOWN;
         return 0;
     }
-    apply_peer_hello(ep, fr->conn_id, &h, events);
+    if (ep->peer_hello_accepted && fr->conn_id != ep->peer_conn_id) {
+        ep->peer_ack_received = 0;
+        ep->local_ack_committed = 0;
+        ep->pending_ack = 0;
+        ep->out_is_ack = 0;
+        ep->out_ack_peer_conn_id = 0;
+    }
+    return apply_peer_hello(ep, fr->conn_id, &h, events);
+}
+
+static int accept_hello_ack(struct lmux_link_endpoint *ep,
+                            const struct lmux_link_frame *fr,
+                            unsigned *events)
+{
+    uint64_t ack_peer_conn_id = 0;
+    if (fr->frame_seq != 0 || fr->conn_id == 0 ||
+        lmux_link_parse_hello_ack_payload(fr->payload, fr->payload_len,
+                                          &ack_peer_conn_id) < 0) {
+        if (ep->state == LMUX_LINK_ESTABLISHED)
+            fail_session(ep, events, "bad hello ack");
+        else
+            ep->resync_drops++;
+        return -1;
+    }
+    if (!ep->peer_hello_accepted ||
+        fr->conn_id != ep->peer_conn_id ||
+        ack_peer_conn_id != ep->local_conn_id)
+        return 0;
+    ep->peer_ack_received = 1;
+    if (events)
+        *events |= LMUX_LINK_EV_PEER_HELLO_ACK;
+    maybe_establish(ep, events);
     return 0;
 }
 
@@ -453,7 +645,8 @@ int lmux_link_endpoint_restart_from_pending(struct lmux_link_endpoint *ep,
     lmux_link_endpoint_begin(ep, new_local_conn_id);
     if (!ep->local_hello_sent)
         return -1;
-    apply_peer_hello(ep, pending.conn_id, &pending.hello, events);
+    if (apply_peer_hello(ep, pending.conn_id, &pending.hello, events) < 0)
+        return -1;
     ep->pending_peer_hello.valid = 0;
     return 0;
 }
@@ -464,6 +657,10 @@ static void handle_frame(struct lmux_link_endpoint *ep,
 {
     if (fr->type == LMUX_LINK_T_HELLO) {
         (void)accept_hello(ep, fr, events);
+        return;
+    }
+    if (fr->type == LMUX_LINK_T_HELLO_ACK) {
+        (void)accept_hello_ack(ep, fr, events);
         return;
     }
     if (ep->state != LMUX_LINK_ESTABLISHED) {

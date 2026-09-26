@@ -34,7 +34,7 @@ uint32_t lmux_crc32c(const uint8_t *buf, size_t len)
 
 static int validate_type(uint8_t type)
 {
-    return type >= LMUX_LINK_T_HELLO && type <= LMUX_LINK_T_BOOT_EVENT;
+    return type >= LMUX_LINK_T_HELLO && type <= LMUX_LINK_T_HELLO_ACK;
 }
 
 int lmux_link_encode_frame(const struct lmux_link_frame *fr,
@@ -172,4 +172,25 @@ int lmux_link_parse_hello_payload(const uint8_t *payload, uint32_t payload_len,
         h->preferred_transport_payload > h->max_transport_payload)
         return -1;
     return 0;
+}
+
+int lmux_link_make_hello_ack_payload(uint64_t ack_peer_conn_id,
+                                     uint8_t *out, size_t out_cap,
+                                     uint32_t *out_len)
+{
+    if (!out || !out_len || out_cap < 8 || ack_peer_conn_id == 0)
+        return -1;
+    put_le64(out, ack_peer_conn_id);
+    *out_len = 8;
+    return 0;
+}
+
+int lmux_link_parse_hello_ack_payload(const uint8_t *payload,
+                                      uint32_t payload_len,
+                                      uint64_t *ack_peer_conn_id)
+{
+    if (!payload || !ack_peer_conn_id || payload_len != 8)
+        return -1;
+    *ack_peer_conn_id = get_le64(payload);
+    return *ack_peer_conn_id ? 0 : -1;
 }

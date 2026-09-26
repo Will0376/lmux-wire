@@ -20,7 +20,11 @@ enum lmux_link_event {
     LMUX_LINK_EV_NONE = 0,
     LMUX_LINK_EV_ESTABLISHED = 0x01,
     LMUX_LINK_EV_DOWN = 0x02,
-    LMUX_LINK_EV_PEER_RESTART = 0x04
+    LMUX_LINK_EV_PEER_RESTART = 0x04,
+    LMUX_LINK_EV_PEER_HELLO = 0x08,
+    LMUX_LINK_EV_HELLO_ACK_QUEUED = 0x10,
+    LMUX_LINK_EV_HELLO_ACK_COMMITTED = 0x20,
+    LMUX_LINK_EV_PEER_HELLO_ACK = 0x40
 };
 
 struct lmux_link_ring {
@@ -68,6 +72,15 @@ struct lmux_link_endpoint {
     uint32_t effective_transport_payload;
     int local_hello_sent;
     int peer_hello_accepted;
+    int local_ack_committed;
+    int peer_ack_received;
+    int pending_hello;
+    int pending_ack;
+    uint64_t pending_ack_peer_conn_id;
+    int out_is_ack;
+    uint64_t out_ack_peer_conn_id;
+    long long next_hello_retry_ms;
+    unsigned hello_retry_count;
     uint8_t enc_in[LMUX_LINK_MAX_ENCODED];
     size_t enc_in_len;
     int discard_until_delim;
@@ -129,6 +142,9 @@ int lmux_link_build_output(struct lmux_link_endpoint *ep);
 size_t lmux_link_output_len(const struct lmux_link_endpoint *ep);
 const uint8_t *lmux_link_output_ptr(const struct lmux_link_endpoint *ep);
 void lmux_link_output_consume(struct lmux_link_endpoint *ep, size_t n);
+void lmux_link_output_consume_events(struct lmux_link_endpoint *ep, size_t n,
+                                     unsigned *events);
+int lmux_link_endpoint_tick(struct lmux_link_endpoint *ep, long long now_ms);
 
 int lmux_link_input_bytes(struct lmux_link_endpoint *ep,
                           const uint8_t *buf, size_t len,

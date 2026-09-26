@@ -175,7 +175,22 @@ Example:
 lmux zeromux install ./lmuxd \
     --tty /dev/ttyUSB0 \
     --baud 115200 \
+    --install-dir /root/zmx-lmux \
     --lmux-carrier /dev/ttyGS0
+```
+
+Z2 requires all three explicit target choices:
+
+```text
+--tty BOOTSTRAP_DEVICE
+--install-dir TARGET_DIR
+--lmux-carrier TARGET_CARRIER
+```
+
+The installed executable path is:
+
+```text
+<TARGET_DIR>/lmuxd
 ```
 
 `--lmux-carrier` describes the target-side operational LMUX carrier.
@@ -185,6 +200,12 @@ It is not the host bootstrap tty.
 Zeromux must not infer a host-side operational carrier such as `/dev/ttyACM0` merely from a target path such as `/dev/ttyGS0`.
 
 Host-side LMUX carrier configuration remains a separate host/runtime concern.
+
+Z2 launches the installed supervisor on the distinct carrier but does not verify
+OUTER, LMUX/2 or service reconciliation. It also does not install persistent
+respawn policy: no `/etc/inittab`, no systemd units and no embedded process
+manager are modified. The bootstrap UART remains an authenticated shell channel
+after launch.
 
 ### Install using the bootstrap channel itself
 
@@ -608,6 +629,7 @@ The first implemented backend is selected only when the structured probe says:
 
 ```text
 uudecode=yes
+stty=yes
 sha256sum=yes
 ```
 
@@ -648,6 +670,71 @@ probable success.
 
 ZMODEM remains a future optimized sender backend. `rz=yes` is recorded by
 probe but is not used by Z1.
+
+Z1 has been hardware-verified on the Hantek target over `/dev/ttyUSB0` at
+115200 8N1 with a 1 MiB transfer verified by target `sha256sum`.
+
+### Z2 explicit install + distinct-carrier launch
+
+Z2 adds an explicit mutating install command:
+
+```text
+lmux zeromux install FILE \
+    --tty BOOTSTRAP_DEVICE \
+    --install-dir TARGET_DIR \
+    --lmux-carrier TARGET_CARRIER \
+    [serial options]
+```
+
+The install directory is never guessed. The operational LMUX carrier is the
+target-side path passed to the launched supervisor and is never mapped to a
+host-side carrier by Zeromux.
+
+The target-side flow is:
+
+```text
+mkdir -p TARGET_DIR
+    ↓
+if TARGET_DIR/lmuxd already has the local SHA256, skip upload
+    ↓
+upload to TARGET_DIR/.lmuxd.zmx.<nonce>.tmp
+    ↓
+verify temp by SHA256
+    ↓
+chmod 0755 temp
+    ↓
+mv -f temp TARGET_DIR/lmuxd
+    ↓
+sync
+    ↓
+verify final TARGET_DIR/lmuxd by SHA256
+    ↓
+launch TARGET_DIR/lmuxd --supervisor --outer --carrier TARGET_CARRIER
+```
+
+The temporary file is in the same directory as the final executable so the final
+move is pathname-atomic on the target filesystem. Existing `TARGET_DIR/lmuxd`
+is not removed before a verified temporary artifact is ready. If launch fails
+after the final move, Z2 reports launch failure and leaves the installed
+artifact in place; it does not attempt rollback.
+
+The launched supervisor is detached from the bootstrap UART:
+
+```text
+TARGET_DIR/lmuxd --supervisor --outer --carrier TARGET_CARRIER \
+    </dev/null >/tmp/lmux-zeromux-<nonce>.log 2>&1 &
+```
+
+Z2 captures `$!` for the backgrounded supervisor process, then uses host-side
+monotonic timing to check `kill -0 PID` repeatedly through a bounded startup
+grace window. `status=started` means only that this exact PID survived the
+initial grace period. It catches immediate startup failures such as carrier-open
+errors, but it does not prove OUTER, LMUX/2 or service health. Normal LMUX
+tooling remains responsible for operational connection verification.
+
+Z2 does not implement same-channel handoff. The bootstrap UART remains a shell
+channel after install/launch. Same-channel bootstrap-to-LMUX transition is a
+future Z3 concern.
 
 ## 12. Installation contract
 
@@ -894,7 +981,8 @@ Implement:
 
 ```text
 lmux zeromux install FILE
-    --bootstrap ...
+    --tty BOOTSTRAP_DEVICE
+    --install-dir TARGET_DIR
     --lmux-carrier TARGET_PATH
 ```
 
@@ -904,7 +992,9 @@ Scope:
 * target temp/final install;
 * executable setup;
 * explicit supervisor launch;
-* no same-channel handoff yet unless it naturally falls out safely;
+* bootstrap UART remains a shell after launch;
+* no persistent init/respawn configuration;
+* no same-channel handoff;
 * no automatic guessing of LMUX carrier.
 
 ### Z3 — same-channel bootstrap -> LMUX handoff

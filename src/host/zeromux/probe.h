@@ -3,7 +3,7 @@
 
 #include "session.h"
 
-#define LMUX_ZMX_TOOL_COUNT 20
+#define LMUX_ZMX_TOOL_COUNT 22
 
 enum lmux_zmx_tri {
     LMUX_ZMX_UNKNOWN = 0,

@@ -155,14 +155,15 @@ the delimiter, plus one delimiter byte.
 3   BOOT_REQUEST
 4   BOOT_RESPONSE
 5   BOOT_EVENT
-6-63     reserved for future core OUTER frame types
+6   HELLO_ACK
+7-63     reserved for future core OUTER frame types
 64-127   reserved for future standard extensions
 128-223  reserved for future experimental/private extensions
 224-255  reserved
 ```
 
-Before HELLO establishment, only valid HELLO frames may affect state. Other
-valid records are discarded as pre-established traffic.
+Before HELLO establishment, only valid HELLO and HELLO_ACK frames may affect
+state. Other valid records are discarded as pre-established traffic.
 
 After establishment:
 
@@ -228,13 +229,16 @@ Every frame sent by an endpoint carries that endpoint's current `conn_id`.
 
 ## Frame Sequence Numbers
 
-`HELLO` for a fresh `conn_id` uses:
+Handshake frames for a fresh `conn_id` use:
 
 ```text
 frame_seq = 0
 ```
 
-The first non-HELLO frame under that `conn_id` uses:
+This applies to both `HELLO` and `HELLO_ACK`. Handshake frames do not consume
+the strict established-session data sequence.
+
+The first TRANSPORT or BOOT frame under that `conn_id` uses:
 
 ```text
 frame_seq = 1
@@ -259,14 +263,20 @@ lower/stale frame_seq
 gap above expected frame_seq
     current OUTER session failure
 
-non-HELLO frame with wrong conn_id
+TRANSPORT/BOOT frame with wrong conn_id
     current OUTER session failure
 
 HELLO with same peer conn_id and frame_seq 0
-    duplicate HELLO; idempotent if compatible
+    duplicate HELLO; reply with HELLO_ACK and otherwise keep state
 
 HELLO with different nonzero peer conn_id and frame_seq 0
     peer restart/new physical incarnation
+
+HELLO_ACK with same peer conn_id and frame_seq 0
+    complete or repeat handshake acknowledgement if ack_peer_conn_id matches
+
+HELLO_ACK with stale/mismatched conn ids
+    ignore; it cannot establish or repair the current session
 ```
 
 The physical carrier is ordered. Sequence numbers detect omission, duplication,
@@ -304,17 +314,68 @@ ignore bytes beyond the first 24.
 HELLO does not include implementation/build strings. BOOT `GET_INFO` is used
 for version and management information.
 
-HELLO establishment:
+Successful local `write()` of a HELLO does not prove peer receipt. OUTER/1
+therefore uses explicit HELLO acknowledgement.
+
+HELLO_ACK payload v1:
 
 ```text
-local HELLO sent
-+
-peer HELLO accepted
-=
-OUTER ESTABLISHED
+u64   ack_peer_conn_id
 ```
 
-No TRANSPORT or BOOT frame is accepted before OUTER establishment.
+The common frame header `conn_id` is the ACK sender's current local
+incarnation. The payload `ack_peer_conn_id` is the peer incarnation being
+acknowledged. This binds each ACK to both endpoint incarnation IDs:
+
+```text
+HELLO_ACK header conn_id   == sender local_conn_id
+HELLO_ACK ack_peer_conn_id == receiver local_conn_id
+```
+
+Handshake state per endpoint:
+
+```text
+local_conn_id
+peer_conn_id / unknown
+peer_hello_seen
+local_ack_committed
+peer_ack_received
+```
+
+While not established, an endpoint periodically sends HELLO with the same local
+`conn_id` using a bounded monotonic retry. There is at most one pending HELLO
+retry; retry stops after establishment.
+
+On receiving a valid HELLO for the current peer incarnation, an endpoint queues
+HELLO_ACK. Duplicate same-peer HELLO is idempotent. If the same ACK is already
+pending or physically in-flight, the duplicate does not enqueue another copy.
+After that ACK is physically committed, a later duplicate HELLO may queue one
+fresh ACK because the peer may have lost the previous one. An established
+endpoint does not restart or echo HELLO for a same-peer duplicate HELLO; it only
+replies with the coalesced HELLO_ACK behavior described above.
+
+HELLO_ACK is accepted only when:
+
+```text
+HELLO_ACK header conn_id == current peer_conn_id
+ack_peer_conn_id         == local_conn_id
+```
+
+Stale or mismatched ACKs are ignored and cannot complete the handshake.
+
+OUTER establishment requires all of:
+
+```text
+peer_hello_seen == true
+local_ack_committed == true
+peer_ack_received == true
+```
+
+`local_ack_committed` means the complete encoded HELLO_ACK frame was written to
+the physical carrier output path, not merely queued internally.
+
+No TRANSPORT or BOOT frame is accepted or delivered upward before OUTER
+establishment.
 
 ## HELLO Capabilities
 
@@ -348,8 +409,9 @@ effective_transport_payload =
 
 ## HELLO Duplicates And Peer Restart
 
-Same peer `conn_id` with a compatible duplicate HELLO is idempotent. It does
-not reset sequence state, TRANSPORT, BOOT, LMS1, or LMUX.
+Same peer `conn_id` with a compatible duplicate HELLO is idempotent. It queues
+at most one pending/in-flight HELLO_ACK for that peer and does not reset
+sequence state, TRANSPORT, BOOT, LMS1, or LMUX.
 
 Different peer `conn_id` while established means peer restart or a new physical
 incarnation. The old OUTER session is retired:
@@ -388,6 +450,11 @@ carrier loss retires current OUTER session
 both endpoints choose fresh conn_id for the new physical incarnation
 new HELLO convergence is required
 ```
+
+HELLO_ACK is mandatory OUTER/1 handshake behavior. Earlier alpha builds that
+implemented HELLO-only establishment are not interoperable with this handshake:
+the common frame header version remains `1`, but type `6` is no longer an
+optional extension.
 
 Convergence does not depend on heuristic autodetection or timeout-based protocol
 guessing.

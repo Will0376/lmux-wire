@@ -1,292 +1,170 @@
 # LMUX Wire
 
-LMUX Wire is a lightweight userspace multiplexer for embedded Linux. The
-foreground daemon is `lmuxd`, the CLI client is `lmux`, and the runtime wire
-transport is LMUX/2.
+LMUX Wire is a userspace transport and service stack for embedded Linux. It is
+designed to give host tooling a durable way to reach a constrained target
+without kernel modules, USB networking, `n_gsm`, helper threads, or a second
+runtime process per service.
 
-LMUX/2 carries transient byte streams over one ordered full-duplex byte-stream
-carrier. The transport core knows about frames, streams, bytes, flow control,
-and lifecycle; the daemon runtime routes the service/control plane above it.
-Application protocols such as LXF remain opaque bytes on top of streams.
+Current high-level shape:
 
-LMUX/1 was the historical fixed-channel predecessor and remains useful only as a
-git-history reference point.
+```text
+HOST:
+lmux / lmuxd
+    -> LMUX/2
+    -> OUTER/1
+    -> carrier
 
-## Runtime Model
+TARGET:
+carrier
+    -> supervisor / OUTER
+    -> LMS1
+    -> worker / LMUX/2
+    -> services
+```
 
-The target daemon advertises bounded built-in factories:
+The implementation is intentionally small and event-driven: one process, one
+`poll()` loop, no threads. LMUX/2 is the active runtime wire protocol; there is
+no LMUX/1 fallback or autodetection.
+
+LMUX is primarily a stable substrate for host tooling and future MCP-style
+embedded target control. It is not trying to become an OTA framework, package
+manager, USB network stack, or kernel-side mux.
+
+## Target Baseline
+
+The current hardware baseline is the Hantek DSO2D15 class target:
+
+```text
+CPU:      ARM926EJ-S / ARMv5TEJ
+kernel:   Linux 5.2
+libc:     glibc 2.23
+userland: BusyBox
+memory:   about 55 MiB RAM, no swap
+ABI:      EABI5 soft-float
+build:    static target binary
+```
+
+Typical development carriers are:
+
+```text
+target: /dev/ttyGS0
+host:   /dev/ttyACM0
+```
+
+LMUX is not Hantek-specific; that target is simply the currently tested
+low-resource embedded baseline.
+
+## Architecture
+
+Do not conflate the lifetimes in the stack:
+
+```text
+carrier
+!= OUTER session
+!= supervisor-worker link
+!= LMUX session
+!= service
+!= stream
+!= local endpoint
+!= PTY process
+```
+
+Physical carrier loss retires the current OUTER/LMUX session, but it does not
+necessarily kill the target supervisor, worker process, durable services, or
+PTY children. Worker replacement is a separate managed lifecycle event; it
+creates a fresh LMUX incarnation and the host reconciles desired services again.
+
+## OUTER/1
+
+OUTER/1 is the physical framing and supervisor-management layer between host
+and target supervisor. It uses COBS records with a zero delimiter, CRC32C,
+endpoint connection incarnation IDs, and strict established-session
+`frame_seq`.
+
+First contact uses explicit `HELLO` / `HELLO_ACK` handshake semantics plus
+bounded periodic HELLO retry while negotiating. This matters on real USB serial
+links: a locally successful write of an early HELLO does not prove that the
+peer endpoint received it. Both target-first and host-first startup are expected
+to converge.
+
+OUTER carries two planes:
+
+- `TRANSPORT`: exact opaque LMUX/2 byte chunks.
+- `BOOT`: supervisor management messages.
+
+The core transport invariant is:
+
+```text
+TRANSPORT = exact ordered LMUX bytes OR explicit OUTER failure
+```
+
+A bad CRC, sequence gap, malformed current-session frame, or other
+current-session protocol failure retires the OUTER session instead of silently
+creating a hole in the LMUX byte stream. See [docs/outer1-wire.md](docs/outer1-wire.md)
+for the wire specification.
+
+## Supervisor And Worker
+
+The target supervisor owns:
+
+- the physical carrier;
+- OUTER/1;
+- BOOT;
+- worker process lifecycle;
+- LMS1 supervisor-worker link;
+- persistent managed-worker state.
+
+The supervisor proxies LMUX bytes as opaque TRANSPORT payload. It does not parse
+LMUX streams, services, PTY data, FILE data, GDB traffic, or factory reports.
+
+The worker owns:
+
+- LMUX/2;
+- service factories;
+- PTYs;
+- FILE;
+- Unix rendezvous sockets.
+
+This boundary keeps transport/lifecycle recovery separate from service-level
+protocols.
+
+## Current Services
+
+Built-in worker services:
 
 - `pty`
 - `unix-rendezvous`
 - `file`
 
-The host daemon owns desired topology and ensures durable services by name:
+Default desired services in the host helper are:
 
-- `console1`: `pty`, `/bin/sh`, supervised
-- `console2`: `pty`, `/bin/sh`, supervised
-- `gdb`: `unix-rendezvous`, target socket `/tmp/lmux-gdb.sock`
-- `files`: `file`
+- `console1`
+- `console2`
+- `gdb`
+- `files`
 
-Host-side sockets for the default deployment are:
+### PTY
 
-- `/run/lmux/console1.sock`
-- `/run/lmux/console2.sock`
-- `/run/lmux/gdb.sock`
-- `/run/lmux/file.sock`
-- `/run/lmux/control.sock`
+The PTY service starts `/bin/sh`, supervises the child, applies window-size
+updates, and lets `lmux term` attach to a console service. PTY children are
+durable across stream detach/reconnect while the worker stays alive.
 
-Service names are durable identities inside one target worker lifetime.
-`service_id` values are runtime handles in that worker lifetime. `stream_id`
-values are transient and connection-local; a physical reconnect creates a fresh
-stream-id namespace and old streams cannot be reused.
+### Unix Rendezvous
 
-## Programs
+The Unix rendezvous service is a binary-clean byte bridge. It is used for
+things like GDB, but LMUX does not parse the application protocol.
 
-- `lmuxd`: foreground daemon owning the physical carrier.
-- `lmux term [-v|--verbose] [--remote-dir DIR] [--channel 1|2] [1|2|SOCKET]`:
-  raw terminal client with local Ctrl-T prefix controls.
-- `lmux status [--control SOCKET]`: query the local host daemon status socket.
-- `lmux connect SOCKET`: binary-clean stdin/stdout socket bridge.
-- `lmux exec SOCKET -- PROGRAM [ARGS...]`: dup2s a socket to child stdin/stdout
-  and execs directly.
-- `lmux put [OPTIONS] HOST_SRC [TARGET_DST]`: upload, HOST to TARGET.
-- `lmux get [OPTIONS] TARGET_SRC [HOST_DST]`: download, TARGET to HOST.
+### FILE
 
-## Source Tree
-
-The source tree is split by coarse subsystem:
-
-```text
-src/
-  lmux.c                 CLI frontend
-  lxf.c, lxf.h           LXF file-transfer application protocol
-  carrier/               physical/inherited/test byte-stream backends
-  transport/             COBS/CRC helpers and LMUX/2 codec/core
-  host/                  host desired topology, local endpoints, control.sock
-  runtime/               lmuxd entry point and poll-loop orchestration
-  services/              target PTY, Unix rendezvous, and FILE adapters
-tests/
-  unit/                  helper/core/frontend/carrier unit tests
-  integration/           real two-daemon LMUX/2 integration tests
-```
-
-`src/transport/protocol.c` and `src/transport/lmux.h` retain the historical
-names for generic COBS/CRC/endian/path helpers used by both LMUX/2 and LXF.
-There is no public C library API or installed include hierarchy.
-
-The runtime owns the single `poll()` loop, carrier/session lifecycle, and
-generic LMUX/2 control-plane routing. The host subsystem owns host-daemon
-policy: desired topology, remote service reconciliation, local service
-listeners, pending/active local clients, and `control.sock`. Service modules
-own target-side durable service state and stream/application bindings; they do
-not parse raw LMUX frames.
-
-## Carriers
-
-A carrier is only the ordered full-duplex byte-stream substrate under LMUX/2.
-LMUX framing, CRC, HELLO/session convergence, stream lifecycle, flow control,
-services, PTY, rendezvous, and LXF live above it.
-
-Current carrier backends are:
-
-- TTY/path: `--carrier /dev/ttyACM0`, `--carrier /dev/ttyGS0`
-- inherited fd: `--carrier-fd FD`
-- Unix test carrier: `--carrier-listen PATH`, `--carrier-connect PATH`
-
-TTY/path carriers reopen the configured path after real loss. Inherited-fd
-carriers do not reopen by path; loss ends that carrier instance. Unix
-listen/connect is for integration tests and local development, not a production
-RPC listener.
-
-## Target Startup
-
-The target daemon is zero-config with respect to service topology. It owns the
-carrier and advertises factories; the host decides which services should exist.
-
-```sh
-/root/lmux/lmuxd --role target --carrier /dev/ttyGS0
-```
-
-The included target wrapper waits for `/dev/ttyGS0` and execs foreground
-`lmuxd`:
-
-```sh
-/root/lmux/lmux-start
-```
-
-Intended BusyBox init entry:
-
-```text
-::respawn:/root/lmux/lmux-start
-```
-
-No separate getty or console scripts are needed for normal deployment.
-
-## Host Startup
-
-```sh
-mkdir -p /run/lmux
-/mnt/linfiles/SourceCode/lmux/build/host/lmuxd \
-  --role host \
-  --carrier /dev/ttyACM0 \
-  --control /run/lmux/control.sock \
-  --pty console1:/run/lmux/console1.sock:/bin/sh \
-  --pty console2:/run/lmux/console2.sock:/bin/sh \
-  --unix gdb:/run/lmux/gdb.sock:/tmp/lmux-gdb.sock \
-  --file files:/run/lmux/file.sock
-```
-
-`start-host.sh` starts this topology and cleans stale owned sockets.
-
-## Terminal Prefix
-
-`lmux term` puts the local tty in raw mode. Ordinary bytes, including Ctrl-C and
-Ctrl-Z, go to the remote PTY. Local control uses Ctrl-T:
-
-```text
-Ctrl-T ?       help
-Ctrl-T q/.     detach
-Ctrl-T Ctrl-T  send literal Ctrl-T
-Ctrl-T p       upload file   HOST -> TARGET
-Ctrl-T g       download file TARGET -> HOST
-```
-
-Ctrl-T `p` and `g` temporarily restore the HOST terminal to canonical mode,
-prompt for paths, run the same LXF file service used by `lmux put/get`, then
-restore raw mode and resume the same console socket. The console stream is not
-closed.
-
-`lmux term` and `lmux term 1` use console context 1. `lmux term 2` uses console
-context 2. For a custom socket, add `--channel 1` or `--channel 2` if Ctrl-T file
-operations should query that TARGET shell's current working directory:
-
-```sh
-lmux term --channel 2 /custom/console.sock
-```
-
-Ctrl-T PUT/GET display the HOST current working directory and the TARGET base
-directory. The TARGET base comes from `--remote-dir DIR`, then absolute
-`LMUX_REMOTE_DIR`, then the supervised TARGET shell cwd queried through the file
-service, then `/root`.
-
-`lmux term` sends the initial terminal size and later SIGWINCH changes to the
-host daemon control socket. The host forwards resize control to the matching
-PTY service, and the target applies it with `TIOCSWINSZ`; resize metadata is not
-injected into the shell byte stream.
-
-## Status
-
-Host `lmuxd` can expose a local-only control socket, normally
-`/run/lmux/control.sock` when started by `start-host.sh`.
-
-```sh
-lmux status
-```
-
-Example output:
-
-```text
-LMUX Wire
-local:  0.1.0+build.N
-wire:   LMUX/2
-role:   host
-link:   established
-control: connected
-services:
-  console1 pty id=...
-  console2 pty id=...
-  gdb unix-rendezvous id=...
-  files file id=...
-```
-
-## GDB
-
-Target:
-
-```sh
-/root/lmux/lmux exec /tmp/lmux-gdb.sock -- gdbserver --attach stdio <PID>
-```
-
-Host GDB:
-
-```text
-target remote /run/lmux/gdb.sock
-```
-
-The `gdb` service is a generic Unix rendezvous service. There is no GDB-specific
-daemon logic. GDB's raw all-stop interrupt byte, `0x03`, is transported as
-ordinary stream data.
-
-## File Transfer
-
-Host file socket default:
-
-```text
-/run/lmux/file.sock
-```
-
-Override with `-S SOCKET` or `--socket SOCKET`.
-
-HOST paths refer to the machine running `lmux`. TARGET paths refer to the
-filesystem served by target `lmuxd`. Relative HOST paths resolve against the
-HOST process cwd. Relative TARGET paths resolve against the TARGET base
-directory: `--remote-dir`, absolute `LMUX_REMOTE_DIR`, queried TARGET shell cwd
-for `--channel`, or `/root`.
-
-Upload, HOST to TARGET:
-
-```sh
-lmux put ./lmuxd
-lmux put ./lmuxd /root/lmux/lmuxd
-lmux put --mode 0755 ./lmuxd /root/lmux/lmuxd.new
-lmux put - /tmp/stdin.bin
-```
-
-Download, TARGET to HOST:
-
-```sh
-lmux get log.log
-lmux get /root/log.log ./saved.log
-lmux get /tmp/output.bin -
-lmux get -S /custom/file.sock /tmp/foo ./foo
-```
-
-`--channel 1` or `--channel 2` selects which supervised TARGET shell cwd is
-queried for relative TARGET paths. Explicit absolute paths remain unchanged.
-Directory recursion and automatic parent-directory creation are not supported.
-
-When stderr is a TTY, transfers show a compact progress line. Use `-v` or
-`--verbose` with `lmux put`, `lmux get`, or `lmux term` for detailed progress.
-Progress is always written to stderr. `lmux get TARGET -` keeps downloaded bytes
-on stdout only.
-
-The file service uses the LXF/1 application protocol over the `files` service:
-
-```text
-magic "LXF1"
-u8 type: 1 PUT_REQUEST, 2 GET_REQUEST, 3 OK, 4 ERROR, 5 DATA, 6 DONE, 7 CWD_REQUEST, 8 CWD_REPLY
-u8 flags
-u16 reserved = 0
-u32 payload_length LE
-payload
-```
-
-PUT streams into a temporary regular file in the destination directory using
-`O_CREAT|O_EXCL`, verifies byte count and SHA-256, applies the requested mode,
-fsyncs, and atomically renames over the final path. Existing regular files may
-be replaced; symlinks, directories, devices, FIFOs, and sockets are rejected
-using final-component `lstat()` checks.
-
-GET requires a TARGET regular file, streams DATA records, and sends DONE with
-byte count and SHA-256. HOST `lmux get` writes to a same-directory temp file and
-atomically renames on successful verification. For `HOST_DST = -`, data goes
-directly to stdout and all diagnostics stay on stderr.
-
-CWD support currently belongs to the LXF/frontend path: `LXF_T_CWD_REQUEST`
-maps console context 1 or 2 to PTY services `console1` or `console2` and reads
-`/proc/<shell-pid>/cwd` on the target. It does not parse shell prompts.
+The FILE service uses LXF over LMUX for PUT and GET. Transfers include SHA
+verification, and target-side replacement uses temporary files, fsync, and
+atomic replacement where applicable. Current FILE behavior is functional and
+tested; receive-window autotuning is intentionally not advertised as a current
+feature.
 
 ## Build
+
+Common developer build and verification commands:
 
 ```sh
 make clean
@@ -296,50 +174,212 @@ make target
 make strip-target
 ```
 
-Target builds use `arm-linux-gnueabi-gcc`, ARMv5TE, soft-float, and static
-linking.
+The usual host outputs are under `build/host/`; static target outputs are under
+`build/target/`.
 
-## Version
+## Quick Start
+
+On the target, run the supervisor in OUTER mode:
 
 ```sh
-lmux --version
-lmuxd --version
+/root/lmux/lmuxd --supervisor --outer --carrier /dev/ttyGS0
 ```
 
-Version strings use `BASE+build.N`, for example `0.1.0+build.104`. `BASE` comes
-from `VERSION`; `N` is a persistent monotonic build number shared by `lmux`,
-`lmuxd`, and the host/target binaries from the same build cycle.
+The supervisor also accepts `--storage-root DIR` for managed worker storage. If
+omitted, it uses the directory containing the actual running executable as
+resolved through `/proc/self/exe`.
 
-Human-facing version output includes the project name, for example
-`lmux 0.1.0+build.104 (LMUX Wire)`.
+On the host, the helper starts the default topology:
 
-## Reconnect
+```sh
+./start-host.sh
+```
 
-Physical carrier reconnect is distinct from service lifetime. When a physical
-LMUX/2 connection is lost, all transient streams become terminal and stream IDs
-restart in the new connection namespace. Durable target services may survive
-inside the same daemon process. Host startup/reconnect performs discovery,
-receives the service snapshot, reconciles desired services by name, and opens
-new transient streams.
+It runs roughly:
 
-PTY services keep the supervised `/bin/sh` process across stream detach and
-carrier reconnect while the target daemon remains alive. File transfers are
-transient: an active LXF transfer aborts on physical disconnect and the durable
-`files` service remains usable after reconnect.
+```sh
+build/host/lmuxd \
+  --role host \
+  --outer \
+  --carrier /dev/ttyACM0 \
+  --control /run/lmux/control.sock \
+  --pty console1:/run/lmux/console1.sock:/bin/sh \
+  --pty console2:/run/lmux/console2.sock:/bin/sh \
+  --unix gdb:/run/lmux/gdb.sock:/tmp/lmux-gdb.sock \
+  --file files:/run/lmux/file.sock \
+  --verbose
+```
 
-## Limits
+Basic commands:
 
-- `LMUX2_MAX_STREAMS = 16`.
-- Per-stream RX/TX rings are 1024 bytes.
-- Connection receive window is 4096 bytes.
-- Control/lifecycle queue capacity is 32 frames.
-- Maximum LMUX/2 frame payload is 512 bytes.
-- Service registry capacity is 8 services.
-- Host desired service capacity is 8 services.
-- Per-service binding capacity is 8 bindings.
-- Runtime poll table capacity is 64 fds.
-- LXF DATA payloads are bounded to 4096 bytes and are streamed through normal
-  LMUX/2 flow control.
-- Internal paths are bounded to 255 bytes.
-- No authentication, encryption, compression, TCP, retransmission, directory
-  recursion, or remote command protocol.
+```sh
+lmux status
+lmux term
+lmux term 2
+lmux put ./local.bin /tmp/remote.bin
+lmux get /tmp/remote.bin ./local.bin
+```
+
+`lmux term` uses local Ctrl-T commands:
+
+```text
+Ctrl-T ?        help
+Ctrl-T q/.      detach
+Ctrl-T Ctrl-T   send literal Ctrl-T
+Ctrl-T p        upload file   HOST -> TARGET
+Ctrl-T g        download file TARGET -> HOST
+```
+
+`lmux put` and `lmux get` use `/run/lmux/file.sock` by default. Use
+`--remote-dir`, `--channel 1|2`, `--mode OCTAL`, `-S SOCKET`, and `-v` as shown
+by `lmux --help`.
+
+The checked-in `lmux-start-target.sh` is a legacy raw-target wrapper. Current
+supervisor deployments should use `lmuxd --supervisor --outer ...` or an
+equivalent target init/launcher entry.
+
+## Managed Deployment
+
+High-level worker deployment is:
+
+```sh
+lmux deploy FILE
+```
+
+The host daemon owns the orchestration:
+
+```text
+upload candidate
+-> activate as managed worker
+-> wait for fresh LMUX
+-> reconcile desired services
+-> verify target is still running the candidate
+-> confirm
+-> install the confirmed ELF as the active supervisor executable
+```
+
+The target supervisor owns worker lifecycle. The external system init or
+launcher owns supervisor lifecycle.
+
+To apply the installed supervisor immediately:
+
+```sh
+lmux deploy FILE --restart-supervisor
+```
+
+After successful worker confirmation and supervisor install, the supervisor
+cleanly exits. An external lifecycle owner, such as BusyBox `::respawn` or an
+equivalent launcher loop, must start the active supervisor executable again.
+The host then waits for fresh OUTER/LMUX convergence and service reconciliation.
+
+For an already confirmed and running artifact:
+
+```sh
+lmux deploy --restart-supervisor
+```
+
+This shortcut skips upload/activation/confirmation, installs the currently
+confirmed artifact as the active supervisor executable if needed, and requests a
+supervisor restart.
+
+There is no supervisor A/B rollback subsystem, supervisor self-exec, or
+package-manager policy here. Persistent `worker.state` is the authoritative
+managed worker state, not a general deployment database.
+
+Low-level administration and diagnostics are available under `lmux boot ...`,
+including:
+
+```text
+lmux boot info
+lmux boot worker-status
+lmux boot upload FILE
+lmux boot activate SHA256
+lmux boot update-status
+lmux boot confirm ACTIVATION_ID
+lmux boot rollback ACTIVATION_ID
+lmux boot supervisor-install SHA256
+lmux boot supervisor-restart SHA256
+```
+
+`BOOT` is not a bootloader. It is the supervisor-management protocol carried
+inside OUTER/1.
+
+## Experimental: Zeromux
+
+Zeromux is an experimental host-side bootstrap/recovery subsystem for targets
+where LMUX is not already running. It is not part of the normal LMUX transport
+path and is currently frozen rather than an active expansion direction.
+
+Implemented pieces include:
+
+- authenticated-shell probe over an explicitly selected UART;
+- serial configuration;
+- host-side classic uuencode sender to target `uudecode`;
+- explicit distinct-carrier install/launch.
+
+Verified hardware work included an authenticated Hantek UART shell and a
+1 MiB uuencode transfer with SHA verification. Zeromux remains a bootstrap
+experiment/tool; same-channel handoff, profiles, ZMODEM, relay integration, and
+automatic expansion are not active roadmap items. See
+[docs/zeromux.md](docs/zeromux.md) for details.
+
+## Current Tested Status
+
+Hardware-tested on Hantek DSO2D15:
+
+- OUTER/1 supervisor/worker topology;
+- explicit `HELLO_ACK` first-contact convergence, including target-first then
+  host-later startup;
+- LMUX/2 establishment and service reconciliation;
+- PTY `console1` and `console2`;
+- multi-MiB FILE transfers;
+- live PTY progress during FILE traffic;
+- supervisor/worker restart and reconvergence;
+- managed worker upload, activate, confirm, and rollback;
+- supervisor executable replacement and restart;
+- acceptance scenarios with clean protocol and stream error counters.
+
+## Current Roadmap
+
+Near-term work is intentionally narrow:
+
+1. Keep transport and lifecycle behavior stable.
+2. Add a private exec service for programmatic use.
+3. Build a host-side MCP frontend over LMUX services.
+
+The private exec service is not a public CLI feature yet. Its process/session
+lifecycle, output retrieval, and control semantics still need design.
+
+The MCP-facing goal is practical embedded control over the existing substrate:
+file upload/download, command execution, command/session handles, long-running
+command output retrieval, and signal/control handling.
+
+Cancelled or deferred directions are not part of the active roadmap: UART
+relay, nested LMUX through a relay, bare-target relay bootstrap, generic
+tunneling framework, automatic Zeromux expansion, and near-term FILE window
+performance tuning.
+
+## Development Verification
+
+Canonical local verification:
+
+```sh
+sh -n start-host.sh
+sh -n lmux-start-target.sh
+sh -n scripts/gen-version.sh
+git diff --check
+make clean
+make host
+make selftest
+make target
+make strip-target
+```
+
+For README-only changes, `git diff --check` is normally sufficient.
+
+## Documents
+
+- [docs/lmux2-wire.md](docs/lmux2-wire.md): LMUX/2 wire protocol.
+- [docs/outer1-wire.md](docs/outer1-wire.md): OUTER/1 physical wire protocol
+  and BOOT framing.
+- [docs/zeromux.md](docs/zeromux.md): experimental bootstrap/install subsystem.

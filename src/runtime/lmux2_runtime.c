@@ -1211,6 +1211,21 @@ static void handle_outer_events(struct v2_app *a, unsigned events)
         outer_session_down(a);
         return;
     }
+    if (events & LMUX_LINK_EV_PEER_HELLO)
+        log_msg(a, 1, "outer peer HELLO received peer_conn=%llu",
+                (unsigned long long)a->outer.peer_conn_id);
+    if (events & LMUX_LINK_EV_HELLO_ACK_QUEUED)
+        log_msg(a, 1, "outer HELLO_ACK queued local_conn=%llu ack_peer=%llu",
+                (unsigned long long)a->outer.local_conn_id,
+                (unsigned long long)a->outer.pending_ack_peer_conn_id);
+    if (events & LMUX_LINK_EV_HELLO_ACK_COMMITTED)
+        log_msg(a, 1, "outer HELLO_ACK committed local_conn=%llu peer_conn=%llu",
+                (unsigned long long)a->outer.local_conn_id,
+                (unsigned long long)a->outer.peer_conn_id);
+    if (events & LMUX_LINK_EV_PEER_HELLO_ACK)
+        log_msg(a, 1, "outer peer HELLO_ACK received peer_conn=%llu ack_local=%llu",
+                (unsigned long long)a->outer.peer_conn_id,
+                (unsigned long long)a->outer.local_conn_id);
     if (events & LMUX_LINK_EV_ESTABLISHED) {
         log_msg(a, 1, "outer established local_conn=%llu peer_conn=%llu",
                 (unsigned long long)a->outer.local_conn_id,
@@ -1294,7 +1309,9 @@ static void flush_outer_carrier(struct v2_app *a)
                                 lmux_link_output_ptr(&a->outer),
                                 lmux_link_output_len(&a->outer));
         if (io.status == LMUX_CARRIER_IO_PROGRESS) {
-            lmux_link_output_consume(&a->outer, (size_t)io.n);
+            unsigned events = 0;
+            lmux_link_output_consume_events(&a->outer, (size_t)io.n, &events);
+            handle_outer_events(a, events);
             continue;
         }
         if (io.status == LMUX_CARRIER_IO_WOULD_BLOCK)
@@ -1376,6 +1393,8 @@ static void run_loop(struct v2_app *a)
         struct pollfd pfds[64];
         int kind[64], svc[64], bind[64];
         nfds_t n = 0, i;
+        long long now = now_ms();
+        int timeout = 1000;
         if (!a->worker_mode)
             try_open_carrier(a);
         if (a->role == LMUX2_ROLE_HOST)
@@ -1388,6 +1407,19 @@ static void run_loop(struct v2_app *a)
             v2_host_control_tick(a, &a->host, &st);
         }
         (void)step_file_services(a);
+        if (a->outer_enabled && a->outer.state == LMUX_LINK_WAIT_HELLO) {
+            int tick = lmux_link_endpoint_tick(&a->outer, now);
+            if (tick < 0)
+                outer_session_down(a);
+            else if (tick > 0 &&
+                     (a->outer.hello_retry_count <= 3 ||
+                      (a->outer.hello_retry_count &
+                       (a->outer.hello_retry_count - 1)) == 0))
+                log_msg(a, 1, "outer HELLO retry queued local_conn=%llu",
+                        (unsigned long long)a->outer.local_conn_id);
+            if (timeout > 250)
+                timeout = 250;
+        }
         if ((!a->worker_mode || a->worker_link_active || a->worker_link_up_flush) &&
             (!a->outer_enabled || a->outer.state == LMUX_LINK_ESTABLISHED))
             build_next_output(a);
@@ -1478,7 +1510,7 @@ static void run_loop(struct v2_app *a)
                 add_poll(pfds, kind, svc, bind, &n, ts->pty_master_fd, ev, 5, (int)i, -1);
             }
         }
-        if (poll(pfds, n, 1000) < 0) {
+        if (poll(pfds, n, timeout) < 0) {
             if (errno == EINTR)
                 continue;
             break;

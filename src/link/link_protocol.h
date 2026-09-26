@@ -22,7 +22,8 @@ enum lmux_link_type {
     LMUX_LINK_T_TRANSPORT = 2,
     LMUX_LINK_T_BOOT_REQUEST = 3,
     LMUX_LINK_T_BOOT_RESPONSE = 4,
-    LMUX_LINK_T_BOOT_EVENT = 5
+    LMUX_LINK_T_BOOT_EVENT = 5,
+    LMUX_LINK_T_HELLO_ACK = 6
 };
 
 enum lmux_link_flag {
@@ -73,5 +74,11 @@ int lmux_link_make_hello_payload(const struct lmux_link_hello *h,
                                  uint32_t *out_len);
 int lmux_link_parse_hello_payload(const uint8_t *payload, uint32_t payload_len,
                                   struct lmux_link_hello *h);
+int lmux_link_make_hello_ack_payload(uint64_t ack_peer_conn_id,
+                                     uint8_t *out, size_t out_cap,
+                                     uint32_t *out_len);
+int lmux_link_parse_hello_ack_payload(const uint8_t *payload,
+                                      uint32_t payload_len,
+                                      uint64_t *ack_peer_conn_id);
 
 #endif

@@ -1166,9 +1166,22 @@ static void handle_outer_events(struct supervisor *s, unsigned events)
         outer_session_down(s);
         return;
     }
-    if (events & LMUX_LINK_EV_ESTABLISHED) {
-        sup_log(s, 1, "outer peer HELLO accepted peer_conn=%llu",
+    if (events & LMUX_LINK_EV_PEER_HELLO)
+        sup_log(s, 1, "outer peer HELLO received peer_conn=%llu",
                 (unsigned long long)s->outer.peer_conn_id);
+    if (events & LMUX_LINK_EV_HELLO_ACK_QUEUED)
+        sup_log(s, 1, "outer HELLO_ACK queued local_conn=%llu ack_peer=%llu",
+                (unsigned long long)s->outer.local_conn_id,
+                (unsigned long long)s->outer.pending_ack_peer_conn_id);
+    if (events & LMUX_LINK_EV_HELLO_ACK_COMMITTED)
+        sup_log(s, 1, "outer HELLO_ACK committed local_conn=%llu peer_conn=%llu",
+                (unsigned long long)s->outer.local_conn_id,
+                (unsigned long long)s->outer.peer_conn_id);
+    if (events & LMUX_LINK_EV_PEER_HELLO_ACK)
+        sup_log(s, 1, "outer peer HELLO_ACK received peer_conn=%llu ack_local=%llu",
+                (unsigned long long)s->outer.peer_conn_id,
+                (unsigned long long)s->outer.local_conn_id);
+    if (events & LMUX_LINK_EV_ESTABLISHED) {
         sup_log(s, 1, "outer established local_conn=%llu peer_conn=%llu",
                 (unsigned long long)s->outer.local_conn_id,
                 (unsigned long long)s->outer.peer_conn_id);
@@ -1717,7 +1730,9 @@ static void flush_outer_physical(struct supervisor *s)
         io = lmux_carrier_write(&s->carrier, lmux_link_output_ptr(&s->outer),
                                 lmux_link_output_len(&s->outer));
         if (io.status == LMUX_CARRIER_IO_PROGRESS) {
-            lmux_link_output_consume(&s->outer, (size_t)io.n);
+            unsigned events = 0;
+            lmux_link_output_consume_events(&s->outer, (size_t)io.n, &events);
+            handle_outer_events(s, events);
             if (s->state == SUP_UP_FLUSH) {
                 sup_log(s, 1, "outer physical write result=%ld remaining=%zu",
                         (long)io.n, lmux_link_output_len(&s->outer));
@@ -1819,6 +1834,19 @@ static int supervisor_loop(struct supervisor *s)
         maybe_send_link_up(s);
         if (s->outer_enabled)
             maybe_finish_supervisor_restart(s);
+        if (s->outer_enabled && s->outer.state == LMUX_LINK_WAIT_HELLO) {
+            int tick = lmux_link_endpoint_tick(&s->outer, now);
+            if (tick < 0)
+                outer_session_down(s);
+            else if (tick > 0 &&
+                     (s->outer.hello_retry_count <= 3 ||
+                      (s->outer.hello_retry_count &
+                       (s->outer.hello_retry_count - 1)) == 0))
+                sup_log(s, 1, "outer HELLO retry queued local_conn=%llu",
+                        (unsigned long long)s->outer.local_conn_id);
+            if (timeout > 250)
+                timeout = 250;
+        }
 
         if (s->state == SUP_WORKER_DOWN && s->restart_deadline_ms > now) {
             long long d = s->restart_deadline_ms - now;

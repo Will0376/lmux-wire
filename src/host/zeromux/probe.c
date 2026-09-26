@@ -6,7 +6,7 @@
 static const char *tool_names[LMUX_ZMX_TOOL_COUNT] = {
     "rz", "rx", "rb", "sz", "sx", "sb", "dd", "stty", "base64",
     "uudecode", "uuencode", "xxd", "printf", "cat", "chmod", "mv",
-    "cp", "rm", "sync", "sha256sum"
+    "cp", "rm", "sync", "sha256sum", "mkdir", "kill"
 };
 
 const char *lmux_zmx_tri_name(enum lmux_zmx_tri v)

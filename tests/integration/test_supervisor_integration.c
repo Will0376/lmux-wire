@@ -382,6 +382,32 @@ static int wait_fault_injected(int fd, int timeout_ms)
     return -1;
 }
 
+static int discard_one_cobs_record(int fd, int timeout_ms)
+{
+    long long end = now_ms() + timeout_ms;
+    unsigned char ch;
+    size_t n = 0;
+    while (now_ms() < end) {
+        int rem = (int)(end - now_ms());
+        int re = wait_fd_event(fd, POLLIN | POLLHUP | POLLERR | POLLNVAL, rem);
+        if (re & POLLIN) {
+            ssize_t r = read(fd, &ch, 1);
+            if (r == 1) {
+                n++;
+                if (ch == 0)
+                    return n > 1 ? 0 : -1;
+                continue;
+            }
+            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+                continue;
+            return -1;
+        }
+        if (re & (POLLHUP | POLLERR | POLLNVAL))
+            return -1;
+    }
+    return -1;
+}
+
 static long parse_pid_marker(const char *buf, const char *prefix)
 {
     const char *p = strstr(buf, prefix);
@@ -1186,6 +1212,344 @@ static pid_t spawn_fault_proxy(const char *path, int stable_fd,
                         test_ring_clear(&to_client);
                     }
                 }
+            }
+        }
+    }
+    return pid;
+}
+
+static int first_hello_truncate_feed(int *injected, uint8_t *rec,
+                                     size_t *rec_len,
+                                     const uint8_t *in, size_t in_len,
+                                     struct test_ring *dst, int notify_fd)
+{
+    size_t i;
+    for (i = 0; i < in_len; i++) {
+        uint8_t ch = in[i];
+        if (*injected) {
+            if (test_ring_write(dst, &ch, 1) != 1)
+                return -1;
+            continue;
+        }
+        if (ch == 0) {
+            size_t keep = *rec_len / 2;
+            if (keep == 0 && *rec_len > 0)
+                keep = 1;
+            if (test_ring_write(dst, rec, keep) != keep)
+                return -1;
+            *rec_len = 0;
+            *injected = 1;
+            if (notify_fd >= 0)
+                (void)write(notify_fd, "I", 1);
+            continue;
+        }
+        if (*rec_len >= LMUX_LINK_MAX_ENCODED)
+            return -1;
+        rec[(*rec_len)++] = ch;
+    }
+    return 0;
+}
+
+static pid_t spawn_truncate_first_hello_proxy(int host_fd, int target_fd,
+                                              int notify_fd)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        struct test_ring to_host = {{0}, 0, 0, 0};
+        struct test_ring to_target = {{0}, 0, 0, 0};
+        uint8_t rec[LMUX_LINK_MAX_ENCODED];
+        size_t rec_len = 0;
+        int injected = 0;
+        signal(SIGPIPE, SIG_IGN);
+        (void)test_set_nonblock(host_fd);
+        (void)test_set_nonblock(target_fd);
+        for (;;) {
+            struct pollfd pfds[2];
+            nfds_t i;
+            pfds[0].fd = host_fd;
+            pfds[0].events = 0;
+            if (test_ring_space(&to_target) > LMUX_LINK_MAX_ENCODED)
+                pfds[0].events |= POLLIN;
+            if (to_host.len > 0)
+                pfds[0].events |= POLLOUT;
+            pfds[0].revents = 0;
+            pfds[1].fd = target_fd;
+            pfds[1].events = 0;
+            if (test_ring_space(&to_host) > LMUX_LINK_MAX_ENCODED)
+                pfds[1].events |= POLLIN;
+            if (to_target.len > 0)
+                pfds[1].events |= POLLOUT;
+            pfds[1].revents = 0;
+            if (poll(pfds, 2, 1000) < 0) {
+                if (errno == EINTR)
+                    continue;
+                _exit(127);
+            }
+            for (i = 0; i < 2; i++) {
+                int fd = pfds[i].fd;
+                struct test_ring *out = i == 0 ? &to_target : &to_host;
+                if (pfds[i].revents & POLLIN) {
+                    uint8_t tmp[512];
+                    ssize_t r = read(fd, tmp, sizeof(tmp));
+                    if (r > 0) {
+                        if (i == 1) {
+                            if (first_hello_truncate_feed(&injected, rec, &rec_len,
+                                                          tmp, (size_t)r, out,
+                                                          notify_fd) < 0)
+                                _exit(127);
+                        } else if (test_ring_write(out, tmp, (size_t)r) != (size_t)r) {
+                            _exit(127);
+                        }
+                    } else if (r == 0 || (r < 0 && errno != EAGAIN &&
+                                          errno != EWOULDBLOCK && errno != EINTR)) {
+                        _exit(0);
+                    }
+                }
+                if (pfds[i].revents & POLLOUT) {
+                    struct test_ring *src = i == 0 ? &to_host : &to_target;
+                    const unsigned char *p;
+                    size_t chunk = test_ring_peek(src, &p);
+                    ssize_t w = write(fd, p, chunk);
+                    if (w > 0)
+                        test_ring_consume(src, (size_t)w);
+                    else if (w < 0 && errno != EAGAIN &&
+                             errno != EWOULDBLOCK && errno != EINTR)
+                        _exit(0);
+                }
+                if (pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL))
+                    _exit(0);
+            }
+        }
+    }
+    return pid;
+}
+
+static int drop_first_ack_feed(int *dropped, uint8_t *rec, size_t *rec_len,
+                               const uint8_t *in, size_t in_len,
+                               struct test_ring *dst, int notify_fd)
+{
+    size_t i;
+    for (i = 0; i < in_len; i++) {
+        uint8_t ch = in[i];
+        if (ch == 0) {
+            struct lmux_link_frame fr;
+            if (!*dropped && *rec_len > 0 &&
+                lmux_link_decode_frame(rec, *rec_len, &fr) == 0) {
+                if (fr.type == LMUX_LINK_T_HELLO_ACK) {
+                    *dropped = 1;
+                    *rec_len = 0;
+                    if (notify_fd >= 0)
+                        (void)write(notify_fd, "I", 1);
+                    continue;
+                }
+            }
+            if (*rec_len > 0 && test_ring_write(dst, rec, *rec_len) != *rec_len)
+                return -1;
+            if (test_ring_write(dst, &ch, 1) != 1)
+                return -1;
+            *rec_len = 0;
+            continue;
+        }
+        if (*rec_len >= LMUX_LINK_MAX_ENCODED)
+            return -1;
+        rec[(*rec_len)++] = ch;
+    }
+    return 0;
+}
+
+static pid_t spawn_drop_first_ack_proxy(int host_fd, int target_fd,
+                                        int notify_fd)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        struct test_ring to_host = {{0}, 0, 0, 0};
+        struct test_ring to_target = {{0}, 0, 0, 0};
+        uint8_t h2t_rec[LMUX_LINK_MAX_ENCODED];
+        uint8_t t2h_rec[LMUX_LINK_MAX_ENCODED];
+        size_t h2t_rec_len = 0, t2h_rec_len = 0;
+        int dropped = 0;
+        signal(SIGPIPE, SIG_IGN);
+        (void)test_set_nonblock(host_fd);
+        (void)test_set_nonblock(target_fd);
+        for (;;) {
+            struct pollfd pfds[2];
+            nfds_t i;
+            pfds[0].fd = host_fd;
+            pfds[0].events = 0;
+            if (test_ring_space(&to_target) > LMUX_LINK_MAX_ENCODED)
+                pfds[0].events |= POLLIN;
+            if (to_host.len > 0)
+                pfds[0].events |= POLLOUT;
+            pfds[0].revents = 0;
+            pfds[1].fd = target_fd;
+            pfds[1].events = 0;
+            if (test_ring_space(&to_host) > LMUX_LINK_MAX_ENCODED)
+                pfds[1].events |= POLLIN;
+            if (to_target.len > 0)
+                pfds[1].events |= POLLOUT;
+            pfds[1].revents = 0;
+            if (poll(pfds, 2, 1000) < 0) {
+                if (errno == EINTR)
+                    continue;
+                _exit(127);
+            }
+            for (i = 0; i < 2; i++) {
+                int fd = pfds[i].fd;
+                struct test_ring *out = i == 0 ? &to_target : &to_host;
+                if (pfds[i].revents & POLLIN) {
+                    uint8_t tmp[512];
+                    ssize_t r = read(fd, tmp, sizeof(tmp));
+                    if (r > 0) {
+                        if (i == 0) {
+                            if (drop_first_ack_feed(&dropped, h2t_rec,
+                                                    &h2t_rec_len,
+                                                    tmp, (size_t)r, out,
+                                                    notify_fd) < 0)
+                                _exit(127);
+                        } else {
+                            if (drop_first_ack_feed(&dropped, t2h_rec,
+                                                    &t2h_rec_len,
+                                                    tmp, (size_t)r, out,
+                                                    notify_fd) < 0)
+                                _exit(127);
+                        }
+                    } else if (r == 0 || (r < 0 && errno != EAGAIN &&
+                                          errno != EWOULDBLOCK && errno != EINTR)) {
+                        _exit(0);
+                    }
+                }
+                if (pfds[i].revents & POLLOUT) {
+                    struct test_ring *src = i == 0 ? &to_host : &to_target;
+                    const unsigned char *p;
+                    size_t chunk = test_ring_peek(src, &p);
+                    ssize_t w = write(fd, p, chunk);
+                    if (w > 0)
+                        test_ring_consume(src, (size_t)w);
+                    else if (w < 0 && errno != EAGAIN &&
+                             errno != EWOULDBLOCK && errno != EINTR)
+                        _exit(0);
+                }
+                if (pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL))
+                    _exit(0);
+            }
+        }
+    }
+    return pid;
+}
+
+static int duplicate_first_hello_feed(int *duplicated, uint8_t *rec,
+                                      size_t *rec_len,
+                                      const uint8_t *in, size_t in_len,
+                                      struct test_ring *dst, int notify_fd)
+{
+    size_t i;
+    for (i = 0; i < in_len; i++) {
+        uint8_t ch = in[i];
+        if (*duplicated) {
+            if (test_ring_write(dst, &ch, 1) != 1)
+                return -1;
+            continue;
+        }
+        if (ch == 0) {
+            struct lmux_link_frame fr;
+            if (*rec_len > 0 &&
+                lmux_link_decode_frame(rec, *rec_len, &fr) == 0 &&
+                fr.type == LMUX_LINK_T_HELLO) {
+                int n;
+                for (n = 0; n < 8; n++) {
+                    if (test_ring_write(dst, rec, *rec_len) != *rec_len ||
+                        test_ring_write(dst, &ch, 1) != 1)
+                        return -1;
+                }
+                *duplicated = 1;
+                *rec_len = 0;
+                if (notify_fd >= 0)
+                    (void)write(notify_fd, "I", 1);
+                continue;
+            }
+            if (*rec_len > 0 && test_ring_write(dst, rec, *rec_len) != *rec_len)
+                return -1;
+            if (test_ring_write(dst, &ch, 1) != 1)
+                return -1;
+            *rec_len = 0;
+            continue;
+        }
+        if (*rec_len >= LMUX_LINK_MAX_ENCODED)
+            return -1;
+        rec[(*rec_len)++] = ch;
+    }
+    return 0;
+}
+
+static pid_t spawn_duplicate_first_target_hello_proxy(int host_fd, int target_fd,
+                                                      int notify_fd)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        struct test_ring to_host = {{0}, 0, 0, 0};
+        struct test_ring to_target = {{0}, 0, 0, 0};
+        uint8_t rec[LMUX_LINK_MAX_ENCODED];
+        size_t rec_len = 0;
+        int duplicated = 0;
+        signal(SIGPIPE, SIG_IGN);
+        (void)test_set_nonblock(host_fd);
+        (void)test_set_nonblock(target_fd);
+        for (;;) {
+            struct pollfd pfds[2];
+            nfds_t i;
+            pfds[0].fd = host_fd;
+            pfds[0].events = 0;
+            if (test_ring_space(&to_target) > LMUX_LINK_MAX_ENCODED)
+                pfds[0].events |= POLLIN;
+            if (to_host.len > 0)
+                pfds[0].events |= POLLOUT;
+            pfds[0].revents = 0;
+            pfds[1].fd = target_fd;
+            pfds[1].events = 0;
+            if (test_ring_space(&to_host) > 1024)
+                pfds[1].events |= POLLIN;
+            if (to_target.len > 0)
+                pfds[1].events |= POLLOUT;
+            pfds[1].revents = 0;
+            if (poll(pfds, 2, 1000) < 0) {
+                if (errno == EINTR)
+                    continue;
+                _exit(127);
+            }
+            for (i = 0; i < 2; i++) {
+                int fd = pfds[i].fd;
+                struct test_ring *out = i == 0 ? &to_target : &to_host;
+                if (pfds[i].revents & POLLIN) {
+                    uint8_t tmp[512];
+                    ssize_t r = read(fd, tmp, sizeof(tmp));
+                    if (r > 0) {
+                        if (i == 1) {
+                            if (duplicate_first_hello_feed(&duplicated, rec,
+                                                           &rec_len, tmp,
+                                                           (size_t)r, out,
+                                                           notify_fd) < 0)
+                                _exit(127);
+                        } else if (test_ring_write(out, tmp, (size_t)r) != (size_t)r) {
+                            _exit(127);
+                        }
+                    } else if (r == 0 || (r < 0 && errno != EAGAIN &&
+                                          errno != EWOULDBLOCK && errno != EINTR)) {
+                        _exit(0);
+                    }
+                }
+                if (pfds[i].revents & POLLOUT) {
+                    struct test_ring *src = i == 0 ? &to_host : &to_target;
+                    const unsigned char *p;
+                    size_t chunk = test_ring_peek(src, &p);
+                    ssize_t w = write(fd, p, chunk);
+                    if (w > 0)
+                        test_ring_consume(src, (size_t)w);
+                    else if (w < 0 && errno != EAGAIN &&
+                             errno != EWOULDBLOCK && errno != EINTR)
+                        _exit(0);
+                }
+                if (pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL))
+                    _exit(0);
             }
         }
     }
@@ -3391,6 +3755,345 @@ out:
     return rc;
 }
 
+static int outer_first_contact_lost_hello_test(int target_first)
+{
+    char dir[] = "/tmp/lmux-supervisor-first-contact-XXXXXX";
+    char control[160], console[160], file_sock[160], pty_arg[320], file_arg[320];
+    int stable[2] = {-1, -1};
+    pid_t sup = -1, host = -1;
+    int cfd = -1, rc = 1;
+    char out[8192];
+    const char *where = "setup";
+
+    if (!mkdtemp(dir))
+        return fail("mkdtemp first contact");
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(console, sizeof(console), "%s/console1.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, stable) < 0)
+        goto out;
+
+    if (target_first) {
+        where = "spawn target";
+        sup = spawn_supervisor_fd(stable[1], 1);
+        close(stable[1]);
+        stable[1] = -1;
+        if (sup < 0)
+            goto out;
+        where = "discard target initial hello";
+        if (discard_one_cobs_record(stable[0], 5000) < 0)
+            goto out;
+        where = "spawn host";
+        host = spawn_host_fd(stable[0], control, pty_arg, file_arg, 1);
+        close(stable[0]);
+        stable[0] = -1;
+        if (host < 0)
+            goto out;
+    } else {
+        where = "spawn host";
+        host = spawn_host_fd(stable[0], control, pty_arg, file_arg, 1);
+        close(stable[0]);
+        stable[0] = -1;
+        if (host < 0)
+            goto out;
+        where = "discard host initial hello";
+        if (discard_one_cobs_record(stable[1], 5000) < 0)
+            goto out;
+        where = "spawn target";
+        sup = spawn_supervisor_fd(stable[1], 1);
+        close(stable[1]);
+        stable[1] = -1;
+        if (sup < 0)
+            goto out;
+    }
+
+    where = "ready after lost first hello";
+    if (wait_path_exists(control, 5000) < 0 ||
+        wait_ready_layers(control, 1, 20000, out, sizeof(out)) < 0) {
+        dump_excerpt("first contact status", out);
+        goto out;
+    }
+    where = "boot after lost first hello";
+    if (!boot_info_ok(control, out, sizeof(out))) {
+        dump_excerpt("first contact boot", out);
+        goto out;
+    }
+    where = "console after lost first hello";
+    cfd = wait_connect(console, 10000);
+    if (cfd < 0 ||
+        shell_cmd_expect(cfd, "printf '%s%s\\n' FIRST CONTACT",
+                         "FIRSTCONTACT", out, sizeof(out)) < 0)
+        goto out;
+    rc = 0;
+out:
+    if (rc != 0)
+        fprintf(stderr, "outer_first_contact_lost_hello target_first=%d where=%s\n",
+                target_first, where);
+    if (cfd >= 0)
+        close(cfd);
+    stop_pid(host);
+    stop_pid(sup);
+    if (stable[0] >= 0) close(stable[0]);
+    if (stable[1] >= 0) close(stable[1]);
+    unlink(console);
+    unlink(file_sock);
+    unlink(control);
+    rmdir(dir);
+    return rc;
+}
+
+static int outer_first_contact_truncated_hello_test(void)
+{
+    char dir[] = "/tmp/lmux-supervisor-first-trunc-XXXXXX";
+    char control[160], console[160], file_sock[160], pty_arg[320], file_arg[320];
+    int host_pair[2] = {-1, -1};
+    int target_pair[2] = {-1, -1};
+    int note[2] = {-1, -1};
+    pid_t proxy = -1, sup = -1, host = -1;
+    int cfd = -1, rc = 1;
+    char out[8192];
+    const char *where = "setup";
+
+    if (!mkdtemp(dir))
+        return fail("mkdtemp first trunc");
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(console, sizeof(console), "%s/console1.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, host_pair) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, target_pair) < 0 ||
+        pipe(note) < 0)
+        goto out;
+    proxy = spawn_truncate_first_hello_proxy(host_pair[0], target_pair[0], note[1]);
+    close(host_pair[0]); host_pair[0] = -1;
+    close(target_pair[0]); target_pair[0] = -1;
+    close(note[1]); note[1] = -1;
+    if (proxy < 0)
+        goto out;
+
+    where = "spawn target";
+    sup = spawn_supervisor_fd(target_pair[1], 1);
+    close(target_pair[1]); target_pair[1] = -1;
+    if (sup < 0)
+        goto out;
+    where = "truncated target hello";
+    if (wait_fault_injected(note[0], 5000) < 0)
+        goto out;
+    where = "spawn host";
+    host = spawn_host_fd(host_pair[1], control, pty_arg, file_arg, 1);
+    close(host_pair[1]); host_pair[1] = -1;
+    if (host < 0)
+        goto out;
+
+    where = "ready after truncated hello";
+    if (wait_path_exists(control, 5000) < 0 ||
+        wait_ready_layers(control, 1, 25000, out, sizeof(out)) < 0) {
+        dump_excerpt("first trunc status", out);
+        goto out;
+    }
+    where = "boot after truncated hello";
+    if (!boot_info_ok(control, out, sizeof(out))) {
+        dump_excerpt("first trunc boot", out);
+        goto out;
+    }
+    where = "console after truncated hello";
+    cfd = wait_connect(console, 10000);
+    if (cfd < 0 ||
+        shell_cmd_expect(cfd, "printf '%s%s\\n' FIRST TRUNC",
+                         "FIRSTTRUNC", out, sizeof(out)) < 0)
+        goto out;
+    rc = 0;
+out:
+    if (rc != 0)
+        fprintf(stderr, "outer_first_contact_truncated_hello where=%s\n", where);
+    if (cfd >= 0)
+        close(cfd);
+    stop_pid(host);
+    stop_pid(sup);
+    stop_pid(proxy);
+    if (host_pair[0] >= 0) close(host_pair[0]);
+    if (host_pair[1] >= 0) close(host_pair[1]);
+    if (target_pair[0] >= 0) close(target_pair[0]);
+    if (target_pair[1] >= 0) close(target_pair[1]);
+    if (note[0] >= 0) close(note[0]);
+    if (note[1] >= 0) close(note[1]);
+    unlink(console);
+    unlink(file_sock);
+    unlink(control);
+    rmdir(dir);
+    return rc;
+}
+
+static int outer_first_contact_lost_ack_test(void)
+{
+    char dir[] = "/tmp/lmux-supervisor-first-ack-XXXXXX";
+    char control[160], console[160], file_sock[160], pty_arg[320], file_arg[320];
+    int host_pair[2] = {-1, -1};
+    int target_pair[2] = {-1, -1};
+    int note[2] = {-1, -1};
+    pid_t proxy = -1, sup = -1, host = -1;
+    int cfd = -1, rc = 1;
+    char out[8192];
+    const char *where = "setup";
+
+    if (!mkdtemp(dir))
+        return fail("mkdtemp first ack");
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(console, sizeof(console), "%s/console1.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, host_pair) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, target_pair) < 0 ||
+        pipe(note) < 0)
+        goto out;
+    proxy = spawn_drop_first_ack_proxy(host_pair[0], target_pair[0], note[1]);
+    close(host_pair[0]); host_pair[0] = -1;
+    close(target_pair[0]); target_pair[0] = -1;
+    close(note[1]); note[1] = -1;
+    if (proxy < 0)
+        goto out;
+
+    where = "spawn target";
+    sup = spawn_supervisor_fd(target_pair[1], 1);
+    close(target_pair[1]); target_pair[1] = -1;
+    if (sup < 0)
+        goto out;
+    where = "spawn host";
+    host = spawn_host_fd(host_pair[1], control, pty_arg, file_arg, 1);
+    close(host_pair[1]); host_pair[1] = -1;
+    if (host < 0)
+        goto out;
+    where = "dropped hello ack";
+    if (wait_fault_injected(note[0], 5000) < 0)
+        goto out;
+
+    where = "ready after lost hello ack";
+    if (wait_path_exists(control, 5000) < 0 ||
+        wait_ready_layers(control, 1, 25000, out, sizeof(out)) < 0) {
+        dump_excerpt("first ack status", out);
+        goto out;
+    }
+    where = "boot after lost hello ack";
+    if (!boot_info_ok(control, out, sizeof(out))) {
+        dump_excerpt("first ack boot", out);
+        goto out;
+    }
+    where = "console after lost hello ack";
+    cfd = wait_connect(console, 10000);
+    if (cfd < 0 ||
+        shell_cmd_expect(cfd, "printf '%s%s\\n' FIRST ACK",
+                         "FIRSTACK", out, sizeof(out)) < 0)
+        goto out;
+    rc = 0;
+out:
+    if (rc != 0)
+        fprintf(stderr, "outer_first_contact_lost_ack where=%s\n", where);
+    if (cfd >= 0)
+        close(cfd);
+    stop_pid(host);
+    stop_pid(sup);
+    stop_pid(proxy);
+    if (host_pair[0] >= 0) close(host_pair[0]);
+    if (host_pair[1] >= 0) close(host_pair[1]);
+    if (target_pair[0] >= 0) close(target_pair[0]);
+    if (target_pair[1] >= 0) close(target_pair[1]);
+    if (note[0] >= 0) close(note[0]);
+    if (note[1] >= 0) close(note[1]);
+    unlink(console);
+    unlink(file_sock);
+    unlink(control);
+    rmdir(dir);
+    return rc;
+}
+
+static int outer_duplicate_hello_burst_test(void)
+{
+    char dir[] = "/tmp/lmux-supervisor-hello-burst-XXXXXX";
+    char control[160], console[160], file_sock[160], pty_arg[320], file_arg[320];
+    int host_pair[2] = {-1, -1};
+    int target_pair[2] = {-1, -1};
+    int note[2] = {-1, -1};
+    pid_t proxy = -1, sup = -1, host = -1;
+    int cfd = -1, rc = 1;
+    char out[8192];
+    const char *where = "setup";
+
+    if (!mkdtemp(dir))
+        return fail("mkdtemp hello burst");
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(console, sizeof(console), "%s/console1.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, host_pair) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, target_pair) < 0 ||
+        pipe(note) < 0)
+        goto out;
+    proxy = spawn_duplicate_first_target_hello_proxy(host_pair[0],
+                                                     target_pair[0], note[1]);
+    close(host_pair[0]); host_pair[0] = -1;
+    close(target_pair[0]); target_pair[0] = -1;
+    close(note[1]); note[1] = -1;
+    if (proxy < 0)
+        goto out;
+
+    where = "spawn target";
+    sup = spawn_supervisor_fd(target_pair[1], 1);
+    close(target_pair[1]); target_pair[1] = -1;
+    if (sup < 0)
+        goto out;
+    where = "spawn host";
+    host = spawn_host_fd(host_pair[1], control, pty_arg, file_arg, 1);
+    close(host_pair[1]); host_pair[1] = -1;
+    if (host < 0)
+        goto out;
+    where = "duplicated target hello";
+    if (wait_fault_injected(note[0], 5000) < 0)
+        goto out;
+
+    where = "ready after duplicate hello burst";
+    if (wait_path_exists(control, 5000) < 0 ||
+        wait_ready_layers(control, 1, 25000, out, sizeof(out)) < 0) {
+        dump_excerpt("hello burst status", out);
+        goto out;
+    }
+    where = "boot after duplicate hello burst";
+    if (!boot_info_ok(control, out, sizeof(out))) {
+        dump_excerpt("hello burst boot", out);
+        goto out;
+    }
+    where = "console after duplicate hello burst";
+    cfd = wait_connect(console, 10000);
+    if (cfd < 0 ||
+        shell_cmd_expect(cfd, "printf '%s%s\\n' HELLO BURST",
+                         "HELLOBURST", out, sizeof(out)) < 0)
+        goto out;
+    rc = 0;
+out:
+    if (rc != 0)
+        fprintf(stderr, "outer_duplicate_hello_burst where=%s\n", where);
+    if (cfd >= 0)
+        close(cfd);
+    stop_pid(host);
+    stop_pid(sup);
+    stop_pid(proxy);
+    if (host_pair[0] >= 0) close(host_pair[0]);
+    if (host_pair[1] >= 0) close(host_pair[1]);
+    if (target_pair[0] >= 0) close(target_pair[0]);
+    if (target_pair[1] >= 0) close(target_pair[1]);
+    if (note[0] >= 0) close(note[0]);
+    if (note[1] >= 0) close(note[1]);
+    unlink(console);
+    unlink(file_sock);
+    unlink(control);
+    rmdir(dir);
+    return rc;
+}
+
 static int outer_fault_recovery_test(enum outer_fault_kind kind,
                                      enum outer_fault_dir dir)
 {
@@ -4002,7 +4705,12 @@ int main(void)
     if (pending_abandon_test(0) || pending_abandon_test(1))
         return 1;
     if (outer_host_restart_same_physical_test() ||
-        outer_supervisor_restart_same_host_physical_test())
+        outer_supervisor_restart_same_host_physical_test() ||
+        outer_first_contact_lost_hello_test(1) ||
+        outer_first_contact_lost_hello_test(0) ||
+        outer_first_contact_truncated_hello_test() ||
+        outer_first_contact_lost_ack_test() ||
+        outer_duplicate_hello_burst_test())
         return 1;
     if (host_first_startup_test() || integration_test())
         return 1;

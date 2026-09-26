@@ -2,6 +2,7 @@
 
 #include "probe.h"
 #include "sender.h"
+#include "install.h"
 #include "lxf.h"
 
 #include <errno.h>
@@ -230,13 +231,101 @@ out:
     return rc;
 }
 
+static int lmux_zeromux_install_main(int argc, char **argv)
+{
+    struct cli_opts opts;
+    const char *local;
+    const char *install_dir = NULL;
+    const char *lmux_carrier = NULL;
+    struct lmux_zmx_session session;
+    struct lmux_zmx_probe_result probe;
+    struct lmux_zmx_install_result res;
+    char hex[65];
+    int rc = 1;
+
+    if (argc < 1)
+        return fprintf(stderr, "Usage: lmux zeromux install FILE --tty DEVICE --install-dir TARGET_DIR --lmux-carrier TARGET_CARRIER [serial options]\n"), 1;
+    local = argv[0];
+    argv++;
+    argc--;
+    memset(&opts, 0, sizeof(opts));
+    lmux_serial_config_default(&opts.serial);
+    opts.timeout_ms = 10000;
+    while (argc > 0) {
+        int p = parse_serial_opts(&argc, &argv, &opts);
+        if (p < 0)
+            return 1;
+        if (p > 0)
+            continue;
+        if (strcmp(argv[0], "--install-dir") == 0 && argc >= 2) {
+            install_dir = argv[1];
+            argv += 2;
+            argc -= 2;
+        } else if (strcmp(argv[0], "--lmux-carrier") == 0 && argc >= 2) {
+            lmux_carrier = argv[1];
+            argv += 2;
+            argc -= 2;
+        } else {
+            return fprintf(stderr, "invalid zeromux install option: %s\n", argv[0]), 1;
+        }
+    }
+    if (!opts.tty)
+        return fprintf(stderr, "lmux zeromux install: --tty is required\n"), 1;
+    if (!install_dir)
+        return fprintf(stderr, "lmux zeromux install: --install-dir is required\n"), 1;
+    if (!lmux_carrier)
+        return fprintf(stderr, "lmux zeromux install: --lmux-carrier is required\n"), 1;
+
+    if (lmux_zmx_session_open_tty(&session, opts.tty, &opts.serial,
+                                  opts.timeout_ms) < 0) {
+        fprintf(stderr, "%s: %s\n", opts.tty, strerror(errno));
+        return 1;
+    }
+    if (lmux_zmx_probe_run(&session, &probe) < 0) {
+        fprintf(stderr, "zeromux install: shell/probe failed: %s\n",
+                lmux_zmx_error_name(probe.status));
+        goto out;
+    }
+    if (lmux_zmx_install(&session, &probe, local, install_dir, lmux_carrier,
+                         &res) < 0) {
+        fprintf(stderr, "zeromux install failed: %s %s\n",
+                lmux_zmx_install_status_name(res.status),
+                res.detail[0] ? res.detail : "");
+        if (res.installed)
+            fprintf(stderr, "artifact installed; supervisor launch failed\n");
+        goto out;
+    }
+    sha256_hex(res.sha256, hex);
+    printf("zeromux install\n");
+    printf("bootstrap=%s %u %u%s%u\n", opts.tty, opts.serial.baud,
+           opts.serial.data_bits, parity_name(opts.serial.parity),
+           opts.serial.stop_bits);
+    printf("artifact sha256=%s\n", hex);
+    printf("artifact=%s\n", res.already_installed ? "already-installed" : "uploaded");
+    if (res.uploaded)
+        printf("sender=%s\nuploaded bytes=%llu\n",
+               res.sender_backend ? res.sender_backend : "unknown",
+               (unsigned long long)res.uploaded_bytes);
+    printf("installed=%s\n", res.final_path);
+    printf("lmux_carrier=%s\n", lmux_carrier);
+    printf("supervisor_pid=%lu\n", res.supervisor_pid);
+    printf("status=started\n");
+    rc = 0;
+out:
+    lmux_zmx_session_close(&session);
+    return rc;
+}
+
 int lmux_zeromux_main(int argc, char **argv)
 {
     if (argc >= 1 && strcmp(argv[0], "probe") == 0)
         return lmux_zeromux_probe_main(argc - 1, argv + 1);
     if (argc >= 1 && strcmp(argv[0], "send") == 0)
         return lmux_zeromux_send_main(argc - 1, argv + 1);
+    if (argc >= 1 && strcmp(argv[0], "install") == 0)
+        return lmux_zeromux_install_main(argc - 1, argv + 1);
     fprintf(stderr, "Usage: lmux zeromux probe --tty DEVICE [serial options]\n"
-                    "       lmux zeromux send LOCAL_FILE TARGET_TEMP --tty DEVICE [serial options]\n");
+                    "       lmux zeromux send LOCAL_FILE TARGET_TEMP --tty DEVICE [serial options]\n"
+                    "       lmux zeromux install FILE --tty DEVICE --install-dir TARGET_DIR --lmux-carrier TARGET_CARRIER [serial options]\n");
     return 1;
 }

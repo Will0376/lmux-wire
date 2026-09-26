@@ -180,6 +180,11 @@ int lmux_zmx_sender_uudecode_upload(struct lmux_zmx_session *s,
         snprintf(res->detail, sizeof(res->detail), "sha256sum unavailable");
         return -1;
     }
+    if (lmux_zmx_probe_tool_state(probe, "stty") != LMUX_ZMX_YES) {
+        res->status = LMUX_ZMX_SENDER_UNSUPPORTED;
+        snprintf(res->detail, sizeof(res->detail), "stty unavailable");
+        return -1;
+    }
     memset(&ctx, 0, sizeof(ctx));
     ctx.local_path = local_path;
     ctx.target_path = target_temp;

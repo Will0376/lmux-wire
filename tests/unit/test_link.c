@@ -263,6 +263,50 @@ static int feed_record(struct lmux_link_endpoint *ep, const uint8_t *enc,
     return lmux_link_input_bytes(ep, enc, len, events);
 }
 
+static int transfer_output(struct lmux_link_endpoint *from,
+                           struct lmux_link_endpoint *to,
+                           unsigned *from_events,
+                           unsigned *to_events)
+{
+    size_t len = lmux_link_output_len(from);
+    if (len == 0) {
+        (void)lmux_link_build_output(from);
+        len = lmux_link_output_len(from);
+    }
+    if (len == 0)
+        return -1;
+    if (feed_record(to, lmux_link_output_ptr(from), len, to_events) < 0)
+        return -1;
+    lmux_link_output_consume_events(from, len, from_events);
+    return 0;
+}
+
+static int establish_pair(struct lmux_link_endpoint *h,
+                          struct lmux_link_endpoint *s)
+{
+    unsigned hev = 0, sev = 0;
+    if (transfer_output(h, s, &hev, &sev) < 0 ||
+        (sev & LMUX_LINK_EV_ESTABLISHED))
+        return -1;
+    hev = sev = 0;
+    if (transfer_output(s, h, &sev, &hev) < 0 ||
+        (sev & LMUX_LINK_EV_ESTABLISHED) ||
+        (hev & LMUX_LINK_EV_ESTABLISHED))
+        return -1;
+    hev = sev = 0;
+    if (transfer_output(h, s, &hev, &sev) < 0 ||
+        (sev & LMUX_LINK_EV_ESTABLISHED) ||
+        (hev & LMUX_LINK_EV_ESTABLISHED))
+        return -1;
+    hev = sev = 0;
+    if (transfer_output(s, h, &sev, &hev) < 0 ||
+        !(hev & LMUX_LINK_EV_ESTABLISHED) ||
+        !(sev & LMUX_LINK_EV_ESTABLISHED))
+        return -1;
+    return h->state == LMUX_LINK_ESTABLISHED &&
+        s->state == LMUX_LINK_ESTABLISHED ? 0 : -1;
+}
+
 static int test_hello_and_transport(void)
 {
     struct lmux_link_endpoint h, s;
@@ -274,14 +318,30 @@ static int test_hello_and_transport(void)
     lmux_link_endpoint_begin(&h, 0x1111);
     lmux_link_endpoint_begin(&s, 0x2222);
     if (feed_record(&s, lmux_link_output_ptr(&h), lmux_link_output_len(&h), &ev) < 0 ||
-        (ev & LMUX_LINK_EV_ESTABLISHED) == 0)
-        return fail("supervisor establishes from host hello");
+        !(ev & LMUX_LINK_EV_PEER_HELLO) ||
+        !(ev & LMUX_LINK_EV_HELLO_ACK_QUEUED) ||
+        (ev & LMUX_LINK_EV_ESTABLISHED))
+        return fail("peer hello established too early");
+    if (lmux_link_transport_write(&s, (const uint8_t *)"x", 1) != 0 ||
+        lmux_link_boot_queue_frame(&s, LMUX_LINK_T_BOOT_REQUEST,
+                                   (const uint8_t *)"x", 1) == 0)
+        return fail("transport boot not gated before hello reply");
     lmux_link_output_consume(&h, lmux_link_output_len(&h));
     ev = 0;
-    if (feed_record(&h, lmux_link_output_ptr(&s), lmux_link_output_len(&s), &ev) < 0 ||
-        (ev & LMUX_LINK_EV_ESTABLISHED) == 0)
-        return fail("host establishes from supervisor hello");
-    lmux_link_output_consume(&s, lmux_link_output_len(&s));
+    if (transfer_output(&s, &h, &ev, &ev) < 0 ||
+        s.state == LMUX_LINK_ESTABLISHED ||
+        h.state == LMUX_LINK_ESTABLISHED)
+        return fail("supervisor hello established too early");
+    ev = 0;
+    if (transfer_output(&h, &s, &ev, &ev) < 0 ||
+        s.state == LMUX_LINK_ESTABLISHED ||
+        h.state == LMUX_LINK_ESTABLISHED)
+        return fail("host ack established too early");
+    ev = 0;
+    if (transfer_output(&s, &h, &ev, &ev) < 0 ||
+        h.state != LMUX_LINK_ESTABLISHED ||
+        s.state != LMUX_LINK_ESTABLISHED)
+        return fail("hello ack handshake");
 
     memset(tmp, 0, sizeof(tmp));
     tmp[0] = 0x00;
@@ -314,11 +374,8 @@ static int test_sequence_gap_fails(void)
     lmux_link_endpoint_init(&s, LMUX_LINK_ROLE_SUPERVISOR);
     lmux_link_endpoint_begin(&h, 0x1111);
     lmux_link_endpoint_begin(&s, 0x2222);
-    (void)feed_record(&s, lmux_link_output_ptr(&h), lmux_link_output_len(&h), &ev);
-    lmux_link_output_consume(&h, lmux_link_output_len(&h));
-    ev = 0;
-    (void)feed_record(&h, lmux_link_output_ptr(&s), lmux_link_output_len(&s), &ev);
-    lmux_link_output_consume(&s, lmux_link_output_len(&s));
+    if (establish_pair(&h, &s) < 0)
+        return fail("gap setup");
     memset(&fr, 0, sizeof(fr));
     fr.type = LMUX_LINK_T_TRANSPORT;
     fr.header_len = LMUX_LINK_HEADER_LEN;
@@ -343,11 +400,8 @@ static int test_crc_failure_fails_established(void)
     lmux_link_endpoint_init(&s, LMUX_LINK_ROLE_SUPERVISOR);
     lmux_link_endpoint_begin(&h, 0x1111);
     lmux_link_endpoint_begin(&s, 0x2222);
-    (void)feed_record(&s, lmux_link_output_ptr(&h), lmux_link_output_len(&h), &ev);
-    lmux_link_output_consume(&h, lmux_link_output_len(&h));
-    ev = 0;
-    (void)feed_record(&h, lmux_link_output_ptr(&s), lmux_link_output_len(&s), &ev);
-    lmux_link_output_consume(&s, lmux_link_output_len(&s));
+    if (establish_pair(&h, &s) < 0)
+        return fail("crc setup handshake");
     if (lmux_link_transport_write(&h, (const uint8_t *)"x", 1) != 1 ||
         lmux_link_build_output(&h) <= 0)
         return fail("crc setup");
@@ -370,15 +424,8 @@ static int test_peer_restart_requires_fresh_local_hello(void)
     lmux_link_endpoint_init(&h2, LMUX_LINK_ROLE_HOST);
     lmux_link_endpoint_begin(&h, 0x1111);
     lmux_link_endpoint_begin(&s, 0x2222);
-    if (feed_record(&s, lmux_link_output_ptr(&h), lmux_link_output_len(&h), &ev) < 0 ||
-        !(ev & LMUX_LINK_EV_ESTABLISHED))
+    if (establish_pair(&h, &s) < 0)
         return fail("restart setup s");
-    lmux_link_output_consume(&h, lmux_link_output_len(&h));
-    ev = 0;
-    if (feed_record(&h, lmux_link_output_ptr(&s), lmux_link_output_len(&s), &ev) < 0 ||
-        !(ev & LMUX_LINK_EV_ESTABLISHED))
-        return fail("restart setup h");
-    lmux_link_output_consume(&s, lmux_link_output_len(&s));
 
     lmux_link_endpoint_begin(&hdup, 0x1111);
     ev = 0;
@@ -394,17 +441,144 @@ static int test_peer_restart_requires_fresh_local_hello(void)
         s.pending_peer_hello.conn_id != 0x3333)
         return fail("new peer hello did not request restart");
     if (lmux_link_endpoint_restart_from_pending(&s, 0x4444, &ev) < 0 ||
-        !(ev & LMUX_LINK_EV_ESTABLISHED) ||
+        (ev & LMUX_LINK_EV_ESTABLISHED) ||
+        !(ev & LMUX_LINK_EV_HELLO_ACK_QUEUED) ||
         s.local_conn_id != 0x4444 ||
         s.peer_conn_id != 0x3333 ||
         s.next_tx_seq != 1)
-        return fail("restart did not establish fresh pair");
+        return fail("restart did not queue fresh pair");
     if (lmux_link_decode_frame(lmux_link_output_ptr(&s),
                                lmux_link_output_len(&s) - 1, &fr) < 0 ||
         fr.type != LMUX_LINK_T_HELLO ||
         fr.conn_id != 0x4444 ||
         fr.frame_seq != 0)
         return fail("fresh restart hello encoding");
+    lmux_link_output_consume(&s, lmux_link_output_len(&s));
+    if (lmux_link_build_output(&s) < 0 ||
+        lmux_link_decode_frame(lmux_link_output_ptr(&s),
+                               lmux_link_output_len(&s) - 1, &fr) < 0 ||
+        fr.type != LMUX_LINK_T_HELLO_ACK ||
+        fr.conn_id != 0x4444 ||
+        fr.frame_seq != 0)
+        return fail("fresh restart ack encoding");
+    return 0;
+}
+
+static int test_hello_ack_payload_and_lost_ack(void)
+{
+    struct lmux_link_endpoint h, s;
+    uint8_t payload[16];
+    uint32_t payload_len = 0;
+    uint64_t ack = 0;
+    unsigned hev = 0, sev = 0;
+
+    if (lmux_link_make_hello_ack_payload(0x1122334455667788ULL,
+                                         payload, sizeof(payload),
+                                         &payload_len) < 0 ||
+        payload_len != 8 ||
+        lmux_link_parse_hello_ack_payload(payload, payload_len, &ack) < 0 ||
+        ack != 0x1122334455667788ULL)
+        return fail("hello ack payload roundtrip");
+
+    lmux_link_endpoint_init(&h, LMUX_LINK_ROLE_HOST);
+    lmux_link_endpoint_init(&s, LMUX_LINK_ROLE_SUPERVISOR);
+    lmux_link_endpoint_begin(&h, 0x1111);
+    lmux_link_endpoint_begin(&s, 0x2222);
+
+    if (transfer_output(&h, &s, &hev, &sev) < 0 ||
+        h.state != LMUX_LINK_WAIT_HELLO ||
+        s.state != LMUX_LINK_WAIT_HELLO)
+        return fail("lost ack setup host hello");
+    hev = sev = 0;
+    if (transfer_output(&s, &h, &sev, &hev) < 0 ||
+        h.state != LMUX_LINK_WAIT_HELLO ||
+        s.state != LMUX_LINK_WAIT_HELLO)
+        return fail("lost ack setup supervisor hello");
+
+    /* Drop host->supervisor ACK after it is physically committed locally. */
+    if (lmux_link_build_output(&h) < 0 ||
+        lmux_link_output_len(&h) == 0)
+        return fail("lost ack host ack build");
+    lmux_link_output_consume_events(&h, lmux_link_output_len(&h), &hev);
+    if (!(hev & LMUX_LINK_EV_HELLO_ACK_COMMITTED) ||
+        h.state != LMUX_LINK_WAIT_HELLO ||
+        s.state != LMUX_LINK_WAIT_HELLO)
+        return fail("lost ack host ack drop");
+
+    hev = sev = 0;
+    if (transfer_output(&s, &h, &sev, &hev) < 0 ||
+        h.state != LMUX_LINK_ESTABLISHED ||
+        s.state != LMUX_LINK_WAIT_HELLO)
+        return fail("lost ack one side established setup");
+
+    if (lmux_link_endpoint_tick(&s, 1000) < 0 ||
+        lmux_link_endpoint_tick(&s, 1300) <= 0)
+        return fail("lost ack retry hello");
+    hev = sev = 0;
+    if (transfer_output(&s, &h, &sev, &hev) < 0 ||
+        (hev & LMUX_LINK_EV_PEER_RESTART) ||
+        h.state != LMUX_LINK_ESTABLISHED ||
+        s.state != LMUX_LINK_WAIT_HELLO)
+        return fail("established duplicate hello handling");
+    if (lmux_link_build_output(&h) < 0 ||
+        lmux_link_output_len(&h) == 0)
+        return fail("established duplicate ack build");
+    hev = sev = 0;
+    if (transfer_output(&h, &s, &hev, &sev) < 0 ||
+        h.state != LMUX_LINK_ESTABLISHED ||
+        s.state != LMUX_LINK_ESTABLISHED)
+        return fail("lost ack did not converge");
+    if (lmux_link_build_output(&h) != 0 || lmux_link_output_len(&h) != 0 ||
+        lmux_link_build_output(&s) != 0 || lmux_link_output_len(&s) != 0)
+        return fail("hello ack ping pong");
+    return 0;
+}
+
+static int test_duplicate_hello_ack_coalescing(void)
+{
+    struct lmux_link_endpoint h, s, hdup;
+    struct lmux_link_frame fr;
+    unsigned ev = 0;
+    size_t ack_len;
+    int i;
+
+    lmux_link_endpoint_init(&h, LMUX_LINK_ROLE_HOST);
+    lmux_link_endpoint_init(&s, LMUX_LINK_ROLE_SUPERVISOR);
+    lmux_link_endpoint_init(&hdup, LMUX_LINK_ROLE_HOST);
+    lmux_link_endpoint_begin(&h, 0x1111);
+    lmux_link_endpoint_begin(&s, 0x2222);
+    if (establish_pair(&h, &s) < 0)
+        return fail("coalesce setup");
+
+    lmux_link_endpoint_begin(&hdup, 0x1111);
+    for (i = 0; i < 8; i++) {
+        ev = 0;
+        if (feed_record(&s, lmux_link_output_ptr(&hdup),
+                        lmux_link_output_len(&hdup), &ev) < 0 ||
+            (ev & LMUX_LINK_EV_PEER_RESTART) ||
+            s.state != LMUX_LINK_ESTABLISHED)
+            return fail("coalesce duplicate hello feed");
+        if (i == 0 && !(ev & LMUX_LINK_EV_HELLO_ACK_QUEUED))
+            return fail("coalesce first ack not queued");
+        if (i > 0 && (ev & LMUX_LINK_EV_HELLO_ACK_QUEUED))
+            return fail("coalesce queued duplicate ack");
+    }
+    ack_len = lmux_link_output_len(&s);
+    if (ack_len == 0 ||
+        lmux_link_decode_frame(lmux_link_output_ptr(&s), ack_len - 1, &fr) < 0 ||
+        fr.type != LMUX_LINK_T_HELLO_ACK ||
+        s.pending_ack)
+        return fail("coalesce one in-flight ack");
+    lmux_link_output_consume(&s, ack_len);
+    if (lmux_link_output_len(&s) != 0 || s.pending_ack)
+        return fail("coalesce ack not cleared");
+
+    ev = 0;
+    if (feed_record(&s, lmux_link_output_ptr(&hdup),
+                    lmux_link_output_len(&hdup), &ev) < 0 ||
+        !(ev & LMUX_LINK_EV_HELLO_ACK_QUEUED) ||
+        lmux_link_output_len(&s) == 0)
+        return fail("coalesce later duplicate fresh ack");
     return 0;
 }
 
@@ -422,13 +596,8 @@ static int test_boot_interleaving_and_reset(void)
     s.local_caps |= LMUX_LINK_CAP_BOOT_INFO;
     lmux_link_endpoint_begin(&h, 0x1111);
     lmux_link_endpoint_begin(&s, 0x2222);
-    if (feed_record(&s, lmux_link_output_ptr(&h), lmux_link_output_len(&h), &ev) < 0)
-        return fail("boot interleave hello s");
-    lmux_link_output_consume(&h, lmux_link_output_len(&h));
-    ev = 0;
-    if (feed_record(&h, lmux_link_output_ptr(&s), lmux_link_output_len(&s), &ev) < 0)
-        return fail("boot interleave hello h");
-    lmux_link_output_consume(&s, lmux_link_output_len(&s));
+    if (establish_pair(&h, &s) < 0)
+        return fail("boot interleave hello");
     if (!(h.negotiated_caps & LMUX_LINK_CAP_BOOT_INFO) ||
         !(s.negotiated_caps & LMUX_LINK_CAP_BOOT_INFO))
         return fail("boot cap negotiation");
@@ -468,14 +637,8 @@ static int test_boot_interleaving_and_reset(void)
         return fail("boot reset clear");
     lmux_link_endpoint_begin(&h, 0x5555);
     lmux_link_endpoint_begin(&s, 0x6666);
-    ev = 0;
-    if (feed_record(&s, lmux_link_output_ptr(&h), lmux_link_output_len(&h), &ev) < 0)
-        return fail("boot malformed setup s");
-    lmux_link_output_consume(&h, lmux_link_output_len(&h));
-    ev = 0;
-    if (feed_record(&h, lmux_link_output_ptr(&s), lmux_link_output_len(&s), &ev) < 0)
-        return fail("boot malformed setup h");
-    lmux_link_output_consume(&s, lmux_link_output_len(&s));
+    if (establish_pair(&h, &s) < 0)
+        return fail("boot malformed setup");
     req[0] = 0xaa;
     if (lmux_link_boot_queue_frame(&h, LMUX_LINK_T_BOOT_REQUEST, req, 1) < 0 ||
         lmux_link_build_output(&h) <= 0)
@@ -497,6 +660,8 @@ int main(void)
         test_sequence_gap_fails() ||
         test_crc_failure_fails_established() ||
         test_peer_restart_requires_fresh_local_hello() ||
+        test_hello_ack_payload_and_lost_ack() ||
+        test_duplicate_hello_ack_coalescing() ||
         test_boot_interleaving_and_reset())
         return 1;
     puts("link selftest ok");
