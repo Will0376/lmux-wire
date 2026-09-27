@@ -51,6 +51,8 @@ struct lmux2_stream {
     int max_stream_data_dirty;
     uint32_t local_error;
     uint32_t remote_error;
+    int local_close_requested;
+    int local_close_sent;
     struct lmux2_ring rx;
     struct lmux2_ring tx;
 };

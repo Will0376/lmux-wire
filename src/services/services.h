@@ -10,6 +10,136 @@
 #include <sys/types.h>
 #include <termios.h>
 
+#define V2_EXEC_MAX_RUNNING 4
+#define V2_EXEC_MAX_COMPLETED 8
+#define V2_EXEC_MAX_SLOTS (V2_EXEC_MAX_RUNNING + V2_EXEC_MAX_COMPLETED)
+#define V2_EXEC_ARG_MAX 16
+#define V2_EXEC_ARG_BYTES_MAX 4096
+#define V2_EXEC_CTL_BUF_MAX 1024
+#define V2_EXEC_STDIN_BUF_MAX 1024
+#define V2_EXEC_OUTPUT_BUF_MAX 256
+#define V2_EXEC_FD_STDIN 1
+#define V2_EXEC_FD_STDOUT 2
+#define V2_EXEC_FD_STDERR 3
+#define V2_EXEC_FD_ERR 4
+
+enum v2_exec_role {
+    V2_EXEC_ROLE_CONTROL = 1,
+    V2_EXEC_ROLE_STDIN = 2,
+    V2_EXEC_ROLE_STDOUT = 3,
+    V2_EXEC_ROLE_STDERR = 4
+};
+
+enum v2_exec_signal {
+    V2_EXEC_SIG_INT = 1,
+    V2_EXEC_SIG_TERM = 2,
+    V2_EXEC_SIG_KILL = 3,
+    V2_EXEC_SIG_HUP = 4
+};
+
+enum v2_exec_record_type {
+    V2_EXEC_REC_START = 1,
+    V2_EXEC_REC_SIGNAL = 2,
+    V2_EXEC_REC_CLOSE_STDIN = 3,
+    V2_EXEC_REC_STATUS = 4,
+    V2_EXEC_REC_RELEASE = 5,
+    V2_EXEC_REC_START_REPLY = 101,
+    V2_EXEC_REC_STATUS_REPLY = 102,
+    V2_EXEC_REC_ERROR = 103
+};
+
+enum v2_exec_status {
+    V2_EXEC_STATUS_STARTING = 1,
+    V2_EXEC_STATUS_RUNNING = 2,
+    V2_EXEC_STATUS_EXITED_DRAINING = 3,
+    V2_EXEC_STATUS_DONE = 4,
+    V2_EXEC_STATUS_START_FAILED = 5,
+    V2_EXEC_STATUS_TERMINATING = 6
+};
+
+enum v2_exec_error {
+    V2_EXEC_OK = 0,
+    V2_EXEC_E_BAD_REQUEST = 1,
+    V2_EXEC_E_NOT_FOUND = 2,
+    V2_EXEC_E_BUSY = 3,
+    V2_EXEC_E_LIMIT = 4,
+    V2_EXEC_E_IO = 5,
+    V2_EXEC_E_NOT_RUNNING = 6
+};
+
+enum v2_exec_start_failure {
+    V2_EXEC_FAIL_NONE = 0,
+    V2_EXEC_FAIL_FORK = 1,
+    V2_EXEC_FAIL_PIPE = 2,
+    V2_EXEC_FAIL_CHDIR = 3,
+    V2_EXEC_FAIL_SETPGID = 4,
+    V2_EXEC_FAIL_EXEC = 5
+};
+
+struct v2_exec_record {
+    uint8_t type;
+    uint8_t status;
+    uint16_t length;
+    uint64_t exec_id;
+    const uint8_t *payload;
+};
+
+struct v2_exec_obj {
+    int used;
+    uint64_t exec_id;
+    enum v2_exec_status status;
+    pid_t pid;
+    pid_t pgid;
+    int stdin_fd;
+    int stdout_fd;
+    int stderr_fd;
+    int err_fd;
+    int stdin_closed;
+    int close_stdin_requested;
+    int stdout_eof;
+    int stderr_eof;
+    int child_reaped;
+    int exit_code;
+    int term_signal;
+    int start_errno;
+    enum v2_exec_start_failure start_failure;
+    uint64_t control_stream_id;
+    uint64_t stdin_stream_id;
+    uint64_t stdout_stream_id;
+    uint64_t stderr_stream_id;
+    uint8_t ctl_in[V2_EXEC_CTL_BUF_MAX];
+    size_t ctl_in_len;
+    uint8_t ctl_out[V2_EXEC_CTL_BUF_MAX];
+    size_t ctl_out_len;
+    size_t ctl_out_pos;
+    uint8_t stdin_buf[V2_EXEC_STDIN_BUF_MAX];
+    size_t stdin_len;
+    size_t stdin_pos;
+    uint8_t stdout_buf[V2_EXEC_OUTPUT_BUF_MAX];
+    size_t stdout_len;
+    size_t stdout_pos;
+    uint8_t stderr_buf[V2_EXEC_OUTPUT_BUF_MAX];
+    size_t stderr_len;
+    size_t stderr_pos;
+    unsigned long long stdout_child_read_total;
+    unsigned long long stdout_lmux_written_total;
+    unsigned long long stderr_child_read_total;
+    unsigned long long stderr_lmux_written_total;
+    unsigned long long completed_seq;
+};
+
+struct v2_exec_service_state {
+    uint64_t next_exec_id;
+    unsigned long long next_completed_seq;
+    uint64_t control_stream_id;
+    uint8_t ctl_in[V2_EXEC_CTL_BUF_MAX];
+    size_t ctl_in_len;
+    uint8_t ctl_out[V2_EXEC_CTL_BUF_MAX];
+    size_t ctl_out_len;
+    size_t ctl_out_pos;
+    struct v2_exec_obj execs[V2_EXEC_MAX_SLOTS];
+};
+
 struct v2_binding {
     uint64_t stream_id;
     int fd;
@@ -64,6 +194,7 @@ struct v2_service {
     uint64_t active_stream_id;
     uint64_t last_stream_id;
     struct v2_file_session file;
+    struct v2_exec_service_state exec;
     struct v2_binding bindings[V2_MAX_BINDINGS];
 };
 
@@ -112,6 +243,23 @@ void v2_file_session_reset(struct v2_file_session *fs);
 int v2_file_service_step(struct v2_app *a, struct lmux2_conn *conn,
                          struct v2_service services[V2_MAX_SERVICES],
                          struct v2_service *s);
+
+void v2_exec_service_reset(struct v2_service *s);
+int v2_exec_create_service(struct v2_app *a, struct v2_service *s,
+                           const char *name);
+int v2_exec_handle_stream_open(struct v2_app *a, struct lmux2_conn *conn,
+                               struct v2_service *s,
+                               struct lmux2_stream *st);
+void v2_exec_cleanup_connection(struct v2_app *a, struct v2_service *s,
+                                struct lmux2_conn *conn);
+int v2_exec_service_step(struct v2_app *a, struct lmux2_conn *conn,
+                         struct v2_service *s);
+short v2_exec_fd_events(struct v2_app *a, struct lmux2_conn *conn,
+                        struct v2_service *s, int exec_idx, int fd_kind);
+void v2_exec_on_fd_event(struct v2_app *a, struct lmux2_conn *conn,
+                         struct v2_service *s, int exec_idx, int fd_kind,
+                         short revents);
+uint64_t v2_exec_stream_token(uint64_t exec_id, enum v2_exec_role role);
 
 void v2_unix_clear_pending(struct v2_app *a, struct v2_service *s);
 void v2_unix_accept_pending(struct v2_app *a, struct v2_service *s, int fd);

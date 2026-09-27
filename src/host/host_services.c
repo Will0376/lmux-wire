@@ -254,7 +254,7 @@ static int desired_matches_service(const struct v2_desired *d, const struct v2_h
         return strcmp(d->target_path, s->target_path) == 0;
     if (d->type == V2_SERVICE_PTY)
         return strcmp(d->argv, s->argv) == 0 && d->supervised == s->supervised;
-    return d->type == V2_SERVICE_FILE;
+    return d->type == V2_SERVICE_FILE || d->type == V2_SERVICE_EXEC;
 }
 
 void v2_host_init(struct v2_host *h)
@@ -273,6 +273,25 @@ void v2_host_init(struct v2_host *h)
     }
 }
 
+static void ensure_private_exec_desired(struct v2_host *h)
+{
+    int i, free_idx = -1;
+    for (i = 0; i < V2_MAX_DESIRED; i++) {
+        if (h->desired[i].used) {
+            if (strcmp(h->desired[i].name, "__exec") == 0)
+                return;
+        } else if (free_idx < 0) {
+            free_idx = i;
+        }
+    }
+    if (free_idx >= 0) {
+        h->desired[free_idx].used = 1;
+        h->desired[free_idx].type = V2_SERVICE_EXEC;
+        h->desired[free_idx].internal = 1;
+        strcpy(h->desired[free_idx].name, "__exec");
+    }
+}
+
 void v2_host_cleanup(struct v2_host *h)
 {
     int i;
@@ -288,6 +307,7 @@ void v2_host_cleanup(struct v2_host *h)
 int v2_host_add_unix(struct v2_host *h, const char *arg)
 {
     int i;
+    ensure_private_exec_desired(h);
     for (i = 0; i < V2_MAX_DESIRED; i++) {
         if (!h->desired[i].used) {
             h->desired[i].used = 1;
@@ -352,7 +372,8 @@ int v2_host_create_desired_services(struct v2_app *a, struct v2_host *h,
         s->id = 0;
         s->type = d->type;
         if (v2_host_copy_bounded(s->name, sizeof(s->name), d->name) < 0 ||
-            v2_host_copy_bounded(s->host_path, sizeof(s->host_path), d->host_path) < 0) {
+            (d->host_path[0] &&
+             v2_host_copy_bounded(s->host_path, sizeof(s->host_path), d->host_path) < 0)) {
             v2_host_service_cleanup(s);
             return -1;
         }
@@ -361,6 +382,12 @@ int v2_host_create_desired_services(struct v2_app *a, struct v2_host *h,
         if (d->argv[0])
             v2_host_copy_bounded(s->argv, sizeof(s->argv), d->argv);
         s->supervised = d->supervised;
+        s->internal = d->internal;
+        if (d->type == V2_SERVICE_EXEC) {
+            v2_app_log(a, 1, "lmux2 host internal service=%s type=%s",
+                       s->name, v2_service_type_name(s->type));
+            continue;
+        }
         s->listen_fd = v2_host_create_listener(s->host_path, &s->created_path);
         if (s->listen_fd < 0) {
             fprintf(stderr, "lmux2 host listener %s: %s\n", s->host_path, strerror(errno));
@@ -372,6 +399,25 @@ int v2_host_create_desired_services(struct v2_app *a, struct v2_host *h,
                    s->name, v2_service_type_name(s->type), s->host_path);
     }
     return 0;
+}
+
+int v2_host_ensure_private_exec(struct v2_app *a, struct v2_host *h)
+{
+    int i;
+    ensure_private_exec_desired(h);
+    if (v2_host_service_find_name(h->services, "exec"))
+        return 0;
+    if (v2_host_service_find_name(h->services, "__exec"))
+        return 0;
+    for (i = 0; i < V2_MAX_DESIRED; i++) {
+        struct v2_desired *d = &h->desired[i];
+        if (d->used && strcmp(d->name, "__exec") == 0) {
+            if (!d->sent)
+                return v2_runtime_send_service_ensure(a, d);
+            return 0;
+        }
+    }
+    return -1;
 }
 
 void v2_host_invalidate_remote(struct v2_host *h)
@@ -393,6 +439,7 @@ void v2_host_invalidate_remote(struct v2_host *h)
     h->factory_unix = 0;
     h->factory_pty = 0;
     h->factory_file = 0;
+    h->factory_exec = 0;
     for (i = 0; i < V2_MAX_DESIRED; i++) {
         h->desired[i].sent = 0;
         h->desired[i].req_id = 0;
@@ -401,7 +448,8 @@ void v2_host_invalidate_remote(struct v2_host *h)
 }
 
 void v2_host_on_factory_report(struct v2_app *a, struct v2_host *h,
-                               int has_unix, int has_pty, int has_file)
+                               int has_unix, int has_pty, int has_file,
+                               int has_exec)
 {
     int i;
     if (h->desired_sent)
@@ -409,15 +457,17 @@ void v2_host_on_factory_report(struct v2_app *a, struct v2_host *h,
     h->factory_unix = has_unix;
     h->factory_pty = has_pty;
     h->factory_file = has_file;
-    v2_app_log(a, 1, "lmux2 FACTORY_REPORT received unix=%d pty=%d file=%d",
-               h->factory_unix, h->factory_pty, h->factory_file);
+    h->factory_exec = has_exec;
+    v2_app_log(a, 1, "lmux2 FACTORY_REPORT received unix=%d pty=%d file=%d exec=%d",
+               h->factory_unix, h->factory_pty, h->factory_file, h->factory_exec);
     v2_app_log(a, 1, "lmux2 reconciling desired services");
     for (i = 0; i < V2_MAX_DESIRED; i++) {
         struct v2_desired *d = &h->desired[i];
         if (d->used &&
             ((d->type == V2_SERVICE_UNIX_RENDEZVOUS && h->factory_unix) ||
              (d->type == V2_SERVICE_PTY && h->factory_pty) ||
-             (d->type == V2_SERVICE_FILE && h->factory_file)))
+             (d->type == V2_SERVICE_FILE && h->factory_file) ||
+             (d->type == V2_SERVICE_EXEC && h->factory_exec)))
             (void)v2_runtime_send_service_ensure(a, d);
     }
     h->desired_sent = 1;
@@ -445,13 +495,15 @@ void v2_host_on_service_ok(struct v2_app *a, struct v2_host *h,
         s->id = service_id;
         s->type = type ? type : d->type;
         v2_host_copy_bounded(s->name, sizeof(s->name), d->name);
-        v2_host_copy_bounded(s->host_path, sizeof(s->host_path), d->host_path);
+        if (d->host_path[0])
+            v2_host_copy_bounded(s->host_path, sizeof(s->host_path), d->host_path);
         if (d->target_path[0])
             v2_host_copy_bounded(s->target_path, sizeof(s->target_path), d->target_path);
         if (d->argv[0])
             v2_host_copy_bounded(s->argv, sizeof(s->argv), d->argv);
         s->supervised = d->supervised;
-        if (s->listen_fd < 0 && s->host_path[0]) {
+        s->internal = d->internal;
+        if (s->type != V2_SERVICE_EXEC && s->listen_fd < 0 && s->host_path[0]) {
             s->listen_fd = v2_host_create_listener(s->host_path, &s->created_path);
             if (s->listen_fd >= 0)
                 v2_host_copy_bounded(s->listen_path, sizeof(s->listen_path), s->host_path);

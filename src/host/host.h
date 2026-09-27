@@ -32,6 +32,7 @@ struct v2_desired {
     char target_path[V2_PATH_MAX];
     char argv[V2_PATH_MAX];
     int supervised;
+    int internal;
     uint64_t service_id;
 };
 
@@ -46,6 +47,7 @@ struct v2_host_service {
     char listen_path[V2_PATH_MAX];
     int listen_fd;
     int created_path;
+    int internal;
     int pending_fd;
     uint64_t pending_event_token;
     int supervised;
@@ -81,12 +83,13 @@ struct v2_host {
     int factory_unix;
     int factory_pty;
     int factory_file;
+    int factory_exec;
     int desired_sent;
     uint32_t next_req_id;
     const char *control_path;
     int control_listen_fd;
     int control_fd;
-    char control_in[256];
+    char control_in[4096];
     size_t control_in_len;
     int boot_pending;
     int boot_control_gone;
@@ -121,6 +124,28 @@ struct v2_host {
     uint64_t deploy_pre_established_count;
     long long deploy_deadline_ms;
     uint8_t deploy_sha[32];
+    int exec_active;
+    int exec_phase;
+    int exec_status_pending;
+    int exec_close_pending;
+    int exec_close_stdin_after_drain;
+    int exec_done_seen;
+    uint64_t exec_service_id;
+    uint64_t exec_id;
+    uint64_t exec_control_stream;
+    uint64_t exec_stdin_stream;
+    uint64_t exec_stdout_stream;
+    uint64_t exec_stderr_stream;
+    uint64_t exec_conflict_stream;
+    uint8_t exec_ctl_in[1024];
+    size_t exec_ctl_in_len;
+    uint8_t exec_ctl_out[1024];
+    size_t exec_ctl_out_len;
+    size_t exec_ctl_out_pos;
+    long long exec_next_status_ms;
+    uint8_t exec_stdin[4096];
+    size_t exec_stdin_len;
+    size_t exec_stdin_pos;
     struct v2_host_service services[V2_MAX_SERVICES];
     struct v2_desired desired[V2_MAX_DESIRED];
 };
@@ -160,6 +185,18 @@ int v2_runtime_queue_boot_request_body(struct v2_app *a, uint16_t opcode,
 void v2_runtime_lmux_marker(struct v2_app *a, uint64_t *local_conn,
                             uint64_t *peer_conn,
                             uint64_t *established_count);
+int v2_runtime_lmux_established(struct v2_app *a);
+int v2_runtime_outer_enabled(struct v2_app *a);
+int v2_runtime_open_stream_token(struct v2_app *a, uint64_t service_id,
+                                 uint64_t token, uint64_t *stream_id);
+int v2_runtime_stream_is_open(struct v2_app *a, uint64_t stream_id);
+int v2_runtime_stream_state(struct v2_app *a, uint64_t stream_id);
+size_t v2_runtime_stream_read(struct v2_app *a, uint64_t stream_id,
+                              uint8_t *buf, size_t len);
+size_t v2_runtime_stream_write(struct v2_app *a, uint64_t stream_id,
+                               const uint8_t *buf, size_t len);
+size_t v2_runtime_stream_tx_len(struct v2_app *a, uint64_t stream_id);
+int v2_runtime_close_stream(struct v2_app *a, uint64_t stream_id);
 void v2_runtime_count_stream_open(struct v2_app *a);
 void v2_runtime_count_stream_close(struct v2_app *a);
 
@@ -188,9 +225,11 @@ int v2_host_add_pty(struct v2_host *h, const char *arg);
 int v2_host_add_file(struct v2_host *h, const char *arg);
 int v2_host_create_desired_services(struct v2_app *a, struct v2_host *h,
                                     uint64_t *next_service_id);
+int v2_host_ensure_private_exec(struct v2_app *a, struct v2_host *h);
 void v2_host_invalidate_remote(struct v2_host *h);
 void v2_host_on_factory_report(struct v2_app *a, struct v2_host *h,
-                               int has_unix, int has_pty, int has_file);
+                               int has_unix, int has_pty, int has_file,
+                               int has_exec);
 void v2_host_on_service_ok(struct v2_app *a, struct v2_host *h,
                            uint32_t req_id, uint64_t service_id,
                            enum v2_service_type type,

@@ -195,7 +195,8 @@ struct lmux2_stream *lmux2_find_stream(struct lmux2_conn *c, uint64_t stream_id)
     int i;
     for (i = 0; i < LMUX2_CORE_MAX_STREAMS; i++)
         if (c->streams[i].state != LMUX2_STREAM_UNUSED &&
-            c->streams[i].state != LMUX2_STREAM_TERMINAL &&
+            (c->streams[i].state != LMUX2_STREAM_TERMINAL ||
+             c->streams[i].rx.len > 0) &&
             c->streams[i].id == stream_id)
             return &c->streams[i];
     return NULL;
@@ -207,7 +208,8 @@ const struct lmux2_stream *lmux2_find_stream_const(const struct lmux2_conn *c,
     int i;
     for (i = 0; i < LMUX2_CORE_MAX_STREAMS; i++)
         if (c->streams[i].state != LMUX2_STREAM_UNUSED &&
-            c->streams[i].state != LMUX2_STREAM_TERMINAL &&
+            (c->streams[i].state != LMUX2_STREAM_TERMINAL ||
+             c->streams[i].rx.len > 0) &&
             c->streams[i].id == stream_id)
             return &c->streams[i];
     return NULL;
@@ -218,7 +220,8 @@ static struct lmux2_stream *alloc_stream_slot(struct lmux2_conn *c)
     int i;
     for (i = 0; i < LMUX2_CORE_MAX_STREAMS; i++) {
         if (c->streams[i].state == LMUX2_STREAM_UNUSED ||
-            c->streams[i].state == LMUX2_STREAM_TERMINAL) {
+            (c->streams[i].state == LMUX2_STREAM_TERMINAL &&
+             c->streams[i].rx.len == 0 && c->streams[i].tx.len == 0)) {
             reset_stream(&c->streams[i]);
             return &c->streams[i];
         }
@@ -552,7 +555,9 @@ int lmux2_next_frame(struct lmux2_conn *c, struct lmux2_frame *fr)
         const uint8_t *p;
         size_t avail;
         uint64_t stream_room, conn_room;
-        if ((s->state != LMUX2_STREAM_OPEN && s->state != LMUX2_STREAM_REMOTE_CLOSED) ||
+        if ((s->state != LMUX2_STREAM_OPEN &&
+             s->state != LMUX2_STREAM_REMOTE_CLOSED &&
+             s->state != LMUX2_STREAM_LOCAL_CLOSED) ||
             s->tx.len == 0)
             continue;
         if (s->send_offset >= s->peer_max_stream_data ||
@@ -578,6 +583,24 @@ int lmux2_next_frame(struct lmux2_conn *c, struct lmux2_frame *fr)
         ring_drop(&s->tx, avail);
         s->send_offset += avail;
         c->conn_send_offset += avail;
+        c->rr_next = (idx + 1) % LMUX2_CORE_MAX_STREAMS;
+        c->frames_tx++;
+        return 1;
+    }
+    for (n = 0; n < LMUX2_CORE_MAX_STREAMS; n++) {
+        int idx = (c->rr_next + n) % LMUX2_CORE_MAX_STREAMS;
+        struct lmux2_stream *s = &c->streams[idx];
+        if (s->state == LMUX2_STREAM_UNUSED || s->state == LMUX2_STREAM_TERMINAL ||
+            s->state == LMUX2_STREAM_RESET)
+            continue;
+        if (!s->local_close_requested || s->local_close_sent || s->tx.len)
+            continue;
+        memset(fr, 0, sizeof(*fr));
+        fr->type = LMUX2_T_STREAM_CLOSE;
+        fr->stream_id = s->id;
+        s->local_close_sent = 1;
+        if (s->state == LMUX2_STREAM_REMOTE_CLOSED)
+            s->state = LMUX2_STREAM_TERMINAL;
         c->rr_next = (idx + 1) % LMUX2_CORE_MAX_STREAMS;
         c->frames_tx++;
         return 1;
@@ -650,11 +673,10 @@ int lmux2_close_stream(struct lmux2_conn *c, uint64_t stream_id)
         return 0;
     if (s->state == LMUX2_STREAM_TERMINAL || s->state == LMUX2_STREAM_RESET)
         return 0;
-    if (queue_simple(c, LMUX2_T_STREAM_CLOSE, stream_id, 0) < 0)
-        return -1;
+    s->local_close_requested = 1;
     if (s->state == LMUX2_STREAM_REMOTE_CLOSED)
-        s->state = LMUX2_STREAM_TERMINAL;
-    else
+        return 0;
+    else if (s->state != LMUX2_STREAM_LOCAL_CLOSED)
         s->state = LMUX2_STREAM_LOCAL_CLOSED;
     return 0;
 }

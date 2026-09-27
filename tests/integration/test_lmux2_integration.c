@@ -575,7 +575,7 @@ static int integration_test(void)
     where = "service delete aux";
     stop_child(host);
     host = -1;
-    if (inject_service_delete(inject_fd, 2) < 0 || wait_socket_absent(target_aux) < 0)
+    if (inject_service_delete(inject_fd, 3) < 0 || wait_socket_absent(target_aux) < 0)
         goto out;
 
     where = "gdb survives aux delete";

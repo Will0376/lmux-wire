@@ -15,7 +15,8 @@ typedef uint64_t v2_pending_token_t;
 enum v2_service_type {
     V2_SERVICE_UNIX_RENDEZVOUS = 1,
     V2_SERVICE_PTY = 2,
-    V2_SERVICE_FILE = 3
+    V2_SERVICE_FILE = 3,
+    V2_SERVICE_EXEC = 4
 };
 
 enum v2_event {
@@ -31,6 +32,7 @@ static inline const char *v2_service_type_name(enum v2_service_type type)
     case V2_SERVICE_UNIX_RENDEZVOUS: return "unix-rendezvous";
     case V2_SERVICE_PTY: return "pty";
     case V2_SERVICE_FILE: return "file";
+    case V2_SERVICE_EXEC: return "exec";
     }
     return "?";
 }

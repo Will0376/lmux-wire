@@ -93,6 +93,7 @@ void v2_service_slots_init(struct v2_service services[V2_MAX_SERVICES])
         services[i].pending_fd = -1;
         services[i].pty_master_fd = -1;
         services[i].file.fd = -1;
+        v2_exec_service_reset(&services[i]);
         for (j = 0; j < V2_MAX_BINDINGS; j++)
             services[i].bindings[j].fd = -1;
     }
@@ -102,6 +103,8 @@ void v2_service_cleanup(struct v2_service *s)
 {
     int i;
     v2_file_session_reset(&s->file);
+    if (s->type == V2_SERVICE_EXEC)
+        v2_exec_service_reset(s);
     if (s->type == V2_SERVICE_PTY)
         v2_pty_terminate_child(s);
     v2_close_fd(&s->pty_master_fd);
@@ -116,6 +119,7 @@ void v2_service_cleanup(struct v2_service *s)
     s->pending_fd = -1;
     s->pty_master_fd = -1;
     s->file.fd = -1;
+    v2_exec_service_reset(s);
     for (i = 0; i < V2_MAX_BINDINGS; i++)
         s->bindings[i].fd = -1;
 }

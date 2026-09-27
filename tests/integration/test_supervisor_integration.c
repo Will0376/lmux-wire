@@ -18,6 +18,7 @@
 #include "link_protocol.h"
 #include "lxf.h"
 #include "lmux.h"
+#include "services.h"
 
 static int fail(const char *msg)
 {
@@ -110,6 +111,25 @@ static int write_all(int fd, const void *buf, size_t len)
         }
     }
     return 0;
+}
+
+static int hex_encode_bytes(const uint8_t *in, size_t len, char *out, size_t cap)
+{
+    static const char hexdig[] = "0123456789abcdef";
+    size_t i;
+    if (cap < len * 2 + 1)
+        return -1;
+    for (i = 0; i < len; i++) {
+        out[i * 2] = hexdig[in[i] >> 4];
+        out[i * 2 + 1] = hexdig[in[i] & 15];
+    }
+    out[len * 2] = 0;
+    return 0;
+}
+
+static int hex_encode_cstr(const char *in, char *out, size_t cap)
+{
+    return hex_encode_bytes((const uint8_t *)in, strlen(in), out, cap);
 }
 
 static int read_until(int fd, const char *needle, char *out, size_t cap, int timeout_ms)
@@ -227,6 +247,130 @@ static int control_request_test(const char *control, const char *req,
     }
     close(fd);
     return len ? 0 : -1;
+}
+
+static int exec_request_test(const char *control, const char *req,
+                             char *out, size_t cap)
+{
+    int fd = connect_unix_test(control);
+    size_t len = 0;
+    long long end = now_ms() + 20000;
+    if (fd < 0 || cap == 0)
+        return -1;
+    out[0] = 0;
+    if (write_all(fd, req, strlen(req)) < 0) {
+        close(fd);
+        return -1;
+    }
+    while (now_ms() < end && len + 1 < cap) {
+        int re = wait_fd_event(fd, POLLIN | POLLHUP | POLLERR | POLLNVAL, 100);
+        if (re & POLLIN) {
+            ssize_t r = read(fd, out + len, cap - len - 1);
+            if (r > 0) {
+                len += (size_t)r;
+                out[len] = 0;
+                if (strstr(out, "\nDONE\n") || strstr(out, "ERR EXEC"))
+                    break;
+                continue;
+            }
+            if (r == 0)
+                break;
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                continue;
+            close(fd);
+            return -1;
+        }
+        if (re & (POLLHUP | POLLERR | POLLNVAL))
+            break;
+    }
+    close(fd);
+    return len ? 0 : -1;
+}
+
+static int parse_exec_id_line(const char *text, uint64_t *out)
+{
+    const char *p = strstr(text, "OK EXEC exec_id=");
+    unsigned long long id;
+    if (!p || sscanf(p, "OK EXEC exec_id=%llu", &id) != 1 || id == 0)
+        return -1;
+    *out = (uint64_t)id;
+    return 0;
+}
+
+static int wait_marker(const char *path, int timeout_ms)
+{
+    long long end = now_ms() + timeout_ms;
+    while (now_ms() < end) {
+        struct stat st;
+        if (stat(path, &st) == 0)
+            return 0;
+        usleep(20000);
+    }
+    return -1;
+}
+
+static int read_size_marker(const char *path, size_t *out)
+{
+    FILE *f = fopen(path, "r");
+    unsigned long long v;
+    if (!f)
+        return -1;
+    if (fscanf(f, "%llu", &v) != 1) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    *out = (size_t)v;
+    return 0;
+}
+
+static int verify_stdout_hex_pattern(const char *out, size_t expected)
+{
+    static const char pat[] = "0123456789abcdef";
+    const char *p = out;
+    size_t pos = 0;
+    while ((p = strstr(p, "STDOUT_HEX ")) != NULL) {
+        p += strlen("STDOUT_HEX ");
+        while (p[0] && p[1] && p[0] != '\n' && p[1] != '\n') {
+            unsigned value;
+            if (sscanf(p, "%2x", &value) != 1)
+                return -1;
+            if (pos >= expected || value != (unsigned char)pat[pos & 15])
+                return -1;
+            pos++;
+            p += 2;
+        }
+    }
+    return pos == expected ? 0 : -1;
+}
+
+static size_t count_stdout_hex_bytes(const char *out)
+{
+    const char *p = out;
+    size_t pos = 0;
+    while ((p = strstr(p, "STDOUT_HEX ")) != NULL) {
+        p += strlen("STDOUT_HEX ");
+        while (p[0] && p[1] && p[0] != '\n' && p[1] != '\n') {
+            pos++;
+            p += 2;
+        }
+    }
+    return pos;
+}
+
+static int hex_encode_pattern(size_t len, char *out, size_t cap)
+{
+    static const char hexdigits[] = "0123456789abcdef";
+    size_t i;
+    if (cap < len * 2 + 1)
+        return -1;
+    for (i = 0; i < len; i++) {
+        unsigned char b = (unsigned char)(i & 255);
+        out[i * 2] = hexdigits[b >> 4];
+        out[i * 2 + 1] = hexdigits[b & 15];
+    }
+    out[len * 2] = 0;
+    return 0;
 }
 
 static int read_line_fd(int fd, char *out, size_t cap, int timeout_ms)
@@ -4697,8 +4841,604 @@ out:
     return rc;
 }
 
-int main(void)
+static int private_exec_basic_test(void)
 {
+    char dir[] = "/tmp/lmux-private-exec-it-XXXXXX";
+    char carrier[160], control[160], console[160], file_sock[160], storage[160];
+    char pty_arg[360], file_arg[240];
+    char out[32768];
+    char req[4096];
+    char self_path[256], self_hex[sizeof(self_path) * 2 + 1];
+    char helper_hex[64], pgsig_hex[32], bp_hex[32], stderr_bp_hex[64];
+    char stdin_delay_hex[64], marker_hex[1100], total_hex[32];
+    char stdin_hex[3200];
+    char marker[512], marker2[1024];
+    char *big = NULL;
+    ssize_t self_len;
+    size_t bp_count = 0;
+    pid_t sup = -1, host = -1;
+    int rc = 1;
+    uint64_t exec_id = 0, old_id = 0;
+    uint64_t ids[V2_EXEC_MAX_COMPLETED + 3];
+    const char *where = "setup";
+
+    if (!mkdtemp(dir))
+        return fail("mkdtemp private exec");
+    snprintf(carrier, sizeof(carrier), "%s/carrier.sock", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(console, sizeof(console), "%s/console.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(storage, sizeof(storage), "%s/storage", dir);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+    if (mkdir(storage, 0700) < 0)
+        goto out;
+    self_len = readlink("/proc/self/exe", self_path, sizeof(self_path) - 1);
+    if (self_len <= 0)
+        goto out;
+    self_path[self_len] = 0;
+    if (hex_encode_cstr(self_path, self_hex, sizeof(self_hex)) < 0 ||
+        hex_encode_cstr("--exec-helper", helper_hex, sizeof(helper_hex)) < 0 ||
+        hex_encode_cstr("pgsig", pgsig_hex, sizeof(pgsig_hex)) < 0 ||
+        hex_encode_cstr("stdout-bp", bp_hex, sizeof(bp_hex)) < 0 ||
+        hex_encode_cstr("stderr-bp", stderr_bp_hex, sizeof(stderr_bp_hex)) < 0 ||
+        hex_encode_cstr("stdin-delay", stdin_delay_hex, sizeof(stdin_delay_hex)) < 0)
+        goto out;
+    big = malloc(320000);
+    if (!big)
+        goto out;
+
+    sup = spawn_supervisor_with_storage(carrier, storage);
+    if (sup <= 0)
+        goto out;
+    host = spawn_host(carrier, control, pty_arg, file_arg);
+    if (host <= 0)
+        goto out;
+
+    where = "ready";
+    if (wait_ready_layers(control, getenv("LMUX_SUP_IT_OUTER") ? 1 : 0,
+                          15000, out, sizeof(out)) < 0) {
+        dump_excerpt("private exec status", out);
+        goto out;
+    }
+
+    where = "true";
+    if (exec_request_test(control, "EXEC START - 2f62696e2f74727565\n",
+                          out, sizeof(out)) < 0 ||
+        !strstr(out, "OK EXEC") ||
+        !strstr(out, "STATUS state=4") ||
+        !strstr(out, "exit=0") ||
+        !strstr(out, "\nDONE\n")) {
+        dump_excerpt("private exec true", out);
+        goto out;
+    }
+
+    where = "false";
+    if (exec_request_test(control, "EXEC START - 2f62696e2f66616c7365\n",
+                          out, sizeof(out)) < 0 ||
+        !strstr(out, "OK EXEC") ||
+        !strstr(out, "STATUS state=4") ||
+        !strstr(out, "exit=1") ||
+        !strstr(out, "\nDONE\n")) {
+        dump_excerpt("private exec false", out);
+        goto out;
+    }
+
+    where = "exec failure";
+    if (exec_request_test(control, "EXEC START - 2f6e6f2f737563682d6c6d75782d65786563\n",
+                          out, sizeof(out)) < 0 ||
+        !strstr(out, "OK EXEC") ||
+        !strstr(out, "STATUS state=START_FAILED") ||
+        !strstr(out, "fail=5") ||
+        !strstr(out, "\nDONE\n")) {
+        dump_excerpt("private exec failure", out);
+        goto out;
+    }
+
+    where = "stdio";
+    if (exec_request_test(control,
+                          "EXEC START - 2f62696e2f7368 2d63 7072696e746620455845435f4f55543b207072696e746620455845435f455252203e26323b20636174 --stdin 410042ff0a\n",
+                          out, sizeof(out)) < 0 ||
+        !strstr(out, "OK EXEC") ||
+        !strstr(out, "STDOUT_HEX 455845435f4f5554") ||
+        !strstr(out, "STDERR_HEX 455845435f455252") ||
+        !strstr(out, "410042ff0a") ||
+        !strstr(out, "STATUS state=4") ||
+        !strstr(out, "exit=0") ||
+        !strstr(out, "stdout_eof=1") ||
+        !strstr(out, "stderr_eof=1") ||
+        !strstr(out, "\nDONE\n")) {
+        dump_excerpt("private exec stdio", out);
+        goto out;
+    }
+
+    where = "release completed";
+    if (parse_exec_id_line(out, &old_id) < 0)
+        goto out;
+    snprintf(req, sizeof(req), "EXEC RELEASE %llu\n",
+             (unsigned long long)old_id);
+    if (exec_request_test(control, req, out, sizeof(out)) < 0 ||
+        !strstr(out, "OK EXEC RELEASED")) {
+        dump_excerpt("private exec release", out);
+        goto out;
+    }
+    snprintf(req, sizeof(req), "EXEC STATUS %llu\n",
+             (unsigned long long)old_id);
+    if (exec_request_test(control, req, out, sizeof(out)) < 0 ||
+        !strstr(out, "ERR EXEC remote status=2")) {
+        dump_excerpt("private exec released status", out);
+        goto out;
+    }
+
+    where = "detached reconnect attach";
+    if (exec_request_test(control,
+                          "EXEC START_DETACHED - 2f62696e2f7368 2d63 736c65657020313b207072696e746620504f5354\n",
+                          out, sizeof(out)) < 0 ||
+        !strstr(out, "DETACHED") ||
+        parse_exec_id_line(out, &exec_id) < 0) {
+        dump_excerpt("private exec detached start", out);
+        goto out;
+    }
+    stop_pid(host);
+    host = -1;
+    host = spawn_host(carrier, control, pty_arg, file_arg);
+    if (host <= 0 ||
+        wait_ready_layers(control, getenv("LMUX_SUP_IT_OUTER") ? 1 : 0,
+                          15000, out, sizeof(out)) < 0)
+        goto out;
+    snprintf(req, sizeof(req), "EXEC ATTACH %llu\n",
+             (unsigned long long)exec_id);
+    if (exec_request_test(control, req, out, sizeof(out)) < 0 ||
+        !strstr(out, "STATUS state=4") ||
+        !strstr(out, "\nDONE\n")) {
+        dump_excerpt("private exec reconnect attach", out);
+        goto out;
+    }
+
+    where = "competing attach and reconnect frees";
+    if (exec_request_test(control,
+                          "EXEC START_DETACHED - 2f62696e2f7368 2d63 736c65657020333b20657869742030\n",
+                          out, sizeof(out)) < 0 ||
+        parse_exec_id_line(out, &exec_id) < 0) {
+        dump_excerpt("private exec conflict start", out);
+        goto out;
+    }
+    snprintf(req, sizeof(req), "EXEC ATTACH_CONFLICT %llu\n",
+             (unsigned long long)exec_id);
+    if (exec_request_test(control, req, out, sizeof(out)) < 0 ||
+        !strstr(out, "OK EXEC ATTACH_BUSY")) {
+        dump_excerpt("private exec attach conflict", out);
+        goto out;
+    }
+    stop_pid(host);
+    host = -1;
+    host = spawn_host(carrier, control, pty_arg, file_arg);
+    if (host <= 0 ||
+        wait_ready_layers(control, getenv("LMUX_SUP_IT_OUTER") ? 1 : 0,
+                          15000, out, sizeof(out)) < 0)
+        goto out;
+    snprintf(req, sizeof(req), "EXEC ATTACH %llu\n",
+             (unsigned long long)exec_id);
+    if (exec_request_test(control, req, out, sizeof(out)) < 0 ||
+        !strstr(out, "STATUS state=4") ||
+        !strstr(out, "\nDONE\n")) {
+        dump_excerpt("private exec reconnect after conflict", out);
+        goto out;
+    }
+
+    where = "signal process group";
+    snprintf(marker, sizeof(marker), "%s/pg-int", dir);
+    if (mkdir(marker, 0700) < 0 ||
+        hex_encode_cstr(marker, marker_hex, sizeof(marker_hex)) < 0)
+        goto out;
+    snprintf(req, sizeof(req), "EXEC START_DETACHED - %s %s %s %s\n",
+             self_hex, helper_hex, pgsig_hex, marker_hex);
+    if (exec_request_test(control, req, out, sizeof(out)) < 0 ||
+        parse_exec_id_line(out, &exec_id) < 0 ||
+        snprintf(marker2, sizeof(marker2), "%s/leader-ready", marker) <= 0 ||
+        wait_marker(marker2, 3000) < 0 ||
+        snprintf(marker2, sizeof(marker2), "%s/child-ready", marker) <= 0 ||
+        wait_marker(marker2, 3000) < 0) {
+        dump_excerpt("private exec signal start", out);
+        goto out;
+    }
+    snprintf(req, sizeof(req), "EXEC SIGNAL %llu INT\n",
+             (unsigned long long)exec_id);
+    if (exec_request_test(control, req, out, sizeof(out)) < 0 ||
+        !strstr(out, "STATUS state=6")) {
+        dump_excerpt("private exec signal", out);
+        goto out;
+    }
+    snprintf(marker2, sizeof(marker2), "%s/leader-sigint", marker);
+    if (wait_marker(marker2, 3000) < 0)
+        goto out;
+    snprintf(marker2, sizeof(marker2), "%s/child-sigint", marker);
+    if (wait_marker(marker2, 3000) < 0)
+        goto out;
+    snprintf(req, sizeof(req), "EXEC ATTACH %llu\n",
+             (unsigned long long)exec_id);
+    if (exec_request_test(control, req, out, sizeof(out)) < 0 ||
+        !strstr(out, "STATUS state=4") ||
+        !strstr(out, "\nDONE\n")) {
+        dump_excerpt("private exec signal drain", out);
+        goto out;
+    }
+
+    where = "signal term and stale";
+    snprintf(marker, sizeof(marker), "%s/pg-term", dir);
+    if (mkdir(marker, 0700) < 0 ||
+        hex_encode_cstr(marker, marker_hex, sizeof(marker_hex)) < 0)
+        goto out;
+    snprintf(req, sizeof(req), "EXEC START_DETACHED - %s %s %s %s\n",
+             self_hex, helper_hex, pgsig_hex, marker_hex);
+    if (exec_request_test(control, req, out, sizeof(out)) < 0 ||
+        parse_exec_id_line(out, &exec_id) < 0 ||
+        snprintf(marker2, sizeof(marker2), "%s/leader-ready", marker) <= 0 ||
+        wait_marker(marker2, 3000) < 0 ||
+        snprintf(marker2, sizeof(marker2), "%s/child-ready", marker) <= 0 ||
+        wait_marker(marker2, 3000) < 0) {
+        dump_excerpt("private exec term start", out);
+        goto out;
+    }
+    snprintf(req, sizeof(req), "EXEC SIGNAL %llu TERM\n",
+             (unsigned long long)exec_id);
+    if (exec_request_test(control, req, out, sizeof(out)) < 0 ||
+        !strstr(out, "STATUS state=6")) {
+        dump_excerpt("private exec term", out);
+        goto out;
+    }
+    snprintf(marker2, sizeof(marker2), "%s/leader-sigterm", marker);
+    if (wait_marker(marker2, 3000) < 0)
+        goto out;
+    snprintf(marker2, sizeof(marker2), "%s/child-sigterm", marker);
+    if (wait_marker(marker2, 3000) < 0)
+        goto out;
+    snprintf(req, sizeof(req), "EXEC ATTACH %llu\n",
+             (unsigned long long)exec_id);
+    if (exec_request_test(control, req, out, sizeof(out)) < 0 ||
+        !strstr(out, "STATUS state=4") ||
+        !strstr(out, "\nDONE\n")) {
+        dump_excerpt("private exec term drain", out);
+        goto out;
+    }
+    snprintf(req, sizeof(req), "EXEC RELEASE %llu\n",
+             (unsigned long long)exec_id);
+    if (exec_request_test(control, req, out, sizeof(out)) < 0 ||
+        !strstr(out, "OK EXEC RELEASED")) {
+        dump_excerpt("private exec term release", out);
+        goto out;
+    }
+    snprintf(req, sizeof(req), "EXEC SIGNAL %llu TERM\n",
+             (unsigned long long)exec_id);
+    if (exec_request_test(control, req, out, sizeof(out)) < 0 ||
+        !strstr(out, "ERR EXEC remote status=2")) {
+        dump_excerpt("private exec stale signal", out);
+        goto out;
+    }
+
+    where = "stdout backpressure";
+    snprintf(marker, sizeof(marker), "%s/stdout-blocked", dir);
+    if (hex_encode_cstr(marker, marker_hex, sizeof(marker_hex)) < 0 ||
+        hex_encode_cstr("16384", total_hex, sizeof(total_hex)) < 0)
+        goto out;
+    snprintf(req, sizeof(req), "EXEC START_DETACHED - %s %s %s %s %s\n",
+             self_hex, helper_hex, bp_hex, marker_hex, total_hex);
+    if (exec_request_test(control, req, out, sizeof(out)) < 0 ||
+        parse_exec_id_line(out, &exec_id) < 0 ||
+        wait_marker(marker, 5000) < 0 ||
+        read_size_marker(marker, &bp_count) < 0 ||
+        bp_count == 0 || bp_count > 100000) {
+        dump_excerpt("private exec stdout bp start", out);
+        goto out;
+    }
+    snprintf(req, sizeof(req), "EXEC STATUS %llu\n",
+             (unsigned long long)exec_id);
+    if (exec_request_test(control, req, out, sizeof(out)) < 0 ||
+        (!strstr(out, "STATUS state=2") &&
+         !strstr(out, "STATUS state=3"))) {
+        dump_excerpt("private exec stdout bp status", out);
+        goto out;
+    }
+    if (!boot_info_ok(control, out, sizeof(out)))
+        goto out;
+    snprintf(req, sizeof(req), "EXEC ATTACH %llu\n",
+             (unsigned long long)exec_id);
+    if (exec_request_test(control, req, big, 320000) < 0 ||
+        verify_stdout_hex_pattern(big, bp_count) < 0) {
+        char diag[2048];
+        fprintf(stderr, "stdout bp expected=%llu host_received=%llu\n",
+                (unsigned long long)bp_count,
+                (unsigned long long)count_stdout_hex_bytes(big));
+        snprintf(req, sizeof(req), "EXEC STATUS %llu\n",
+                 (unsigned long long)exec_id);
+        if (exec_request_test(control, req, diag, sizeof(diag)) == 0)
+            dump_excerpt("private exec stdout bp post-status", diag);
+        dump_excerpt("private exec stdout bp attach", big);
+        goto out;
+    }
+
+    where = "stderr independent backpressure";
+    snprintf(req, sizeof(req), "EXEC START_DETACHED - %s %s %s\n",
+             self_hex, helper_hex, stderr_bp_hex);
+    if (exec_request_test(control, req, out, sizeof(out)) < 0 ||
+        parse_exec_id_line(out, &exec_id) < 0) {
+        dump_excerpt("private exec stderr bp start", out);
+        goto out;
+    }
+    snprintf(req, sizeof(req), "EXEC ATTACH_STDOUT_ONCE %llu\n",
+             (unsigned long long)exec_id);
+    if (exec_request_test(control, req, out, sizeof(out)) < 0 ||
+        !strstr(out, "5354444f55545f4f4b")) {
+        dump_excerpt("private exec stderr bp stdout", out);
+        goto out;
+    }
+    snprintf(req, sizeof(req), "EXEC RELEASE %llu\n",
+             (unsigned long long)exec_id);
+    if (exec_request_test(control, req, out, sizeof(out)) < 0 ||
+        !strstr(out, "OK EXEC RELEASED")) {
+        dump_excerpt("private exec stderr bp release", out);
+        goto out;
+    }
+
+    where = "stdin backpressure";
+    if (hex_encode_pattern(1500, stdin_hex, sizeof(stdin_hex)) < 0 ||
+        hex_encode_cstr("1500", total_hex, sizeof(total_hex)) < 0)
+        goto out;
+    snprintf(req, sizeof(req), "EXEC START - %s %s %s %s --stdin %s\n",
+             self_hex, helper_hex, stdin_delay_hex, total_hex, stdin_hex);
+    if (exec_request_test(control, req, out, sizeof(out)) < 0 ||
+        !strstr(out, "535444494e5f4f4b") ||
+        !strstr(out, "STATUS state=4") ||
+        !strstr(out, "\nDONE\n")) {
+        dump_excerpt("private exec stdin backpressure", out);
+        goto out;
+    }
+
+    where = "stdin epipe";
+    if (exec_request_test(control,
+                          "EXEC START - 2f62696e2f7368 2d63 6578656320303c262d3b20657869742030 --stdin 00010203040506070809\n",
+                          out, sizeof(out)) < 0 ||
+        !strstr(out, "OK EXEC") ||
+        !strstr(out, "STATUS state=4") ||
+        !strstr(out, "\nDONE\n")) {
+        dump_excerpt("private exec epipe", out);
+        goto out;
+    }
+
+    where = "exit drain repeated";
+    for (int rep = 0; rep < 5; rep++) {
+        if (exec_request_test(control,
+                              "EXEC START - 2f62696e2f7368 2d63 7072696e7466204f55545f5441494c3b207072696e7466204552525f5441494c203e26323b20657869742030\n",
+                              out, sizeof(out)) < 0 ||
+            !strstr(out, "4f55545f5441494c") ||
+            !strstr(out, "4552525f5441494c") ||
+            !strstr(out, "STATUS state=4") ||
+            !strstr(out, "\nDONE\n")) {
+            dump_excerpt("private exec repeated drain", out);
+            goto out;
+        }
+    }
+
+    where = "completed gc";
+    for (int gi = 0; gi < V2_EXEC_MAX_COMPLETED + 2; gi++) {
+        if (exec_request_test(control, "EXEC START - 2f62696e2f74727565\n",
+                              out, sizeof(out)) < 0 ||
+            parse_exec_id_line(out, &ids[gi]) < 0 ||
+            (gi > 0 && ids[gi] <= ids[gi - 1]) ||
+            !strstr(out, "STATUS state=4")) {
+            dump_excerpt("private exec gc start", out);
+            goto out;
+        }
+    }
+    snprintf(req, sizeof(req), "EXEC STATUS %llu\n",
+             (unsigned long long)ids[0]);
+    if (exec_request_test(control, req, out, sizeof(out)) < 0 ||
+        !strstr(out, "ERR EXEC remote status=2")) {
+        dump_excerpt("private exec gc evicted", out);
+        goto out;
+    }
+    snprintf(req, sizeof(req), "EXEC STATUS %llu\n",
+             (unsigned long long)ids[V2_EXEC_MAX_COMPLETED + 1]);
+    if (exec_request_test(control, req, out, sizeof(out)) < 0 ||
+        !strstr(out, "STATUS state=4")) {
+        dump_excerpt("private exec gc retained", out);
+        goto out;
+    }
+
+    where = "exit drain tail";
+    if (exec_request_test(control,
+                          "EXEC START - 2f62696e2f7368 2d63 693d303b207768696c65205b202469202d6c74203830205d3b20646f207072696e746620303132333435363738396162636465663b20693d242828692b3129293b20646f6e65\n",
+                          out, sizeof(out)) < 0 ||
+        !strstr(out, "30313233343536373839616263646566") ||
+        !strstr(out, "STATUS state=4") ||
+        !strstr(out, "\nDONE\n")) {
+        dump_excerpt("private exec exit drain", out);
+        goto out;
+    }
+
+    rc = 0;
+out:
+    if (rc)
+        fprintf(stderr, "private_exec_basic where=%s\n", where);
+    stop_pid(host);
+    stop_pid(sup);
+    free(big);
+    unlink(carrier);
+    unlink(control);
+    unlink(console);
+    unlink(file_sock);
+    rmdir(storage);
+    rmdir(dir);
+    return rc;
+}
+
+static char helper_marker_dir[512];
+static int helper_is_child;
+
+static void helper_write_marker(const char *name)
+{
+    char path[640];
+    int fd;
+    snprintf(path, sizeof(path), "%s/%s", helper_marker_dir, name);
+    fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    if (fd >= 0) {
+        (void)write(fd, "1\n", 2);
+        close(fd);
+    }
+}
+
+static void helper_signal_handler(int sig)
+{
+    if (sig == SIGINT)
+        helper_write_marker(helper_is_child ? "child-sigint" : "leader-sigint");
+    else if (sig == SIGTERM)
+        helper_write_marker(helper_is_child ? "child-sigterm" : "leader-sigterm");
+    _exit(128 + sig);
+}
+
+static int exec_helper_pgsig(const char *dir)
+{
+    pid_t child;
+    if (strlen(dir) >= sizeof(helper_marker_dir))
+        return 2;
+    strcpy(helper_marker_dir, dir);
+    signal(SIGINT, helper_signal_handler);
+    signal(SIGTERM, helper_signal_handler);
+    child = fork();
+    if (child < 0)
+        return 2;
+    if (child == 0) {
+        helper_is_child = 1;
+        signal(SIGINT, helper_signal_handler);
+        signal(SIGTERM, helper_signal_handler);
+        helper_write_marker("child-ready");
+        for (;;)
+            pause();
+    }
+    helper_write_marker("leader-ready");
+    for (;;)
+        pause();
+}
+
+static int exec_helper_stdout_bp(const char *marker, size_t total)
+{
+    static const char pat[] = "0123456789abcdef";
+    size_t pos = 0;
+    int marked = 0;
+#ifdef F_SETPIPE_SZ
+    (void)fcntl(STDOUT_FILENO, F_SETPIPE_SZ, 4096);
+#endif
+    if (test_set_nonblock(STDOUT_FILENO) < 0)
+        return 2;
+    while (pos < total) {
+        char buf[512];
+        size_t i, n = sizeof(buf);
+        ssize_t w;
+        if (n > total - pos)
+            n = total - pos;
+        for (i = 0; i < n; i++)
+            buf[i] = pat[(pos + i) & 15];
+        w = write(STDOUT_FILENO, buf, n);
+        if (w > 0) {
+            pos += (size_t)w;
+            continue;
+        }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (!marked) {
+                int fd = open(marker, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+                if (fd >= 0) {
+                    char tmp[64];
+                    int len = snprintf(tmp, sizeof(tmp), "%llu\n",
+                                       (unsigned long long)pos);
+                    if (len > 0)
+                        (void)write(fd, tmp, (size_t)len);
+                    close(fd);
+                }
+                marked = 1;
+            }
+            return 0;
+        }
+        if (w < 0 && errno == EINTR)
+            continue;
+        return 3;
+    }
+    return marked ? 0 : 4;
+}
+
+static int exec_helper_stderr_bp(void)
+{
+    pid_t err_child, out_child;
+    err_child = fork();
+    if (err_child < 0)
+        return 2;
+    if (err_child == 0) {
+        char buf[512];
+        memset(buf, 'E', sizeof(buf));
+        for (;;) {
+            ssize_t w = write(STDERR_FILENO, buf, sizeof(buf));
+            if (w < 0 && errno != EINTR)
+                _exit(0);
+        }
+    }
+    out_child = fork();
+    if (out_child < 0)
+        return 2;
+    if (out_child == 0) {
+        usleep(200000);
+        (void)write(STDOUT_FILENO, "STDOUT_OK", 9);
+        _exit(0);
+    }
+    for (;;)
+        pause();
+}
+
+static int exec_helper_stdin_delay(size_t total)
+{
+    size_t got = 0;
+    usleep(300000);
+    while (got < total) {
+        uint8_t buf[256];
+        ssize_t r = read(STDIN_FILENO, buf, sizeof(buf));
+        if (r > 0) {
+            ssize_t i;
+            for (i = 0; i < r; i++) {
+                if (buf[i] != (uint8_t)((got + (size_t)i) & 255))
+                    return 3;
+            }
+            got += (size_t)r;
+            continue;
+        }
+        if (r == 0)
+            break;
+        if (errno == EINTR)
+            continue;
+        return 4;
+    }
+    if (got != total)
+        return 5;
+    if (read(STDIN_FILENO, &(uint8_t){0}, 1) != 0)
+        return 6;
+    (void)write(STDOUT_FILENO, "STDIN_OK", 8);
+    return 0;
+}
+
+static int exec_helper_main(int argc, char **argv)
+{
+    if (argc >= 4 && strcmp(argv[2], "pgsig") == 0)
+        return exec_helper_pgsig(argv[3]);
+    if (argc >= 5 && strcmp(argv[2], "stdout-bp") == 0)
+        return exec_helper_stdout_bp(argv[3], (size_t)strtoull(argv[4], NULL, 10));
+    if (argc >= 3 && strcmp(argv[2], "stderr-bp") == 0)
+        return exec_helper_stderr_bp();
+    if (argc >= 4 && strcmp(argv[2], "stdin-delay") == 0)
+        return exec_helper_stdin_delay((size_t)strtoull(argv[3], NULL, 10));
+    return 2;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc >= 2 && strcmp(argv[1], "--exec-helper") == 0)
+        return exec_helper_main(argc, argv);
     signal(SIGPIPE, SIG_IGN);
     if (invalid_storage_root_test())
         return 1;
@@ -4725,6 +5465,7 @@ int main(void)
         outer_upload_fault_test(OUTER_FAULT_BOOT_BAD_CRC) ||
         outer_deploy_confirm_fault_test(OUTER_FAULT_BOOT_CONFIRM_RESP_BAD_CRC) ||
         outer_deploy_confirm_fault_test(OUTER_FAULT_BOOT_CONFIRM_REQ_BAD_CRC) ||
+        private_exec_basic_test() ||
         supervisor_install_restart_shortcut_test() ||
         host_first_startup_test() || integration_test())
         return 1;

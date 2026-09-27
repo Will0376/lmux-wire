@@ -121,23 +121,19 @@ void v2_pty_supervise(struct v2_app *a, struct v2_service services[V2_MAX_SERVIC
 {
     int i;
     long long t = v2_now_ms();
-    for (;;) {
+    for (i = 0; i < V2_MAX_SERVICES; i++) {
+        struct v2_service *s = &services[i];
         int st;
-        pid_t pid = waitpid(-1, &st, WNOHANG);
-        if (pid <= 0)
-            break;
-        for (i = 0; i < V2_MAX_SERVICES; i++) {
-            struct v2_service *s = &services[i];
-            if (s->used && s->type == V2_SERVICE_PTY && s->child_pid == pid) {
+        pid_t pid;
+        if (s->used && s->type == V2_SERVICE_PTY && s->child_pid > 0) {
+            pid = waitpid(s->child_pid, &st, WNOHANG);
+            if (pid == s->child_pid) {
                 s->child_pid = 0;
                 s->respawn_at_ms = v2_now_ms() + 1000;
                 v2_pty_restore_baseline(s);
                 v2_app_log(a, 1, "lmux2 pty service %s child exited", s->name);
             }
         }
-    }
-    for (i = 0; i < V2_MAX_SERVICES; i++) {
-        struct v2_service *s = &services[i];
         if (s->used && s->type == V2_SERVICE_PTY && s->supervised &&
             s->child_pid <= 0 && (s->respawn_at_ms == 0 || t >= s->respawn_at_ms))
             v2_pty_spawn_child(a, s);

@@ -1,4 +1,5 @@
 #include "host.h"
+#include "services.h"
 #include "version.h"
 
 #include <errno.h>
@@ -43,6 +44,13 @@ static const char *yesno(int v)
 {
     return v ? "yes" : "no";
 }
+
+static void control_write_all(int fd, const char *buf, size_t len);
+static void control_printf(struct v2_host *h, const char *fmt, ...);
+static int exec_queue_record(struct v2_host *h, uint8_t type, uint8_t status,
+                             uint64_t exec_id, const uint8_t *payload,
+                             uint16_t len);
+static void exec_finish_error(struct v2_host *h, const char *msg);
 
 enum deploy_phase {
     DEPLOY_IDLE = 0,
@@ -125,6 +133,50 @@ static void digest_to_hex(const uint8_t digest[32], char out[65])
     out[64] = 0;
 }
 
+static int parse_hex_blob(const char *s, uint8_t *out, size_t cap, size_t *len)
+{
+    size_t n, i;
+    if (!s)
+        return -1;
+    n = strlen(s);
+    if (strcmp(s, "-") == 0) {
+        *len = 0;
+        return 0;
+    }
+    if ((n & 1) || n / 2 > cap)
+        return -1;
+    for (i = 0; i < n / 2; i++) {
+        int hi = hex_value((unsigned char)s[i * 2]);
+        int lo = hex_value((unsigned char)s[i * 2 + 1]);
+        if (hi < 0 || lo < 0)
+            return -1;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    *len = n / 2;
+    return 0;
+}
+
+static void control_write_hex_line(struct v2_host *h, const char *prefix,
+                                   const uint8_t *buf, size_t len)
+{
+    static const char hexdigits[] = "0123456789abcdef";
+    char out[256];
+    size_t i, off = 0;
+    control_printf(h, "%s", prefix);
+    while (off < len) {
+        size_t n = len - off;
+        if (n > (sizeof(out) / 2))
+            n = sizeof(out) / 2;
+        for (i = 0; i < n; i++) {
+            out[i * 2] = hexdigits[buf[off + i] >> 4];
+            out[i * 2 + 1] = hexdigits[buf[off + i] & 15];
+        }
+        control_write_all(h->control_fd, out, n * 2);
+        off += n;
+    }
+    control_printf(h, "\n");
+}
+
 static void control_write_all(int fd, const char *buf, size_t len)
 {
     size_t off = 0;
@@ -175,6 +227,36 @@ static uint64_t next_boot_request_id(struct v2_host *h)
 
 static void clear_boot_pending(struct v2_host *h);
 static void deploy_clear(struct v2_host *h);
+
+#define EXEC_MODE_START_WAIT 1
+#define EXEC_MODE_START_DETACH 2
+#define EXEC_MODE_ATTACH_WAIT 3
+#define EXEC_MODE_STATUS_ONCE 4
+#define EXEC_MODE_SIGNAL_ONCE 5
+#define EXEC_MODE_RELEASE_ONCE 6
+#define EXEC_MODE_ATTACH_CONFLICT 7
+#define EXEC_MODE_ATTACH_STDOUT_ONCE 8
+
+static void exec_clear(struct v2_host *h)
+{
+    h->exec_active = 0;
+    h->exec_phase = 0;
+    h->exec_status_pending = 0;
+    h->exec_close_pending = 0;
+    h->exec_close_stdin_after_drain = 0;
+    h->exec_done_seen = 0;
+    h->exec_service_id = 0;
+    h->exec_id = 0;
+    h->exec_control_stream = 0;
+    h->exec_stdin_stream = 0;
+    h->exec_stdout_stream = 0;
+    h->exec_stderr_stream = 0;
+    h->exec_conflict_stream = 0;
+    h->exec_ctl_in_len = 0;
+    h->exec_ctl_out_len = h->exec_ctl_out_pos = 0;
+    h->exec_next_status_ms = 0;
+    h->exec_stdin_len = h->exec_stdin_pos = 0;
+}
 
 static void upload_clear(struct v2_host *h)
 {
@@ -426,7 +508,8 @@ void v2_host_control_accept(struct v2_host *h)
     if (fd < 0)
         return;
     (void)v2_host_set_nonblock(fd);
-    if (h->boot_pending || h->boot_upload_active || h->deploy_active) {
+    if (h->boot_pending || h->boot_upload_active || h->deploy_active ||
+        h->exec_active) {
         (void)write(fd, "ERR busy\n", 9);
         close(fd);
         return;
@@ -447,13 +530,15 @@ static void write_host_services(struct v2_host *h)
                        s->name, (unsigned long long)s->id,
                        v2_service_type_name(s->type),
                        s->listen_fd >= 0 ? "ready" : "none",
-                       s->listen_path[0] ? s->listen_path :
+                       s->internal ? "-" : (s->listen_path[0] ? s->listen_path :
                        (s->host_path[0] ? s->host_path :
-                        (s->target_path[0] ? s->target_path : "-")),
+                        (s->target_path[0] ? s->target_path : "-"))),
                        s->pending_fd >= 0 ? "yes" : "no",
                        (unsigned long long)s->pending_event_token,
                        (unsigned long long)s->active_stream_id,
                        (unsigned long long)s->last_stream_id);
+        if (s->internal)
+            control_printf(h, " internal=yes");
         if (s->type == V2_SERVICE_PTY)
             control_printf(h, " target_child=not-reported");
         control_printf(h, "\n");
@@ -580,11 +665,12 @@ void v2_host_status_write(struct v2_app *a, struct v2_host *h,
                    (unsigned long long)st->conn->last_sent_max_data,
                    yesno(st->conn->max_data_dirty), st->conn->outq_len);
     if (st->role == LMUX2_ROLE_TARGET) {
-        control_printf(h, "factories: unix-rendezvous pty file\n");
+        control_printf(h, "factories: unix-rendezvous pty file exec\n");
     } else {
-        control_printf(h, "factories: unix-rendezvous=%s pty=%s file=%s desired_sent=%s\n",
+        control_printf(h, "factories: unix-rendezvous=%s pty=%s file=%s exec=%s desired_sent=%s\n",
                        yesno(h->factory_unix), yesno(h->factory_pty),
-                       yesno(h->factory_file), yesno(h->desired_sent));
+                       yesno(h->factory_file), yesno(h->factory_exec),
+                       yesno(h->desired_sent));
     }
     control_printf(h, "desired_services:\n");
     for (i = 0; i < V2_MAX_DESIRED; i++) {
@@ -724,6 +810,211 @@ static void control_handle_line(struct v2_app *a, struct v2_host *h,
         h->deploy_deadline_ms = v2_now_ms() + 120000;
         if (queue_update_status(a, h) < 0) {
             finish_deploy_error(h, "queue");
+            return;
+        }
+        return;
+    } else if (strcmp(cmd, "EXEC") == 0) {
+        char *save = NULL;
+        char *tok = strtok_r(line, " \t\r\n", &save);
+        char *subcmd = strtok_r(NULL, " \t\r\n", &save);
+        char *cwd_hex;
+        uint8_t payload[V2_EXEC_CTL_BUF_MAX - 12];
+        uint8_t cwd[V2_PATH_MAX];
+        uint8_t args[V2_EXEC_ARG_BYTES_MAX];
+        uint16_t arg_lens[V2_EXEC_ARG_MAX];
+        size_t cwd_len = 0, args_len = 0, off, n;
+        uint8_t argc = 0;
+        unsigned long long exec_id_ull;
+        (void)tok;
+        if (!subcmd) {
+            (void)write(h->control_fd, "ERR bad EXEC\n", 13);
+            v2_host_close_fd(&h->control_fd);
+            return;
+        }
+        if (h->boot_pending || h->boot_upload_active || h->deploy_active ||
+            h->exec_active) {
+            (void)write(h->control_fd, "ERR busy\n", 9);
+            v2_host_close_fd(&h->control_fd);
+            return;
+        }
+        if (strcmp(subcmd, "ATTACH") == 0 ||
+            strcmp(subcmd, "ATTACH_CONFLICT") == 0 ||
+            strcmp(subcmd, "ATTACH_STDOUT_ONCE") == 0) {
+            char *id_s = strtok_r(NULL, " \t\r\n", &save);
+            char *opt;
+            if (!id_s || sscanf(id_s, "%llu", &exec_id_ull) != 1 ||
+                exec_id_ull == 0) {
+                (void)write(h->control_fd, "ERR bad EXEC id\n", 16);
+                v2_host_close_fd(&h->control_fd);
+                return;
+            }
+            exec_clear(h);
+            h->exec_active = 1;
+            if (strcmp(subcmd, "ATTACH_CONFLICT") == 0)
+                h->exec_phase = EXEC_MODE_ATTACH_CONFLICT;
+            else if (strcmp(subcmd, "ATTACH_STDOUT_ONCE") == 0)
+                h->exec_phase = EXEC_MODE_ATTACH_STDOUT_ONCE;
+            else
+                h->exec_phase = EXEC_MODE_ATTACH_WAIT;
+            h->exec_id = (uint64_t)exec_id_ull;
+            while ((opt = strtok_r(NULL, " \t\r\n", &save)) != NULL) {
+                if (h->exec_phase == EXEC_MODE_ATTACH_CONFLICT ||
+                    h->exec_phase == EXEC_MODE_ATTACH_STDOUT_ONCE) {
+                    (void)write(h->control_fd, "ERR bad EXEC attach\n", 20);
+                    v2_host_close_fd(&h->control_fd);
+                    exec_clear(h);
+                    return;
+                }
+                if (strcmp(opt, "--stdin") == 0) {
+                    char *stdin_hex = strtok_r(NULL, " \t\r\n", &save);
+                    if (!stdin_hex ||
+                        parse_hex_blob(stdin_hex, h->exec_stdin,
+                                       sizeof(h->exec_stdin),
+                                       &h->exec_stdin_len) < 0) {
+                        (void)write(h->control_fd, "ERR bad EXEC stdin\n", 19);
+                        v2_host_close_fd(&h->control_fd);
+                        exec_clear(h);
+                        return;
+                    }
+                    h->exec_close_stdin_after_drain = 1;
+                } else if (strcmp(opt, "--close-stdin") == 0) {
+                    h->exec_close_stdin_after_drain = 1;
+                } else {
+                    (void)write(h->control_fd, "ERR bad EXEC attach\n", 20);
+                    v2_host_close_fd(&h->control_fd);
+                    exec_clear(h);
+                    return;
+                }
+            }
+            return;
+        }
+        if (strcmp(subcmd, "STATUS") == 0 ||
+            strcmp(subcmd, "SIGNAL") == 0 ||
+            strcmp(subcmd, "RELEASE") == 0) {
+            char *id_s = strtok_r(NULL, " \t\r\n", &save);
+            uint8_t sig_payload[1];
+            uint8_t rec = V2_EXEC_REC_STATUS;
+            uint16_t len = 0;
+            if (!id_s || sscanf(id_s, "%llu", &exec_id_ull) != 1 ||
+                exec_id_ull == 0) {
+                (void)write(h->control_fd, "ERR bad EXEC id\n", 16);
+                v2_host_close_fd(&h->control_fd);
+                return;
+            }
+            exec_clear(h);
+            h->exec_active = 1;
+            h->exec_id = (uint64_t)exec_id_ull;
+            h->exec_phase = EXEC_MODE_STATUS_ONCE;
+            if (strcmp(subcmd, "SIGNAL") == 0) {
+                char *sig = strtok_r(NULL, " \t\r\n", &save);
+                if (!sig) {
+                    (void)write(h->control_fd, "ERR bad EXEC signal\n", 20);
+                    v2_host_close_fd(&h->control_fd);
+                    exec_clear(h);
+                    return;
+                }
+                if (strcmp(sig, "INT") == 0)
+                    sig_payload[0] = V2_EXEC_SIG_INT;
+                else if (strcmp(sig, "TERM") == 0)
+                    sig_payload[0] = V2_EXEC_SIG_TERM;
+                else if (strcmp(sig, "KILL") == 0)
+                    sig_payload[0] = V2_EXEC_SIG_KILL;
+                else if (strcmp(sig, "HUP") == 0)
+                    sig_payload[0] = V2_EXEC_SIG_HUP;
+                else {
+                    (void)write(h->control_fd, "ERR bad EXEC signal\n", 20);
+                    v2_host_close_fd(&h->control_fd);
+                    exec_clear(h);
+                    return;
+                }
+                rec = V2_EXEC_REC_SIGNAL;
+                len = 1;
+                h->exec_phase = EXEC_MODE_SIGNAL_ONCE;
+            } else if (strcmp(subcmd, "RELEASE") == 0) {
+                rec = V2_EXEC_REC_RELEASE;
+                h->exec_phase = EXEC_MODE_RELEASE_ONCE;
+            }
+            if (strtok_r(NULL, " \t\r\n", &save) != NULL ||
+                exec_queue_record(h, rec, 0, h->exec_id,
+                                  len ? sig_payload : NULL, len) < 0) {
+                (void)write(h->control_fd, "ERR bad EXEC\n", 13);
+                v2_host_close_fd(&h->control_fd);
+                exec_clear(h);
+            }
+            return;
+        }
+        cwd_hex = strtok_r(NULL, " \t\r\n", &save);
+        if ((strcmp(subcmd, "START") != 0 &&
+             strcmp(subcmd, "START_DETACHED") != 0) || !cwd_hex) {
+            (void)write(h->control_fd, "ERR bad EXEC\n", 13);
+            v2_host_close_fd(&h->control_fd);
+            return;
+        }
+        if (parse_hex_blob(cwd_hex, cwd, sizeof(cwd), &cwd_len) < 0) {
+            (void)write(h->control_fd, "ERR bad EXEC cwd\n", 17);
+            v2_host_close_fd(&h->control_fd);
+            return;
+        }
+        exec_clear(h);
+        memset(h->exec_stdin, 0, sizeof(h->exec_stdin));
+        h->exec_stdin_len = h->exec_stdin_pos = 0;
+        while ((tok = strtok_r(NULL, " \t\r\n", &save)) != NULL) {
+            if (strcmp(tok, "--stdin") == 0) {
+                char *stdin_hex = strtok_r(NULL, " \t\r\n", &save);
+                if (!stdin_hex ||
+                    parse_hex_blob(stdin_hex, h->exec_stdin,
+                                   sizeof(h->exec_stdin),
+                                   &h->exec_stdin_len) < 0 ||
+                    strtok_r(NULL, " \t\r\n", &save) != NULL) {
+                    (void)write(h->control_fd, "ERR bad EXEC stdin\n", 19);
+                    v2_host_close_fd(&h->control_fd);
+                    return;
+                }
+                break;
+            }
+            if (argc >= V2_EXEC_ARG_MAX ||
+                parse_hex_blob(tok, args + args_len,
+                               sizeof(args) - args_len, &n) < 0 ||
+                n == 0 || n > UINT16_MAX) {
+                (void)write(h->control_fd, "ERR bad EXEC argv\n", 18);
+                v2_host_close_fd(&h->control_fd);
+                return;
+            }
+            arg_lens[argc++] = (uint16_t)n;
+            args_len += n;
+        }
+        if (argc == 0 || cwd_len > UINT16_MAX) {
+            (void)write(h->control_fd, "ERR bad EXEC argv\n", 18);
+            v2_host_close_fd(&h->control_fd);
+            return;
+        }
+        off = 0;
+        lmux_put_le16(payload + off, (uint16_t)cwd_len);
+        off += 2;
+        payload[off++] = argc;
+        payload[off++] = 0;
+        if (off + (size_t)argc * 2 + cwd_len + args_len > sizeof(payload)) {
+            (void)write(h->control_fd, "ERR EXEC too-large\n", 19);
+            v2_host_close_fd(&h->control_fd);
+            return;
+        }
+        for (n = 0; n < argc; n++) {
+            lmux_put_le16(payload + off, arg_lens[n]);
+            off += 2;
+        }
+        if (cwd_len) {
+            memcpy(payload + off, cwd, cwd_len);
+            off += cwd_len;
+        }
+        memcpy(payload + off, args, args_len);
+        off += args_len;
+        h->exec_active = 1;
+        h->exec_phase = strcmp(subcmd, "START_DETACHED") == 0 ?
+            EXEC_MODE_START_DETACH : EXEC_MODE_START_WAIT;
+        h->exec_close_stdin_after_drain = h->exec_phase == EXEC_MODE_START_WAIT;
+        if (exec_queue_record(h, V2_EXEC_REC_START, 0, 0,
+                              payload, (uint16_t)off) < 0) {
+            exec_finish_error(h, "queue");
             return;
         }
         return;
@@ -931,6 +1222,12 @@ void v2_host_control_on_hup(struct v2_host *h)
         h->control_in_len = 0;
         return;
     }
+    if (h->exec_active) {
+        v2_host_close_fd(&h->control_fd);
+        h->control_in_len = 0;
+        exec_clear(h);
+        return;
+    }
     v2_host_close_fd(&h->control_fd);
 }
 
@@ -987,6 +1284,12 @@ void v2_host_control_outer_down(struct v2_host *h)
         finish_deploy_error(h, "link-down");
         return;
     }
+    if (h->exec_active) {
+        if (h->control_fd >= 0)
+            control_printf(h, "ERR EXEC link-down\n");
+        v2_host_close_fd(&h->control_fd);
+        exec_clear(h);
+    }
     if (h->boot_pending)
         finish_boot_error(h, "link-down");
     else if (h->boot_upload_active) {
@@ -1009,9 +1312,414 @@ void v2_host_control_check_timeout(struct v2_host *h)
     }
 }
 
+static int exec_queue_record(struct v2_host *h, uint8_t type, uint8_t status,
+                             uint64_t exec_id, const uint8_t *payload,
+                             uint16_t len)
+{
+    if (12u + len > sizeof(h->exec_ctl_out) ||
+        h->exec_ctl_out_len != h->exec_ctl_out_pos)
+        return -1;
+    h->exec_ctl_out[0] = type;
+    h->exec_ctl_out[1] = status;
+    lmux_put_le16(h->exec_ctl_out + 2, len);
+    lmux_put_le64(h->exec_ctl_out + 4, exec_id);
+    if (len)
+        memcpy(h->exec_ctl_out + 12, payload, len);
+    h->exec_ctl_out_len = 12u + len;
+    h->exec_ctl_out_pos = 0;
+    return 0;
+}
+
+static int exec_parse_record(struct v2_host *h, struct v2_exec_record *r)
+{
+    if (h->exec_ctl_in_len < 12)
+        return 0;
+    r->type = h->exec_ctl_in[0];
+    r->status = h->exec_ctl_in[1];
+    r->length = lmux_get_le16(h->exec_ctl_in + 2);
+    r->exec_id = lmux_get_le64(h->exec_ctl_in + 4);
+    if (r->length > sizeof(h->exec_ctl_in) - 12)
+        return -1;
+    if (h->exec_ctl_in_len < 12u + r->length)
+        return 0;
+    r->payload = h->exec_ctl_in + 12;
+    return 1;
+}
+
+static void exec_consume_record(struct v2_host *h, uint16_t len)
+{
+    size_t n = 12u + len;
+    if (n < h->exec_ctl_in_len)
+        memmove(h->exec_ctl_in, h->exec_ctl_in + n, h->exec_ctl_in_len - n);
+    h->exec_ctl_in_len -= n;
+}
+
+static void exec_finish_error(struct v2_host *h, const char *msg)
+{
+    if (h->control_fd >= 0)
+        control_printf(h, "ERR EXEC %s\n", msg);
+    v2_host_close_fd(&h->control_fd);
+    exec_clear(h);
+}
+
+static void exec_finish_done(struct v2_host *h)
+{
+    if (h->control_fd >= 0)
+        control_printf(h, "DONE\n");
+    v2_host_close_fd(&h->control_fd);
+    exec_clear(h);
+}
+
+static void exec_close_lmux_streams(struct v2_app *a, struct v2_host *h)
+{
+    if (h->exec_control_stream)
+        (void)v2_runtime_close_stream(a, h->exec_control_stream);
+    if (h->exec_stdin_stream)
+        (void)v2_runtime_close_stream(a, h->exec_stdin_stream);
+    if (h->exec_stdout_stream)
+        (void)v2_runtime_close_stream(a, h->exec_stdout_stream);
+    if (h->exec_stderr_stream)
+        (void)v2_runtime_close_stream(a, h->exec_stderr_stream);
+}
+
+static void exec_finish_done_remote(struct v2_app *a, struct v2_host *h)
+{
+    exec_close_lmux_streams(a, h);
+    exec_finish_done(h);
+}
+
+static void exec_finish_simple(struct v2_app *a, struct v2_host *h)
+{
+    exec_close_lmux_streams(a, h);
+    v2_host_close_fd(&h->control_fd);
+    exec_clear(h);
+}
+
+static int exec_status_done(uint8_t st)
+{
+    return st == V2_EXEC_STATUS_DONE || st == V2_EXEC_STATUS_START_FAILED;
+}
+
+static int exec_mode_has_attachment(const struct v2_host *h)
+{
+    return h->exec_phase == EXEC_MODE_START_WAIT ||
+        h->exec_phase == EXEC_MODE_ATTACH_WAIT ||
+        h->exec_phase == EXEC_MODE_ATTACH_CONFLICT ||
+        h->exec_phase == EXEC_MODE_ATTACH_STDOUT_ONCE;
+}
+
+static int exec_output_stream_drained(struct v2_app *a, uint64_t stream_id)
+{
+    int st;
+    if (!stream_id)
+        return 0;
+    st = v2_runtime_stream_state(a, stream_id);
+    return st == LMUX2_STREAM_REMOTE_CLOSED ||
+        st == LMUX2_STREAM_TERMINAL ||
+        st == LMUX2_STREAM_RESET ||
+        st == LMUX2_STREAM_UNUSED;
+}
+
+static int exec_attachment_drained(struct v2_app *a, const struct v2_host *h)
+{
+    if (!exec_mode_has_attachment(h) ||
+        h->exec_phase == EXEC_MODE_ATTACH_CONFLICT)
+        return 1;
+    if (h->exec_phase == EXEC_MODE_ATTACH_STDOUT_ONCE)
+        return exec_output_stream_drained(a, h->exec_stdout_stream);
+    return exec_output_stream_drained(a, h->exec_stdout_stream) &&
+        exec_output_stream_drained(a, h->exec_stderr_stream);
+}
+
+static void exec_handle_record(struct v2_app *a, struct v2_host *h,
+                               const struct v2_exec_record *r)
+{
+    if (r->type == V2_EXEC_REC_ERROR) {
+        control_printf(h, "ERR EXEC remote status=%u exec_id=%llu\n",
+                       r->status, (unsigned long long)r->exec_id);
+        exec_close_lmux_streams(a, h);
+        v2_host_close_fd(&h->control_fd);
+        exec_clear(h);
+        return;
+    }
+    if ((r->type == V2_EXEC_REC_START_REPLY ||
+         r->type == V2_EXEC_REC_STATUS_REPLY) && r->length >= 16) {
+        uint8_t state = r->payload[0];
+        uint8_t fail = r->payload[1];
+        uint16_t errnum = lmux_get_le16(r->payload + 2);
+        uint32_t exit_code = lmux_get_le32(r->payload + 4);
+        uint32_t term_signal = lmux_get_le32(r->payload + 8);
+        h->exec_status_pending = 0;
+        if (r->type == V2_EXEC_REC_START_REPLY) {
+            h->exec_id = r->exec_id;
+            control_printf(h, "OK EXEC exec_id=%llu stdin_len=%llu\n",
+                           (unsigned long long)h->exec_id,
+                           (unsigned long long)h->exec_stdin_len);
+            if (state == V2_EXEC_STATUS_START_FAILED) {
+                control_printf(h, "STATUS state=START_FAILED fail=%u errno=%u exit=%u signal=%u\n",
+                               fail, errnum, exit_code, term_signal);
+                exec_finish_done_remote(a, h);
+                return;
+            }
+            if (h->exec_phase == EXEC_MODE_START_DETACH) {
+                control_printf(h, "DETACHED\n");
+                exec_finish_simple(a, h);
+                return;
+            }
+        }
+        control_printf(h, "STATUS state=%u fail=%u errno=%u exit=%u signal=%u stdin_closed=%u stdout_eof=%u stderr_eof=%u reaped=%u",
+                       state, fail, errnum, exit_code, term_signal,
+                       r->payload[12], r->payload[13], r->payload[14],
+                       r->payload[15]);
+        if (r->length >= 64) {
+            control_printf(h, " stdout_child=%llu stdout_lmux=%llu stdout_pending=%llu stderr_child=%llu stderr_lmux=%llu stderr_pending=%llu",
+                           (unsigned long long)lmux_get_le64(r->payload + 16),
+                           (unsigned long long)lmux_get_le64(r->payload + 24),
+                           (unsigned long long)lmux_get_le64(r->payload + 32),
+                           (unsigned long long)lmux_get_le64(r->payload + 40),
+                           (unsigned long long)lmux_get_le64(r->payload + 48),
+                           (unsigned long long)lmux_get_le64(r->payload + 56));
+        }
+        control_printf(h, "\n");
+        if (h->exec_phase == EXEC_MODE_STATUS_ONCE ||
+            h->exec_phase == EXEC_MODE_SIGNAL_ONCE) {
+            exec_finish_simple(a, h);
+            return;
+        }
+        if (exec_status_done(state)) {
+            if (exec_mode_has_attachment(h) &&
+                h->exec_phase != EXEC_MODE_ATTACH_CONFLICT) {
+                h->exec_done_seen = 1;
+                if (!exec_attachment_drained(a, h))
+                    return;
+            }
+            exec_finish_done_remote(a, h);
+            return;
+        }
+    } else if (r->type == V2_EXEC_REC_STATUS_REPLY && r->length == 0 &&
+               h->exec_phase == EXEC_MODE_RELEASE_ONCE) {
+        h->exec_status_pending = 0;
+        control_printf(h, "OK EXEC RELEASED exec_id=%llu\n",
+                       (unsigned long long)r->exec_id);
+        exec_finish_simple(a, h);
+        return;
+    }
+}
+
+static void exec_drain_control_rx(struct v2_app *a, struct v2_host *h)
+{
+    while (h->exec_control_stream &&
+           h->exec_ctl_in_len < sizeof(h->exec_ctl_in)) {
+        size_t n = v2_runtime_stream_read(a, h->exec_control_stream,
+                                          h->exec_ctl_in + h->exec_ctl_in_len,
+                                          sizeof(h->exec_ctl_in) - h->exec_ctl_in_len);
+        if (!n)
+            break;
+        h->exec_ctl_in_len += n;
+    }
+    for (;;) {
+        struct v2_exec_record r;
+        int rc = exec_parse_record(h, &r);
+        if (rc < 0) {
+            exec_finish_error(h, "bad-record");
+            return;
+        }
+        if (rc == 0)
+            return;
+        exec_handle_record(a, h, &r);
+        if (!h->exec_active)
+            return;
+        exec_consume_record(h, r.length);
+    }
+}
+
+static void exec_pump_control_tx(struct v2_app *a, struct v2_host *h)
+{
+    if (!h->exec_control_stream ||
+        !v2_runtime_stream_is_open(a, h->exec_control_stream))
+        return;
+    while (h->exec_ctl_out_pos < h->exec_ctl_out_len &&
+           v2_runtime_stream_tx_len(a, h->exec_control_stream) < LMUX2_STREAM_TX_CAP) {
+        size_t n = h->exec_ctl_out_len - h->exec_ctl_out_pos;
+        size_t w = v2_runtime_stream_write(a, h->exec_control_stream,
+                                           h->exec_ctl_out + h->exec_ctl_out_pos, n);
+        if (!w)
+            break;
+        h->exec_ctl_out_pos += w;
+    }
+    if (h->exec_ctl_out_pos == h->exec_ctl_out_len)
+        h->exec_ctl_out_pos = h->exec_ctl_out_len = 0;
+}
+
+static size_t exec_read_output_stream(struct v2_app *a, struct v2_host *h,
+                                      uint64_t stream_id, const char *prefix)
+{
+    uint8_t buf[256];
+    size_t n, total = 0;
+    while (stream_id && (n = v2_runtime_stream_read(a, stream_id,
+                                                   buf, sizeof(buf))) > 0) {
+        control_write_hex_line(h, prefix, buf, n);
+        total += n;
+    }
+    return total;
+}
+
+static void exec_pump_stdin(struct v2_app *a, struct v2_host *h)
+{
+    if (!h->exec_stdin_stream ||
+        !v2_runtime_stream_is_open(a, h->exec_stdin_stream))
+        return;
+    while (h->exec_stdin_pos < h->exec_stdin_len &&
+           v2_runtime_stream_tx_len(a, h->exec_stdin_stream) < LMUX2_STREAM_TX_CAP) {
+        size_t n = h->exec_stdin_len - h->exec_stdin_pos;
+        size_t w = v2_runtime_stream_write(a, h->exec_stdin_stream,
+                                           h->exec_stdin + h->exec_stdin_pos, n);
+        if (!w)
+            break;
+        h->exec_stdin_pos += w;
+    }
+}
+
+static struct v2_host_service *exec_host_service(struct v2_host *h)
+{
+    struct v2_host_service *s = v2_host_service_find_name(h->services, "__exec");
+    if (!s)
+        s = v2_host_service_find_name(h->services, "exec");
+    if (!s || s->type != V2_SERVICE_EXEC || !s->id)
+        return NULL;
+    return s;
+}
+
+static void exec_tick(struct v2_app *a, struct v2_host *h,
+                      const struct v2_host_status *st)
+{
+    struct v2_host_service *s;
+    (void)st;
+    if (!h->exec_active)
+        return;
+    if (!v2_runtime_lmux_established(a)) {
+        exec_finish_error(h, "lmux-down");
+        return;
+    }
+    s = exec_host_service(h);
+    if (!s) {
+        if (v2_host_ensure_private_exec(a, h) < 0)
+            exec_finish_error(h, "service-unavailable");
+        return;
+    }
+    h->exec_service_id = s->id;
+    if (!h->exec_control_stream) {
+        if (v2_runtime_open_stream_token(a, h->exec_service_id, 0,
+                                         &h->exec_control_stream) < 0) {
+            exec_finish_error(h, "open-control");
+            return;
+        }
+        return;
+    }
+    exec_pump_control_tx(a, h);
+    if (h->exec_id && exec_mode_has_attachment(h)) {
+        if (exec_read_output_stream(a, h, h->exec_stdout_stream,
+                                    "STDOUT_HEX ") > 0 &&
+            h->exec_phase == EXEC_MODE_ATTACH_STDOUT_ONCE) {
+            exec_finish_simple(a, h);
+            return;
+        }
+        if (h->exec_phase != EXEC_MODE_ATTACH_STDOUT_ONCE)
+            exec_read_output_stream(a, h, h->exec_stderr_stream, "STDERR_HEX ");
+        exec_pump_stdin(a, h);
+    }
+    exec_drain_control_rx(a, h);
+    if (!h->exec_active)
+        return;
+    if (!v2_runtime_stream_is_open(a, h->exec_control_stream))
+        return;
+    if (h->exec_id && exec_mode_has_attachment(h) && !h->exec_stdout_stream) {
+        (void)v2_runtime_open_stream_token(a, h->exec_service_id,
+                                           v2_exec_stream_token(h->exec_id, V2_EXEC_ROLE_STDOUT),
+                                           &h->exec_stdout_stream);
+    }
+    if (h->exec_id && h->exec_phase != EXEC_MODE_ATTACH_CONFLICT &&
+        h->exec_phase != EXEC_MODE_ATTACH_STDOUT_ONCE &&
+        exec_mode_has_attachment(h) && !h->exec_stderr_stream) {
+        (void)v2_runtime_open_stream_token(a, h->exec_service_id,
+                                           v2_exec_stream_token(h->exec_id, V2_EXEC_ROLE_STDERR),
+                                           &h->exec_stderr_stream);
+    }
+    if (h->exec_id && exec_mode_has_attachment(h) &&
+        h->exec_close_stdin_after_drain &&
+        !h->exec_stdin_stream && !h->exec_close_pending) {
+        (void)v2_runtime_open_stream_token(a, h->exec_service_id,
+                                           v2_exec_stream_token(h->exec_id, V2_EXEC_ROLE_STDIN),
+                                           &h->exec_stdin_stream);
+    }
+    if (exec_mode_has_attachment(h)) {
+        if (exec_read_output_stream(a, h, h->exec_stdout_stream,
+                                    "STDOUT_HEX ") > 0 &&
+            h->exec_phase == EXEC_MODE_ATTACH_STDOUT_ONCE) {
+            exec_finish_simple(a, h);
+            return;
+        }
+        if (h->exec_phase != EXEC_MODE_ATTACH_CONFLICT &&
+            h->exec_phase != EXEC_MODE_ATTACH_STDOUT_ONCE)
+            exec_read_output_stream(a, h, h->exec_stderr_stream, "STDERR_HEX ");
+        exec_pump_stdin(a, h);
+    }
+    if (h->exec_done_seen && exec_attachment_drained(a, h)) {
+        exec_finish_done_remote(a, h);
+        return;
+    }
+    if (h->exec_phase == EXEC_MODE_ATTACH_CONFLICT && h->exec_stdout_stream &&
+        v2_runtime_stream_is_open(a, h->exec_stdout_stream)) {
+        int st;
+        if (!h->exec_conflict_stream) {
+            (void)v2_runtime_open_stream_token(a, h->exec_service_id,
+                                               v2_exec_stream_token(h->exec_id,
+                                                                    V2_EXEC_ROLE_STDOUT),
+                                               &h->exec_conflict_stream);
+            return;
+        }
+        st = v2_runtime_stream_state(a, h->exec_conflict_stream);
+        if (st == LMUX2_STREAM_OPEN || st == LMUX2_STREAM_REMOTE_CLOSED) {
+            exec_finish_error(h, "conflict-opened");
+            return;
+        }
+        if (st == LMUX2_STREAM_TERMINAL || st == LMUX2_STREAM_RESET ||
+            st == LMUX2_STREAM_UNUSED) {
+            if (h->control_fd >= 0)
+                control_printf(h, "OK EXEC ATTACH_BUSY exec_id=%llu\n",
+                               (unsigned long long)h->exec_id);
+            exec_finish_simple(a, h);
+            return;
+        }
+    }
+    if (h->exec_id && exec_mode_has_attachment(h) &&
+        h->exec_close_stdin_after_drain && h->exec_stdin_stream &&
+        h->exec_stdin_pos == h->exec_stdin_len &&
+        v2_runtime_stream_tx_len(a, h->exec_stdin_stream) == 0 &&
+        !h->exec_close_pending &&
+        h->exec_ctl_out_len == h->exec_ctl_out_pos) {
+        if (exec_queue_record(h, V2_EXEC_REC_CLOSE_STDIN, 0,
+                              h->exec_id, NULL, 0) == 0) {
+            h->exec_close_pending = 1;
+            h->exec_status_pending = 1;
+        }
+    }
+    if (h->exec_id && !h->exec_done_seen && !h->exec_status_pending &&
+        v2_now_ms() >= h->exec_next_status_ms &&
+        h->exec_ctl_out_len == h->exec_ctl_out_pos) {
+        if (exec_queue_record(h, V2_EXEC_REC_STATUS, 0,
+                              h->exec_id, NULL, 0) == 0) {
+            h->exec_status_pending = 1;
+            h->exec_next_status_ms = v2_now_ms() + 100;
+        }
+    }
+}
+
 short v2_host_control_poll_events(const struct v2_host *h)
 {
     if (h->control_fd < 0)
+        return 0;
+    if (h->exec_active)
         return 0;
     if (h->boot_upload_active && h->boot_pending)
         return 0;
@@ -1031,6 +1739,7 @@ void v2_host_control_tick(struct v2_app *a, struct v2_host *h,
         if (upload_queue_end(a, h) < 0)
             upload_fail(h, "queue");
     }
+    exec_tick(a, h, st);
     if (!h->deploy_active || h->boot_pending || h->boot_upload_active)
         return;
     if (h->deploy_deadline_ms > 0 && v2_now_ms() > h->deploy_deadline_ms) {
