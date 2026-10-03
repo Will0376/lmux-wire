@@ -236,15 +236,29 @@ static void deploy_clear(struct v2_host *h);
 #define EXEC_MODE_RELEASE_ONCE 6
 #define EXEC_MODE_ATTACH_CONFLICT 7
 #define EXEC_MODE_ATTACH_STDOUT_ONCE 8
+#define EXEC_MODE_INFO_ONCE 9
 
 static void exec_clear(struct v2_host *h)
 {
+    uint8_t stdin_keep[sizeof(h->exec_stdin)];
+    size_t stdin_keep_len = 0;
+    int keep_stdin_close = h->exec_close_stdin_after_drain ||
+        h->structured_exec_stdin_close_requested;
+    int keep_structured_stdin;
+    if (h->exec_structured && h->exec_stdin_pos < h->exec_stdin_len) {
+        stdin_keep_len = h->exec_stdin_len - h->exec_stdin_pos;
+        memcpy(stdin_keep, h->exec_stdin + h->exec_stdin_pos, stdin_keep_len);
+    }
+    v2_host_structured_on_exec_clear(h);
+    keep_structured_stdin = h->structured_exec_auto_reattach &&
+        !h->structured_exec_done && !h->structured_exec_lost;
     h->exec_active = 0;
     h->exec_phase = 0;
     h->exec_status_pending = 0;
     h->exec_close_pending = 0;
     h->exec_close_stdin_after_drain = 0;
     h->exec_done_seen = 0;
+    h->exec_structured = 0;
     h->exec_service_id = 0;
     h->exec_id = 0;
     h->exec_control_stream = 0;
@@ -256,6 +270,14 @@ static void exec_clear(struct v2_host *h)
     h->exec_ctl_out_len = h->exec_ctl_out_pos = 0;
     h->exec_next_status_ms = 0;
     h->exec_stdin_len = h->exec_stdin_pos = 0;
+    if (keep_structured_stdin) {
+        if (stdin_keep_len) {
+            memcpy(h->exec_stdin, stdin_keep, stdin_keep_len);
+            h->exec_stdin_len = stdin_keep_len;
+        }
+        h->exec_close_stdin_after_drain = keep_stdin_close;
+        h->structured_exec_stdin_close_requested = keep_stdin_close;
+    }
 }
 
 static void upload_clear(struct v2_host *h)
@@ -509,7 +531,7 @@ void v2_host_control_accept(struct v2_host *h)
         return;
     (void)v2_host_set_nonblock(fd);
     if (h->boot_pending || h->boot_upload_active || h->deploy_active ||
-        h->exec_active) {
+        (h->exec_active && !h->exec_structured)) {
         (void)write(fd, "ERR busy\n", 9);
         close(fd);
         return;
@@ -1222,7 +1244,7 @@ void v2_host_control_on_hup(struct v2_host *h)
         h->control_in_len = 0;
         return;
     }
-    if (h->exec_active) {
+    if (h->exec_active && !h->exec_structured) {
         v2_host_close_fd(&h->control_fd);
         h->control_in_len = 0;
         exec_clear(h);
@@ -1285,6 +1307,11 @@ void v2_host_control_outer_down(struct v2_host *h)
         return;
     }
     if (h->exec_active) {
+        if (h->exec_structured) {
+            v2_host_structured_on_outer_down(h);
+            exec_clear(h);
+            return;
+        }
         if (h->control_fd >= 0)
             control_printf(h, "ERR EXEC link-down\n");
         v2_host_close_fd(&h->control_fd);
@@ -1356,6 +1383,20 @@ static void exec_consume_record(struct v2_host *h, uint16_t len)
 
 static void exec_finish_error(struct v2_host *h, const char *msg)
 {
+    if (h->exec_structured) {
+        uint8_t p[260];
+        size_t n = strlen(msg);
+        if (n > sizeof(p) - 13)
+            n = sizeof(p) - 13;
+        lmux_put_le64(p, h->structured_exec_ref);
+        lmux_put_le32(p + 8, LMUX_HC2_E_INTERNAL);
+        memcpy(p + 12, msg, n);
+        (void)v2_host_structured_queue_exec_frame(h, LMUX_HC2_ERROR,
+                                                  h->structured_exec_req_id,
+                                                  p, (uint32_t)(12 + n));
+        exec_clear(h);
+        return;
+    }
     if (h->control_fd >= 0)
         control_printf(h, "ERR EXEC %s\n", msg);
     v2_host_close_fd(&h->control_fd);
@@ -1364,6 +1405,10 @@ static void exec_finish_error(struct v2_host *h, const char *msg)
 
 static void exec_finish_done(struct v2_host *h)
 {
+    if (h->exec_structured) {
+        exec_clear(h);
+        return;
+    }
     if (h->control_fd >= 0)
         control_printf(h, "DONE\n");
     v2_host_close_fd(&h->control_fd);
@@ -1400,6 +1445,44 @@ static int exec_status_done(uint8_t st)
     return st == V2_EXEC_STATUS_DONE || st == V2_EXEC_STATUS_START_FAILED;
 }
 
+static int exec_queue_structured_state(struct v2_host *h, uint16_t frame_type,
+                                       uint64_t request_id,
+                                       uint8_t state, uint8_t fail,
+                                       uint16_t errnum,
+                                       uint32_t exit_code,
+                                       uint32_t term_signal,
+                                       const uint8_t *payload,
+                                       uint16_t payload_len)
+{
+    uint8_t p[80];
+    uint32_t flags = 0;
+    if (payload_len >= 16) {
+        if (payload[12])
+            flags |= 1u;
+        if (payload[13])
+            flags |= 2u;
+        if (payload[14])
+            flags |= 4u;
+        if (payload[15])
+            flags |= 8u;
+    }
+    lmux_put_le64(p, h->structured_exec_ref);
+    lmux_put_le64(p + 8, h->exec_id ? h->exec_id : h->structured_exec_id);
+    p[16] = state;
+    p[17] = fail;
+    lmux_put_le16(p + 18, errnum);
+    lmux_put_le32(p + 20, exit_code);
+    lmux_put_le32(p + 24, term_signal);
+    lmux_put_le32(p + 28, flags);
+    if (payload_len >= 64) {
+        memcpy(p + 32, payload + 16, 48);
+        return v2_host_structured_queue_exec_frame(h, frame_type, request_id,
+                                                   p, sizeof(p));
+    }
+    return v2_host_structured_queue_exec_frame(h, frame_type, request_id,
+                                               p, 32);
+}
+
 static int exec_mode_has_attachment(const struct v2_host *h)
 {
     return h->exec_phase == EXEC_MODE_START_WAIT ||
@@ -1434,7 +1517,63 @@ static int exec_attachment_drained(struct v2_app *a, const struct v2_host *h)
 static void exec_handle_record(struct v2_app *a, struct v2_host *h,
                                const struct v2_exec_record *r)
 {
+    if (r->type == V2_EXEC_REC_INFO_REPLY && r->status == V2_EXEC_OK &&
+        r->length >= 8 && h->exec_structured &&
+        h->exec_phase == EXEC_MODE_INFO_ONCE) {
+        v2_host_structured_on_exec_info(h, lmux_get_le64(r->payload));
+        if (h->structured_exec_active && !h->structured_exec_done &&
+            !h->structured_exec_lost && h->structured_exec_incarnation &&
+            h->structured_exec_incarnation != h->structured_known_exec_incarnation) {
+            exec_close_lmux_streams(a, h);
+            v2_host_structured_check_exec_incarnation(h);
+            exec_clear(h);
+            return;
+        }
+        if (h->structured_exec_active && !h->structured_exec_done &&
+            !h->structured_exec_lost && h->structured_exec_auto_reattach &&
+            h->structured_exec_id &&
+            h->structured_exec_incarnation == h->structured_known_exec_incarnation) {
+            h->exec_id = h->structured_exec_id;
+            h->structured_exec_req_id = 0;
+            h->structured_exec_auto_reattach = 0;
+            h->exec_phase = EXEC_MODE_START_WAIT;
+            h->exec_status_pending = 1;
+            if (exec_queue_record(h, V2_EXEC_REC_STATUS, 0,
+                                  h->exec_id, NULL, 0) < 0)
+                exec_finish_error(h, "reattach-queue");
+            return;
+        }
+        exec_finish_simple(a, h);
+        return;
+    }
     if (r->type == V2_EXEC_REC_ERROR) {
+        if (h->exec_structured) {
+            uint8_t p[20];
+            uint32_t code = r->status == V2_EXEC_E_NOT_FOUND ?
+                LMUX_HC2_E_NOT_FOUND : (r->status == V2_EXEC_E_BUSY ?
+                LMUX_HC2_E_BUSY : LMUX_HC2_E_INTERNAL);
+            if (r->status == V2_EXEC_E_NOT_FOUND && h->structured_exec_req_id == 0) {
+                uint8_t lost[12];
+                lmux_put_le64(lost, h->structured_exec_ref);
+                lmux_put_le32(lost + 8, LMUX_HC2_E_STALE_TARGET);
+                (void)v2_host_structured_queue_exec_frame(h, LMUX_HC2_EXEC_LOST,
+                                                          0, lost, sizeof(lost));
+                h->structured_exec_lost = 1;
+                h->structured_exec_active = 0;
+                exec_close_lmux_streams(a, h);
+                exec_clear(h);
+                return;
+            }
+            lmux_put_le64(p, h->structured_exec_ref);
+            lmux_put_le32(p + 8, code);
+            lmux_put_le64(p + 12, r->exec_id);
+            (void)v2_host_structured_queue_exec_frame(h, LMUX_HC2_ERROR,
+                                                      h->structured_exec_req_id,
+                                                      p, sizeof(p));
+            exec_close_lmux_streams(a, h);
+            exec_clear(h);
+            return;
+        }
         control_printf(h, "ERR EXEC remote status=%u exec_id=%llu\n",
                        r->status, (unsigned long long)r->exec_id);
         exec_close_lmux_streams(a, h);
@@ -1452,6 +1591,19 @@ static void exec_handle_record(struct v2_app *a, struct v2_host *h,
         h->exec_status_pending = 0;
         if (r->type == V2_EXEC_REC_START_REPLY) {
             h->exec_id = r->exec_id;
+            h->structured_exec_id = r->exec_id;
+            if (h->exec_structured) {
+                (void)exec_queue_structured_state(h, LMUX_HC2_EXEC_STARTED,
+                                                  h->structured_exec_req_id,
+                                                  state, fail, errnum,
+                                                  exit_code, term_signal,
+                                                  r->payload, r->length);
+                if (state == V2_EXEC_STATUS_START_FAILED) {
+                    exec_finish_done_remote(a, h);
+                    return;
+                }
+                goto after_status_print;
+            }
             control_printf(h, "OK EXEC exec_id=%llu stdin_len=%llu\n",
                            (unsigned long long)h->exec_id,
                            (unsigned long long)h->exec_stdin_len);
@@ -1467,6 +1619,14 @@ static void exec_handle_record(struct v2_app *a, struct v2_host *h,
                 return;
             }
         }
+        if (h->exec_structured) {
+            (void)exec_queue_structured_state(h, LMUX_HC2_EXEC_STATE,
+                                              h->structured_exec_req_id,
+                                              state, fail, errnum,
+                                              exit_code, term_signal,
+                                              r->payload, r->length);
+            goto after_status_print;
+        }
         control_printf(h, "STATUS state=%u fail=%u errno=%u exit=%u signal=%u stdin_closed=%u stdout_eof=%u stderr_eof=%u reaped=%u",
                        state, fail, errnum, exit_code, term_signal,
                        r->payload[12], r->payload[13], r->payload[14],
@@ -1481,6 +1641,7 @@ static void exec_handle_record(struct v2_app *a, struct v2_host *h,
                            (unsigned long long)lmux_get_le64(r->payload + 56));
         }
         control_printf(h, "\n");
+after_status_print:
         if (h->exec_phase == EXEC_MODE_STATUS_ONCE ||
             h->exec_phase == EXEC_MODE_SIGNAL_ONCE) {
             exec_finish_simple(a, h);
@@ -1499,6 +1660,17 @@ static void exec_handle_record(struct v2_app *a, struct v2_host *h,
     } else if (r->type == V2_EXEC_REC_STATUS_REPLY && r->length == 0 &&
                h->exec_phase == EXEC_MODE_RELEASE_ONCE) {
         h->exec_status_pending = 0;
+        if (h->exec_structured) {
+            uint8_t p[16];
+            lmux_put_le64(p, h->structured_exec_ref);
+            lmux_put_le64(p + 8, r->exec_id);
+            (void)v2_host_structured_queue_exec_frame(h, LMUX_HC2_EXEC_STATE,
+                                                      h->structured_exec_req_id,
+                                                      p, sizeof(p));
+            h->structured_exec_active = 0;
+            exec_finish_simple(a, h);
+            return;
+        }
         control_printf(h, "OK EXEC RELEASED exec_id=%llu\n",
                        (unsigned long long)r->exec_id);
         exec_finish_simple(a, h);
@@ -1554,8 +1726,24 @@ static void exec_pump_control_tx(struct v2_app *a, struct v2_host *h)
 static size_t exec_read_output_stream(struct v2_app *a, struct v2_host *h,
                                       uint64_t stream_id, const char *prefix)
 {
-    uint8_t buf[256];
+    uint8_t buf[512];
     size_t n, total = 0;
+    if (h->exec_structured) {
+        uint16_t type = strcmp(prefix, "STDERR_HEX ") == 0 ?
+            LMUX_HC2_EXEC_STDERR : LMUX_HC2_EXEC_STDOUT;
+        while (stream_id &&
+               v2_host_structured_can_queue(h, (uint32_t)(8 + sizeof(buf)))) {
+            n = v2_runtime_stream_read(a, stream_id, buf + 8, sizeof(buf) - 8);
+            if (!n)
+                break;
+            lmux_put_le64(buf, h->structured_exec_ref);
+            if (v2_host_structured_queue_exec_frame(h, type, 0, buf,
+                                                    (uint32_t)(8 + n)) < 0)
+                break;
+            total += n;
+        }
+        return total;
+    }
     while (stream_id && (n = v2_runtime_stream_read(a, stream_id,
                                                    buf, sizeof(buf))) > 0) {
         control_write_hex_line(h, prefix, buf, n);
@@ -1598,6 +1786,11 @@ static void exec_tick(struct v2_app *a, struct v2_host *h,
     if (!h->exec_active)
         return;
     if (!v2_runtime_lmux_established(a)) {
+        if (h->exec_structured) {
+            v2_host_structured_on_outer_down(h);
+            exec_clear(h);
+            return;
+        }
         exec_finish_error(h, "lmux-down");
         return;
     }
@@ -1610,8 +1803,15 @@ static void exec_tick(struct v2_app *a, struct v2_host *h,
     h->exec_service_id = s->id;
     if (!h->exec_control_stream) {
         if (v2_runtime_open_stream_token(a, h->exec_service_id, 0,
-                                         &h->exec_control_stream) < 0) {
-            exec_finish_error(h, "open-control");
+                                         &h->exec_control_stream) < 0)
+            return;
+        return;
+    }
+    if (!v2_runtime_stream_is_open(a, h->exec_control_stream)) {
+        int cs = v2_runtime_stream_state(a, h->exec_control_stream);
+        if (cs == LMUX2_STREAM_TERMINAL || cs == LMUX2_STREAM_RESET ||
+            cs == LMUX2_STREAM_UNUSED) {
+            h->exec_control_stream = 0;
             return;
         }
         return;
@@ -1631,8 +1831,6 @@ static void exec_tick(struct v2_app *a, struct v2_host *h,
     exec_drain_control_rx(a, h);
     if (!h->exec_active)
         return;
-    if (!v2_runtime_stream_is_open(a, h->exec_control_stream))
-        return;
     if (h->exec_id && exec_mode_has_attachment(h) && !h->exec_stdout_stream) {
         (void)v2_runtime_open_stream_token(a, h->exec_service_id,
                                            v2_exec_stream_token(h->exec_id, V2_EXEC_ROLE_STDOUT),
@@ -1646,7 +1844,8 @@ static void exec_tick(struct v2_app *a, struct v2_host *h,
                                            &h->exec_stderr_stream);
     }
     if (h->exec_id && exec_mode_has_attachment(h) &&
-        h->exec_close_stdin_after_drain &&
+        (h->exec_close_stdin_after_drain ||
+         h->exec_stdin_pos < h->exec_stdin_len) &&
         !h->exec_stdin_stream && !h->exec_close_pending) {
         (void)v2_runtime_open_stream_token(a, h->exec_service_id,
                                            v2_exec_stream_token(h->exec_id, V2_EXEC_ROLE_STDIN),
@@ -1696,13 +1895,9 @@ static void exec_tick(struct v2_app *a, struct v2_host *h,
         h->exec_close_stdin_after_drain && h->exec_stdin_stream &&
         h->exec_stdin_pos == h->exec_stdin_len &&
         v2_runtime_stream_tx_len(a, h->exec_stdin_stream) == 0 &&
-        !h->exec_close_pending &&
-        h->exec_ctl_out_len == h->exec_ctl_out_pos) {
-        if (exec_queue_record(h, V2_EXEC_REC_CLOSE_STDIN, 0,
-                              h->exec_id, NULL, 0) == 0) {
-            h->exec_close_pending = 1;
-            h->exec_status_pending = 1;
-        }
+        !h->exec_close_pending) {
+        (void)v2_runtime_close_stream(a, h->exec_stdin_stream);
+        h->exec_close_pending = 1;
     }
     if (h->exec_id && !h->exec_done_seen && !h->exec_status_pending &&
         v2_now_ms() >= h->exec_next_status_ms &&

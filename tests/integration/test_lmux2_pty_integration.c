@@ -321,12 +321,13 @@ static int status_service_last_stream(const char *buf, const char *service,
     return -1;
 }
 
-static int wait_console_stream_id(const char *control, const char *service,
-                                  unsigned long long want_conn,
-                                  unsigned long long want_stream,
-                                  int timeout_ms)
+static int wait_console_stream_after(const char *control, const char *service,
+                                     unsigned long long want_conn,
+                                     unsigned long long prev_stream,
+                                     int timeout_ms,
+                                     unsigned long long *out_stream)
 {
-    char buf[4096], last[4096];
+    char buf[16384], last[16384];
     unsigned long long last_conn = 0, last_stream = 0;
     int last_conn_ok = 0, last_stream_ok = 0;
     long long end = now_ms() + timeout_ms;
@@ -336,8 +337,11 @@ static int wait_console_stream_id(const char *control, const char *service,
         if (read_status_snapshot(control, buf, sizeof(buf), 1000) == 0 &&
             status_u64_after(buf, "local_conn=", &conn) == 0 &&
             status_service_last_stream(buf, service, &stream) == 0 &&
-            conn == want_conn && stream == want_stream)
+            conn == want_conn && stream > prev_stream) {
+            if (out_stream)
+                *out_stream = stream;
             return 0;
+        }
         last_conn = conn;
         last_stream = stream;
         last_conn_ok = status_u64_after(buf, "local_conn=", &conn) == 0;
@@ -349,8 +353,8 @@ static int wait_console_stream_id(const char *control, const char *service,
         snprintf(last, sizeof(last), "%s", buf);
         usleep(50000);
     }
-    fprintf(stderr, "status missing %s local_conn=%llu last_stream=%llu parsed_conn=%s/%llu parsed_stream=%s/%llu:\n%s\n",
-            service, want_conn, want_stream,
+    fprintf(stderr, "status missing %s local_conn=%llu stream_after=%llu parsed_conn=%s/%llu parsed_stream=%s/%llu:\n%s\n",
+            service, want_conn, prev_stream,
             last_conn_ok ? "ok" : "bad", last_conn,
             last_stream_ok ? "ok" : "bad", last_stream, last);
     return -1;
@@ -432,8 +436,9 @@ static int integration_test(void)
     int fd1 = -1, fd2 = -1, rc = 1;
     int host_fd_base = -1, target_fd_base = -1;
     unsigned long long initial_conn = 0;
+    unsigned long long console1_stream = 0;
     long pid1 = -1, pid1_after = -1, pid2 = -1, pid1_respawn = -1;
-    char out[8192], status[4096];
+    char out[8192], status[16384];
     const char *where = "setup";
 
     if (!mkdtemp(dir))
@@ -490,14 +495,17 @@ static int integration_test(void)
         goto out;
     if (read_status_snapshot(control, status, sizeof(status), 3000) < 0 ||
         status_u64_after(status, "local_conn=", &initial_conn) < 0 ||
-        wait_console_stream_id(control, "console1", initial_conn, 1, 5000) < 0)
+        wait_console_stream_after(control, "console1", initial_conn, 0, 5000,
+                                  &console1_stream) < 0)
         goto out;
     where = "detach preserves shell";
     close(fd1);
     fd1 = wait_connect(c1, 5000);
     if (fd1 < 0)
         goto out;
-    if (wait_console_stream_id(control, "console1", initial_conn, 3, 5000) < 0)
+    if (wait_console_stream_after(control, "console1", initial_conn,
+                                  console1_stream, 5000,
+                                  &console1_stream) < 0)
         goto out;
     if (shell_cmd_expect(fd1, "printf 'P''ID1B:%s:%s\\n' \"$$\" \"$LMUX_STATE\"", "PID1B:", out, sizeof(out)) < 0)
         goto out;
@@ -509,14 +517,18 @@ static int integration_test(void)
     close(fd1);
     fd1 = wait_connect(c1, 5000);
     if (fd1 < 0 ||
-        wait_console_stream_id(control, "console1", initial_conn, 5, 5000) < 0 ||
+        wait_console_stream_after(control, "console1", initial_conn,
+                                  console1_stream, 5000,
+                                  &console1_stream) < 0 ||
         shell_cmd_expect(fd1, "printf 'P''ID1E:%s:%s\\n' \"$$\" \"$LMUX_STATE\"", "PID1E:", out, sizeof(out)) < 0 ||
         parse_pid_marker(out, "PID1E:") != pid1 || !strstr(out, ":alive"))
         goto out;
     close(fd1);
     fd1 = wait_connect(c1, 5000);
     if (fd1 < 0 ||
-        wait_console_stream_id(control, "console1", initial_conn, 7, 5000) < 0 ||
+        wait_console_stream_after(control, "console1", initial_conn,
+                                  console1_stream, 5000,
+                                  &console1_stream) < 0 ||
         shell_cmd_expect(fd1, "printf 'P''ID1F:%s:%s\\n' \"$$\" \"$LMUX_STATE\"", "PID1F:", out, sizeof(out)) < 0 ||
         parse_pid_marker(out, "PID1F:") != pid1 || !strstr(out, ":alive"))
         goto out;
@@ -547,6 +559,9 @@ static int integration_test(void)
         close(fd1);
         fd1 = wait_connect(c1, 5000);
         if (fd1 < 0 ||
+            wait_console_stream_after(control, "console1", initial_conn,
+                                      console1_stream, 5000,
+                                      &console1_stream) < 0 ||
             shell_cmd_expect(fd1, "printf 'C1''OK\\n'", "C1OK", out, sizeof(out)) < 0) {
             fprintf(stderr, "churn iteration failed: %d fd=%d\n", i, fd1);
             dump_excerpt("churn console1", out);
@@ -605,7 +620,8 @@ static int integration_test(void)
     }
     if (read_status_snapshot(control, status, sizeof(status), 5000) < 0 ||
         status_u64_after(status, "local_conn=", &initial_conn) < 0 ||
-        wait_console_stream_id(control, "console1", initial_conn, 1, 8000) < 0)
+        wait_console_stream_after(control, "console1", initial_conn, 0, 8000,
+                                  &console1_stream) < 0)
         goto out;
     if (shell_cmd_expect(fd1, "LMUX_STATE=alive; printf 'P''ID1R:%s\\n' \"$$\"", "PID1R:", out, sizeof(out)) < 0)
         goto out;

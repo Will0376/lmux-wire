@@ -953,6 +953,7 @@ static void invalidate_connection_runtime(struct v2_app *a)
 {
     int i, j;
     if (a->role == LMUX2_ROLE_HOST) {
+        v2_host_structured_on_outer_down(&a->host);
         v2_host_invalidate_remote(&a->host);
     } else {
         for (i = 0; i < V2_MAX_SERVICES; i++) {
@@ -1526,6 +1527,7 @@ static void run_loop(struct v2_app *a)
             fill_target_service_status(a);
             fill_host_status(a, &st);
             v2_host_control_tick(a, &a->host, &st);
+            v2_host_structured_tick(a, &a->host, &st);
         }
         (void)step_file_services(a);
         (void)step_exec_services(a);
@@ -1576,6 +1578,12 @@ static void run_loop(struct v2_app *a)
         if (a->host.control_fd >= 0)
             add_poll(pfds, kind, svc, bind, &n, a->host.control_fd,
                      v2_host_control_poll_events(&a->host), 7, -1, -1);
+        if (a->host.structured_listen_fd >= 0)
+            add_poll(pfds, kind, svc, bind, &n, a->host.structured_listen_fd,
+                     POLLIN, 11, -1, -1);
+        if (a->host.structured_fd >= 0)
+            add_poll(pfds, kind, svc, bind, &n, a->host.structured_fd,
+                     v2_host_structured_poll_events(&a->host), 12, -1, -1);
         if (a->worker_mode && a->supervisor_ctrl_fd >= 0)
             add_poll(pfds, kind, svc, bind, &n, a->supervisor_ctrl_fd, POLLIN, 9, -1, -1);
         for (i = 0; i < V2_MAX_SERVICES; i++) {
@@ -1758,6 +1766,14 @@ static void run_loop(struct v2_app *a)
                 int fd_kind = bind[i] % 10;
                 v2_exec_on_fd_event(a, &a->conn, s, exec_idx, fd_kind,
                                     pfds[i].revents);
+            } else if (kind[i] == 11) {
+                if (pfds[i].revents & POLLIN)
+                    v2_host_structured_accept(&a->host);
+            } else if (kind[i] == 12) {
+                struct v2_host_status st;
+                fill_target_service_status(a);
+                fill_host_status(a, &st);
+                v2_host_structured_service(a, &a->host, &st, pfds[i].revents);
             }
         }
         v2_unix_pair_unbound_target_streams(a, &a->conn, a->services);
@@ -1802,8 +1818,8 @@ static void usage(FILE *f)
 {
     fprintf(f,
             "lmuxd %s (%s)\n"
-            "Usage: lmuxd --role host|target --carrier PATH [--control PATH] [--unix NAME:HOST_SOCKET:TARGET_SOCKET] [--pty NAME:HOST_SOCKET:ARGV] [--file NAME:HOST_SOCKET] [--verbose]\n"
-            "       lmuxd --role host|target --carrier-fd FD [--control PATH] [--unix NAME:HOST_SOCKET:TARGET_SOCKET] [--pty NAME:HOST_SOCKET:ARGV] [--file NAME:HOST_SOCKET] [--verbose]\n"
+            "Usage: lmuxd --role host|target --carrier PATH [--control PATH] [--structured-control PATH] [--unix NAME:HOST_SOCKET:TARGET_SOCKET] [--pty NAME:HOST_SOCKET:ARGV] [--file NAME:HOST_SOCKET] [--verbose]\n"
+            "       lmuxd --role host|target --carrier-fd FD [--control PATH] [--structured-control PATH] [--unix NAME:HOST_SOCKET:TARGET_SOCKET] [--pty NAME:HOST_SOCKET:ARGV] [--file NAME:HOST_SOCKET] [--verbose]\n"
             "       lmuxd --role host|target --carrier-listen PATH|--carrier-connect PATH [test carrier]\n"
             "       lmuxd --role host --outer --carrier PATH [host options]\n"
             "       lmuxd --worker --carrier-fd FD --supervisor-control-fd FD [--verbose]\n"
@@ -1869,6 +1885,10 @@ int lmux2_runtime_main(int argc, char **argv)
             if (++i >= argc)
                 return usage(stderr), 1;
             a.host.control_path = argv[i];
+        } else if (strcmp(argv[i], "--structured-control") == 0) {
+            if (++i >= argc)
+                return usage(stderr), 1;
+            a.host.structured_path = argv[i];
         } else if (strcmp(argv[i], "--unix") == 0) {
             if (++i >= argc || v2_host_add_unix(&a.host, argv[i]) < 0)
                 return usage(stderr), 1;
@@ -1908,6 +1928,13 @@ int lmux2_runtime_main(int argc, char **argv)
     if (a.host.control_path) {
         if (v2_host_control_start(&a.host) < 0) {
             perror(a.host.control_path);
+            cleanup_app(&a);
+            return 1;
+        }
+    }
+    if (a.host.structured_path) {
+        if (v2_host_structured_start(&a.host) < 0) {
+            perror(a.host.structured_path);
             cleanup_app(&a);
             return 1;
         }

@@ -3,6 +3,7 @@
 
 #include "carrier.h"
 #include "boot_protocol.h"
+#include "host_control_structured.h"
 #include "link_endpoint.h"
 #include "lxf.h"
 #include "lmux2_core.h"
@@ -91,6 +92,52 @@ struct v2_host {
     int control_fd;
     char control_in[4096];
     size_t control_in_len;
+    const char *structured_path;
+    int structured_listen_fd;
+    int structured_fd;
+    int structured_created_path;
+    int structured_ready;
+    uint8_t structured_rx[LMUX_HC2_RX_CAP];
+    size_t structured_rx_len;
+    uint8_t structured_tx[LMUX_HC2_TX_CAP];
+    size_t structured_tx_len;
+    size_t structured_tx_pos;
+    uint64_t structured_next_ref;
+    uint64_t structured_known_exec_incarnation;
+    uint64_t structured_exec_ref;
+    uint64_t structured_exec_id;
+    uint64_t structured_exec_incarnation;
+    uint64_t structured_exec_req_id;
+    int structured_exec_info_pending;
+    int structured_exec_active;
+    int structured_exec_lost;
+    int structured_exec_lost_emitted;
+    int structured_exec_done;
+    int structured_exec_auto_reattach;
+    int structured_exec_stdin_close_requested;
+    uint64_t structured_next_file_op_id;
+    uint64_t structured_file_op_id;
+    uint64_t structured_file_req_id;
+    uint64_t structured_file_stream;
+    int structured_file_active;
+    int structured_file_kind;
+    int structured_file_phase;
+    int structured_file_fd;
+    uint64_t structured_file_expected;
+    uint64_t structured_file_count;
+    uint64_t structured_file_last_progress;
+    uint32_t structured_file_mode;
+    char structured_file_local_path[LXF_PATH_MAX];
+    char structured_file_target_path[LXF_PATH_MAX];
+    char structured_file_tmp_path[LXF_PATH_MAX];
+    struct sha256_ctx structured_file_sha;
+    uint8_t structured_file_digest[32];
+    uint8_t structured_file_in[LXF_MAX_RECORD];
+    size_t structured_file_in_len;
+    size_t structured_file_need_len;
+    uint8_t structured_file_out[LXF_MAX_RECORD];
+    size_t structured_file_out_len;
+    size_t structured_file_out_pos;
     int boot_pending;
     int boot_control_gone;
     uint16_t boot_opcode;
@@ -130,6 +177,7 @@ struct v2_host {
     int exec_close_pending;
     int exec_close_stdin_after_drain;
     int exec_done_seen;
+    int exec_structured;
     uint64_t exec_service_id;
     uint64_t exec_id;
     uint64_t exec_control_stream;
@@ -281,5 +329,26 @@ void v2_host_control_on_boot_response(struct v2_app *a, struct v2_host *h,
                                       uint16_t opcode,
                                       uint16_t status, uint64_t request_id,
                                       const uint8_t *body, uint32_t body_len);
+
+int v2_host_structured_start(struct v2_host *h);
+void v2_host_structured_accept(struct v2_host *h);
+short v2_host_structured_poll_events(const struct v2_host *h);
+void v2_host_structured_service(struct v2_app *a, struct v2_host *h,
+                                const struct v2_host_status *st, short revents);
+void v2_host_structured_tick(struct v2_app *a, struct v2_host *h,
+                             const struct v2_host_status *st);
+void v2_host_structured_on_exec_info(struct v2_host *h,
+                                     uint64_t exec_incarnation);
+void v2_host_structured_check_exec_incarnation(struct v2_host *h);
+short v2_host_structured_file_poll_events(const struct v2_host *h);
+void v2_host_structured_file_event(struct v2_app *a, struct v2_host *h,
+                                   short revents);
+int v2_host_structured_queue_exec_frame(struct v2_host *h, uint16_t type,
+                                        uint64_t request_id,
+                                        const uint8_t *payload,
+                                        uint32_t payload_len);
+int v2_host_structured_can_queue(struct v2_host *h, uint32_t payload_len);
+void v2_host_structured_on_exec_clear(struct v2_host *h);
+void v2_host_structured_on_outer_down(struct v2_host *h);
 
 #endif

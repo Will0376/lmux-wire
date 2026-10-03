@@ -50,7 +50,8 @@ rm -f \
 "$RUNDIR/console2.sock" \
 "$RUNDIR/gdb.sock" \
 "$RUNDIR/file.sock" \
-"$RUNDIR/control.sock"
+"$RUNDIR/control.sock" \
+"$RUNDIR/control-v2.sock"
 
 # Make host-side sockets connectable by the normal user.
 
@@ -61,6 +62,7 @@ nohup "$LMUXD" \
 --outer \
 --carrier "$CARRIER" \
 --control "$RUNDIR/control.sock" \
+--structured-control "$RUNDIR/control-v2.sock" \
 --pty console1:"$RUNDIR/console1.sock":/bin/sh \
 --pty console2:"$RUNDIR/console2.sock":/bin/sh \
 --unix gdb:"$RUNDIR/gdb.sock":/tmp/lmux-gdb.sock \

@@ -144,6 +144,19 @@ static void reset_stream(struct lmux2_stream *s)
     s->state = LMUX2_STREAM_UNUSED;
 }
 
+static int stream_slot_reclaimable(const struct lmux2_stream *s)
+{
+    if (s->state == LMUX2_STREAM_UNUSED)
+        return 1;
+    if (s->state == LMUX2_STREAM_TERMINAL && s->rx.len == 0 && s->tx.len == 0)
+        return 1;
+    if (s->local_close_sent && s->rx.len == 0 && s->tx.len == 0 &&
+        (s->state == LMUX2_STREAM_LOCAL_CLOSED ||
+         s->state == LMUX2_STREAM_REMOTE_CLOSED))
+        return 1;
+    return 0;
+}
+
 static void reset_transient(struct lmux2_conn *c)
 {
     int i;
@@ -219,9 +232,7 @@ static struct lmux2_stream *alloc_stream_slot(struct lmux2_conn *c)
 {
     int i;
     for (i = 0; i < LMUX2_CORE_MAX_STREAMS; i++) {
-        if (c->streams[i].state == LMUX2_STREAM_UNUSED ||
-            (c->streams[i].state == LMUX2_STREAM_TERMINAL &&
-             c->streams[i].rx.len == 0 && c->streams[i].tx.len == 0)) {
+        if (stream_slot_reclaimable(&c->streams[i])) {
             reset_stream(&c->streams[i]);
             return &c->streams[i];
         }

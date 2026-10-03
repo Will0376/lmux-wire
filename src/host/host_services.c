@@ -262,6 +262,11 @@ void v2_host_init(struct v2_host *h)
     memset(h, 0, sizeof(*h));
     h->control_listen_fd = -1;
     h->control_fd = -1;
+    h->structured_listen_fd = -1;
+    h->structured_fd = -1;
+    h->structured_next_ref = 1;
+    h->structured_next_file_op_id = 1;
+    h->structured_file_fd = -1;
     h->next_req_id = 0;
     h->boot_next_request_id = 1;
     int i, j;
@@ -302,6 +307,13 @@ void v2_host_cleanup(struct v2_host *h)
     v2_host_close_fd(&h->control_listen_fd);
     if (h->control_path)
         unlink(h->control_path);
+    v2_host_close_fd(&h->structured_fd);
+    v2_host_close_fd(&h->structured_file_fd);
+    if (h->structured_file_tmp_path[0])
+        unlink(h->structured_file_tmp_path);
+    v2_host_close_fd(&h->structured_listen_fd);
+    if (h->structured_path && h->structured_created_path)
+        unlink(h->structured_path);
 }
 
 int v2_host_add_unix(struct v2_host *h, const char *arg)
@@ -354,6 +366,7 @@ int v2_host_create_desired_services(struct v2_app *a, struct v2_host *h,
                                     uint64_t *next_service_id)
 {
     int i;
+    ensure_private_exec_desired(h);
     for (i = 0; i < V2_MAX_DESIRED; i++) {
         struct v2_desired *d = &h->desired[i];
         struct v2_host_service *s;

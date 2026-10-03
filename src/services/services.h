@@ -38,11 +38,13 @@ enum v2_exec_signal {
 };
 
 enum v2_exec_record_type {
+    V2_EXEC_REC_INFO = 0,
     V2_EXEC_REC_START = 1,
     V2_EXEC_REC_SIGNAL = 2,
     V2_EXEC_REC_CLOSE_STDIN = 3,
     V2_EXEC_REC_STATUS = 4,
     V2_EXEC_REC_RELEASE = 5,
+    V2_EXEC_REC_INFO_REPLY = 100,
     V2_EXEC_REC_START_REPLY = 101,
     V2_EXEC_REC_STATUS_REPLY = 102,
     V2_EXEC_REC_ERROR = 103
@@ -129,6 +131,7 @@ struct v2_exec_obj {
 };
 
 struct v2_exec_service_state {
+    uint64_t incarnation;
     uint64_t next_exec_id;
     unsigned long long next_completed_seq;
     uint64_t control_stream_id;

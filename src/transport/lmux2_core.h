@@ -6,7 +6,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define LMUX2_CORE_MAX_STREAMS 16
+#define LMUX2_CORE_MAX_STREAMS 32
 #define LMUX2_STREAM_RX_CAP 1024
 #define LMUX2_STREAM_TX_CAP 1024
 #define LMUX2_CONN_RX_CAP 4096

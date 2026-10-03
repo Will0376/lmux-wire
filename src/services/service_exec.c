@@ -78,6 +78,24 @@ static void exec_obj_close_streams(struct lmux2_conn *conn, struct v2_exec_obj *
     e->stdin_len = e->stdin_pos = 0;
 }
 
+static uint64_t exec_random_nonzero64(void)
+{
+    uint64_t v = 0;
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        if (read(fd, &v, sizeof(v)) != (ssize_t)sizeof(v))
+            v = 0;
+        close(fd);
+    }
+    if (!v)
+        v = ((uint64_t)(uint32_t)getpid() << 32) ^
+            (uint64_t)(uintptr_t)&v ^ (uint64_t)v2_now_ms() ^
+            0x65786563696e6349ULL;
+    if (!v)
+        v = 1;
+    return v;
+}
+
 static void exec_obj_kill_and_reap(struct v2_exec_obj *e)
 {
     int status;
@@ -135,6 +153,7 @@ void v2_exec_service_reset(struct v2_service *s)
         }
     }
     memset(&s->exec, 0, sizeof(s->exec));
+    s->exec.incarnation = exec_random_nonzero64();
     s->exec.next_exec_id = 1;
     s->exec.ctl_out_len = s->exec.ctl_out_pos = 0;
     exec_state_init_fds(&s->exec);
@@ -542,7 +561,12 @@ static int handle_control_record(struct v2_service *s,
                                  const struct v2_exec_record *r)
 {
     struct v2_exec_obj *e;
+    uint8_t info[8];
     switch (r->type) {
+    case V2_EXEC_REC_INFO:
+        lmux_put_le64(info, s->exec.incarnation);
+        return queue_control_record(s, V2_EXEC_REC_INFO_REPLY, V2_EXEC_OK,
+                                    0, info, sizeof(info));
     case V2_EXEC_REC_START:
         return handle_start(s, r);
     case V2_EXEC_REC_SIGNAL:
@@ -713,7 +737,8 @@ static void detach_dead_streams(struct v2_exec_obj *e, struct lmux2_conn *conn)
     if (e->stdin_stream_id) {
         st = lmux2_find_stream_const(conn, e->stdin_stream_id);
         if (!st || st->state == LMUX2_STREAM_TERMINAL ||
-            st->state == LMUX2_STREAM_RESET)
+            st->state == LMUX2_STREAM_RESET ||
+            (st->state == LMUX2_STREAM_REMOTE_CLOSED && e->stdin_fd < 0))
             e->stdin_stream_id = 0;
     }
     if (e->stdout_stream_id) {
@@ -757,9 +782,11 @@ static void pump_child_output(struct v2_exec_obj *e, struct lmux2_conn *conn,
     uint8_t *pending;
     size_t *pending_len, *pending_pos;
     uint8_t buf[256];
-    if (fd < 0 || !stream_id || *eof || !stream_can_send(conn, stream_id))
-        return;
-    if (fd == e->stdout_fd) {
+    int can_send = stream_id && stream_can_send(conn, stream_id);
+    int is_stdout = eof == &e->stdout_eof;
+    int actual_fd = is_stdout ? e->stdout_fd : e->stderr_fd;
+    (void)fd;
+    if (is_stdout) {
         pending = e->stdout_buf;
         pending_len = &e->stdout_len;
         pending_pos = &e->stdout_pos;
@@ -768,14 +795,14 @@ static void pump_child_output(struct v2_exec_obj *e, struct lmux2_conn *conn,
         pending_len = &e->stderr_len;
         pending_pos = &e->stderr_pos;
     }
-    while (*pending_pos < *pending_len &&
+    while (can_send && *pending_pos < *pending_len &&
            lmux2_stream_tx_len(conn, stream_id) < LMUX2_STREAM_TX_CAP) {
         size_t w = lmux2_stream_write(conn, stream_id,
                                       pending + *pending_pos,
                                       *pending_len - *pending_pos);
         if (!w)
             return;
-        if (fd == e->stdout_fd)
+        if (is_stdout)
             e->stdout_lmux_written_total += (unsigned long long)w;
         else
             e->stderr_lmux_written_total += (unsigned long long)w;
@@ -784,39 +811,53 @@ static void pump_child_output(struct v2_exec_obj *e, struct lmux2_conn *conn,
     if (*pending_pos < *pending_len)
         return;
     *pending_len = *pending_pos = 0;
-    while (lmux2_stream_tx_len(conn, stream_id) < LMUX2_STREAM_TX_CAP) {
-        size_t space = LMUX2_STREAM_TX_CAP - lmux2_stream_tx_len(conn, stream_id);
+    if (actual_fd < 0 || *eof) {
+        if (*eof && stream_id)
+            (void)lmux2_close_stream(conn, stream_id);
+        return;
+    }
+    while ((can_send && lmux2_stream_tx_len(conn, stream_id) < LMUX2_STREAM_TX_CAP) ||
+           (!can_send && *pending_len < V2_EXEC_OUTPUT_BUF_MAX)) {
+        size_t space = can_send ?
+            LMUX2_STREAM_TX_CAP - lmux2_stream_tx_len(conn, stream_id) :
+            V2_EXEC_OUTPUT_BUF_MAX - *pending_len;
         ssize_t r;
         size_t w;
         if (space > sizeof(buf))
             space = sizeof(buf);
         r = read(fd, buf, space);
         if (r > 0) {
-            if (fd == e->stdout_fd)
+            if (is_stdout)
                 e->stdout_child_read_total += (unsigned long long)r;
             else
                 e->stderr_child_read_total += (unsigned long long)r;
-            w = lmux2_stream_write(conn, stream_id, buf, (size_t)r);
-            if (fd == e->stdout_fd)
-                e->stdout_lmux_written_total += (unsigned long long)w;
-            else
-                e->stderr_lmux_written_total += (unsigned long long)w;
-            if (w < (size_t)r) {
-                size_t left = (size_t)r - w;
-                if (left > V2_EXEC_OUTPUT_BUF_MAX)
-                    left = V2_EXEC_OUTPUT_BUF_MAX;
-                memcpy(pending, buf + w, left);
-                *pending_len = left;
-                *pending_pos = 0;
+            if (can_send) {
+                w = lmux2_stream_write(conn, stream_id, buf, (size_t)r);
+                if (is_stdout)
+                    e->stdout_lmux_written_total += (unsigned long long)w;
+                else
+                    e->stderr_lmux_written_total += (unsigned long long)w;
+                if (w < (size_t)r) {
+                    size_t left = (size_t)r - w;
+                    if (left > V2_EXEC_OUTPUT_BUF_MAX)
+                        left = V2_EXEC_OUTPUT_BUF_MAX;
+                    memcpy(pending, buf + w, left);
+                    *pending_len = left;
+                    *pending_pos = 0;
+                    return;
+                }
+            } else {
+                memcpy(pending + *pending_len, buf, (size_t)r);
+                *pending_len += (size_t)r;
                 return;
             }
             continue;
         }
         if (r == 0) {
             *eof = 1;
-            if (fd == e->stdout_fd)
+            if (is_stdout)
                 close_fd(&e->stdout_fd);
-            else if (fd == e->stderr_fd)
+            else
                 close_fd(&e->stderr_fd);
             if (stream_id)
                 (void)lmux2_close_stream(conn, stream_id);
@@ -825,9 +866,9 @@ static void pump_child_output(struct v2_exec_obj *e, struct lmux2_conn *conn,
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
             return;
         *eof = 1;
-        if (fd == e->stdout_fd)
+        if (is_stdout)
             close_fd(&e->stdout_fd);
-        else if (fd == e->stderr_fd)
+        else
             close_fd(&e->stderr_fd);
         if (stream_id)
             (void)lmux2_close_stream(conn, stream_id);
@@ -939,7 +980,9 @@ static void maybe_done(struct v2_service *s, struct v2_exec_obj *e)
         e->status == V2_EXEC_STATUS_START_FAILED)
         return;
     if ((e->stdout_eof || e->stdout_fd < 0) &&
-        (e->stderr_eof || e->stderr_fd < 0)) {
+        (e->stderr_eof || e->stderr_fd < 0) &&
+        e->stdout_len == e->stdout_pos &&
+        e->stderr_len == e->stderr_pos) {
         e->status = V2_EXEC_STATUS_DONE;
         e->completed_seq = ++s->exec.next_completed_seq;
     }
@@ -990,16 +1033,18 @@ short v2_exec_fd_events(struct v2_app *a, struct lmux2_conn *conn,
     case V2_EXEC_FD_STDIN:
         return e->stdin_fd >= 0 && e->stdin_len > e->stdin_pos ? POLLOUT : 0;
     case V2_EXEC_FD_STDOUT:
-        return e->stdout_fd >= 0 && !e->stdout_eof && e->stdout_stream_id &&
-            e->stdout_len == e->stdout_pos &&
-            stream_can_send(conn, e->stdout_stream_id) &&
-            lmux2_stream_tx_len(conn, e->stdout_stream_id) < LMUX2_STREAM_TX_CAP ?
+        return e->stdout_fd >= 0 && !e->stdout_eof &&
+            e->stdout_len < V2_EXEC_OUTPUT_BUF_MAX &&
+            (!e->stdout_stream_id ||
+             (stream_can_send(conn, e->stdout_stream_id) &&
+              lmux2_stream_tx_len(conn, e->stdout_stream_id) < LMUX2_STREAM_TX_CAP)) ?
             POLLIN : 0;
     case V2_EXEC_FD_STDERR:
-        return e->stderr_fd >= 0 && !e->stderr_eof && e->stderr_stream_id &&
-            e->stderr_len == e->stderr_pos &&
-            stream_can_send(conn, e->stderr_stream_id) &&
-            lmux2_stream_tx_len(conn, e->stderr_stream_id) < LMUX2_STREAM_TX_CAP ?
+        return e->stderr_fd >= 0 && !e->stderr_eof &&
+            e->stderr_len < V2_EXEC_OUTPUT_BUF_MAX &&
+            (!e->stderr_stream_id ||
+             (stream_can_send(conn, e->stderr_stream_id) &&
+              lmux2_stream_tx_len(conn, e->stderr_stream_id) < LMUX2_STREAM_TX_CAP)) ?
             POLLIN : 0;
     case V2_EXEC_FD_ERR:
         return e->err_fd >= 0 ? POLLIN : 0;

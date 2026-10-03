@@ -115,7 +115,7 @@ Important lifecycle cases:
   stdin EOF unless an explicit `CLOSE_STDIN` operation has been accepted.
 - **LMUX connection recreation:** all LMUX streams are gone. Executions survive
   if the same worker survives. The host must re-discover/reconcile the exec
-  service and attach again by `exec_id`.
+  service, read the service incarnation, and attach again by `exec_id`.
 - **OUTER reconnect:** same as LMUX reconnect from the worker service point of
   view. OUTER is below LMUX and must not leak into exec semantics.
 - **Worker crash/replacement:** all executions are gone. Old `exec_id` values
@@ -139,8 +139,18 @@ Rules:
 - not a LMUX `service_id`;
 - not persistent across target reboot or worker replacement.
 
-Host state must bind every `exec_id` to the current worker incarnation marker.
-After worker replacement, all old handles are invalid even if a future worker
+The exec service exposes a nonzero random `u64 exec_incarnation` generated once
+when the worker-owned service is initialized. It is not persistent and is in a
+separate namespace from OUTER connection IDs, LMUX connection IDs, LMUX peer
+restart counters, LMS1 epochs, stream IDs, and MCP command tokens.
+
+```text
+same worker + fresh OUTER/LMUX => same exec_incarnation
+worker death/replacement       => new exec_incarnation
+```
+
+Host state must bind every `exec_id` to the current `exec_incarnation`. After
+worker replacement, all old handles are invalid even if a future worker
 allocates the same numeric value. P8 should avoid numeric reuse within an
 incarnation so stale-handle bugs are easier to catch.
 
@@ -349,16 +359,29 @@ serialized C structs.
 P8a record types:
 
 ```text
+INFO
 START
 SIGNAL
 CLOSE_STDIN
 STATUS
 RELEASE
 
+INFO_REPLY
 START_REPLY
 STATUS_REPLY
 ERROR
 ```
+
+`INFO_REPLY` returns:
+
+```text
+u64 exec_incarnation
+```
+
+encoded little-endian. The host must obtain this value after exec service
+reconciliation before deciding whether old execution references are eligible
+for automatic reattach. A mismatch means worker replacement, not a recoverable
+LMUX reconnect.
 
 P8a `START` payload:
 
