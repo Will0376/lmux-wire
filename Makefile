@@ -1,4 +1,5 @@
 HOST_CC ?= cc
+GO ?= go
 CROSS_COMPILE ?= arm-linux-gnueabi-
 TARGET_CC := $(CROSS_COMPILE)gcc
 TARGET_STRIP := $(CROSS_COMPILE)strip
@@ -25,6 +26,7 @@ TARGET_LDFLAGS := -static
 
 HOST_DIR := build/host
 TARGET_DIR := build/target
+GO_CACHE := $(abspath $(HOST_DIR)/go-cache)
 
 LMUX := $(SRC_DIR)/lmux.c
 LXF_SRC := $(SRC_DIR)/lxf.c
@@ -58,17 +60,18 @@ TEST_LMUX2_INTEGRATION := $(INTEGRATION_TEST_DIR)/test_lmux2_integration.c
 TEST_LMUX2_PTY_INTEGRATION := $(INTEGRATION_TEST_DIR)/test_lmux2_pty_integration.c
 TEST_LMUX2_FILE_INTEGRATION := $(INTEGRATION_TEST_DIR)/test_lmux2_file_integration.c
 TEST_SUPERVISOR_INTEGRATION := $(INTEGRATION_TEST_DIR)/test_supervisor_integration.c
+GO_SRC := go.mod $(shell find cmd internal -name '*.go' 2>/dev/null)
 VERSION_INPUTS := VERSION Makefile $(LMUX) $(LMUXD) $(TRANSPORT_HDRS) $(CARRIER_HDRS) $(SERVICES_HDRS) $(HOST_SUBSYS_HDRS) $(ZEROMUX_HDRS) $(SUPERVISOR_HDRS) $(LINK_HDRS) $(LXF_SRC) $(LXF_HDR) $(COMMON_SRC) $(LMUX2_SRC) $(CARRIER_SRC) $(SERVICES_SRC) $(HOST_SUBSYS_SRC) $(ZEROMUX_SRC) $(SUPERVISOR_SRC) $(LINK_SRC) $(LMUX2_RUNTIME_SRC) $(RUNTIME_HDRS) $(TEST_PROTOCOL) $(TEST_LMUX2) $(TEST_CARRIER) $(TEST_SUPERVISOR) $(TEST_LINK) $(TEST_ZEROMUX) $(TEST_LMUX2_INTEGRATION) $(TEST_LMUX2_PTY_INTEGRATION) $(TEST_LMUX2_FILE_INTEGRATION) $(TEST_SUPERVISOR_INTEGRATION) $(TEST_LMUX_CLIENT)
 
-.PHONY: all host target strip-target clean selftest new-build bump-version
+.PHONY: all host target strip-target clean selftest new-build bump-version go-test
 
 all: host target
 
-host: $(HOST_DIR)/lmuxd $(HOST_DIR)/lmux $(HOST_DIR)/test_protocol $(HOST_DIR)/test_lmux2 $(HOST_DIR)/test_carrier $(HOST_DIR)/test_supervisor $(HOST_DIR)/test_link $(HOST_DIR)/test_zeromux $(HOST_DIR)/test_lmux2_integration $(HOST_DIR)/test_lmux2_pty_integration $(HOST_DIR)/test_lmux2_file_integration $(HOST_DIR)/test_supervisor_integration $(HOST_DIR)/test_lmux_client
+host: $(HOST_DIR)/lmuxd $(HOST_DIR)/lmux $(HOST_DIR)/lmux-mcp $(HOST_DIR)/test_protocol $(HOST_DIR)/test_lmux2 $(HOST_DIR)/test_carrier $(HOST_DIR)/test_supervisor $(HOST_DIR)/test_link $(HOST_DIR)/test_zeromux $(HOST_DIR)/test_lmux2_integration $(HOST_DIR)/test_lmux2_pty_integration $(HOST_DIR)/test_lmux2_file_integration $(HOST_DIR)/test_supervisor_integration $(HOST_DIR)/test_lmux_client
 
 target: $(TARGET_DIR)/lmuxd $(TARGET_DIR)/lmux $(TARGET_DIR)/test_lmux2
 
-selftest: $(HOST_DIR)/lmuxd $(HOST_DIR)/lmux $(HOST_DIR)/test_protocol $(HOST_DIR)/test_lmux2 $(HOST_DIR)/test_carrier $(HOST_DIR)/test_supervisor $(HOST_DIR)/test_link $(HOST_DIR)/test_zeromux $(HOST_DIR)/test_lmux2_integration $(HOST_DIR)/test_lmux2_pty_integration $(HOST_DIR)/test_lmux2_file_integration $(HOST_DIR)/test_supervisor_integration $(HOST_DIR)/test_lmux_client
+selftest: $(HOST_DIR)/lmuxd $(HOST_DIR)/lmux $(HOST_DIR)/lmux-mcp $(HOST_DIR)/test_protocol $(HOST_DIR)/test_lmux2 $(HOST_DIR)/test_carrier $(HOST_DIR)/test_supervisor $(HOST_DIR)/test_link $(HOST_DIR)/test_zeromux $(HOST_DIR)/test_lmux2_integration $(HOST_DIR)/test_lmux2_pty_integration $(HOST_DIR)/test_lmux2_file_integration $(HOST_DIR)/test_supervisor_integration $(HOST_DIR)/test_lmux_client go-test
 	$(HOST_DIR)/test_protocol
 	$(HOST_DIR)/test_lmux2
 	$(HOST_DIR)/test_carrier
@@ -100,6 +103,12 @@ $(HOST_DIR)/lmuxd: $(LMUXD) $(COMMON_SRC) $(LMUX2_SRC) $(CARRIER_SRC) $(SERVICES
 
 $(HOST_DIR)/lmux: $(LMUX) $(COMMON_SRC) $(ZEROMUX_SRC) $(CARRIER_DIR)/carrier_tty.c $(TRANSPORT_DIR)/lmux.h $(LXF_HDR) $(ZEROMUX_HDRS) $(CARRIER_HDRS) $(GEN_VERSION) | $(HOST_DIR)
 	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(LMUX) $(COMMON_SRC) $(ZEROMUX_SRC) $(CARRIER_DIR)/carrier_tty.c
+
+$(HOST_DIR)/lmux-mcp: $(GO_SRC) | $(HOST_DIR)
+	GOCACHE=$(GO_CACHE) $(GO) build -o $@ ./cmd/lmux-mcp
+
+go-test:
+	GOCACHE=$(GO_CACHE) $(GO) test ./...
 
 $(HOST_DIR)/test_protocol: $(TEST_PROTOCOL) $(COMMON_SRC) $(TRANSPORT_DIR)/lmux.h $(LXF_HDR) $(GEN_VERSION) | $(HOST_DIR)
 	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_PROTOCOL) $(COMMON_SRC)

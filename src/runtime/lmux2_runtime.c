@@ -1575,9 +1575,12 @@ static void run_loop(struct v2_app *a)
                      lmux_carrier_listen_fd(&a->carrier), POLLIN, 8, -1, -1);
         if (a->host.control_listen_fd >= 0)
             add_poll(pfds, kind, svc, bind, &n, a->host.control_listen_fd, POLLIN, 6, -1, -1);
-        if (a->host.control_fd >= 0)
-            add_poll(pfds, kind, svc, bind, &n, a->host.control_fd,
-                     v2_host_control_poll_events(&a->host), 7, -1, -1);
+        if (a->host.control_fd >= 0) {
+            short ev = v2_host_control_poll_events(&a->host);
+            if (ev)
+                add_poll(pfds, kind, svc, bind, &n, a->host.control_fd,
+                         ev, 7, -1, -1);
+        }
         if (a->host.structured_listen_fd >= 0)
             add_poll(pfds, kind, svc, bind, &n, a->host.structured_listen_fd,
                      POLLIN, 11, -1, -1);

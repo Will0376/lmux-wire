@@ -1,8 +1,8 @@
 # Host-Side MCP Architecture
 
-P9 defines the host-side MCP frontend for LMUX Wire. This is a design document
-only. It does not add production code, tests, target wire changes, a public
-`lmux exec` command, or a target-side runtime.
+This document describes the host-side MCP frontend for LMUX Wire. P10b
+implements the v1 frontend as a standalone host process. It does not add target
+wire changes, a public `lmux exec` command, or a target-side runtime.
 
 ## Goals
 
@@ -19,7 +19,7 @@ programmatic and LLM-driven target control:
 - send explicit signals/control;
 - keep stable command handles and output cursors for tool use.
 
-Preferred deployment:
+Deployment:
 
 ```text
 MCP client
@@ -37,6 +37,24 @@ LMUX services
 `lmux-mcp` is a standalone host process. It is not loaded into the target
 `lmuxd`, does not add a language runtime to the target, and does not turn
 `lmuxd` into a generic RPC server.
+
+## Implemented V1 Summary
+
+P10b adds:
+
+- `build/host/lmux-mcp`, a Go-only host binary;
+- MCP over stdio using JSON-RPC `Content-Length` framing;
+- an HC2 structured-control client for `/run/lmux/control-v2.sock`;
+- tools for structured status, private exec commands, stdin/signals/release,
+  and FILE PUT/GET;
+- host-side MCP sessions, opaque command tokens, cursor-based transcript reads,
+  and human-readable session journals;
+- a single-instance runtime owner for `/run/lmux/mcp/`;
+- default retention of five sessions and 10 MiB per session.
+
+The implementation is intentionally a host frontend over P10a. It does not
+duplicate FILE/private-exec protocols, does not call the legacy `lmux` CLI, and
+does not persist sessions across `lmux-mcp` restart.
 
 ## Non-Goals
 
@@ -110,7 +128,9 @@ V1 policy:
   session per client connection.
 - Client disconnect does not immediately kill running commands.
 - A disconnected session is retained for a bounded idle grace period, initially
-  10 minutes.
+  10 minutes. In the current stdio deployment the process normally exits when
+  the owning MCP client closes stdio, so durable cross-process session resume is
+  not provided.
 - Explicit session close releases all command tokens in that session and
   attempts target `RELEASE` for still-present exec objects.
 - Session GC removes host transcript files and marks all command tokens stale.
@@ -118,7 +138,7 @@ V1 policy:
   tokens, and transcripts.
 
 The 10-minute disconnected retention is a host policy, not a target protocol.
-It should be a named constant in P10 and may become configurable later.
+It is a named default and may become configurable later.
 
 ## Command Tokens
 
@@ -881,15 +901,16 @@ The caller may decide to continue from `earliest_cursor`.
 MCP file tools use the existing FILE service. They must not reimplement file
 transfer through shell, exec, base64, or private exec.
 
-V1 tool concepts:
+Implemented v1 tools:
 
 ```text
-file_put(local/source bytes, target_path)
-file_get(target_path)
+file_put(local_source, target_destination)
+file_get(target_source, local_destination)
 ```
 
 The FILE service already provides PUT/GET and SHA-verified transfers in the
-LMUX stack. MCP should surface those operations through the host internal API.
+LMUX stack. MCP surfaces those operations through the host internal API and
+waits for structured FILE completion before returning byte count and SHA256.
 It should not become a general remote filesystem RPC framework.
 
 Optional future helpers may expose remote SHA/status if supported cleanly by
@@ -966,18 +987,20 @@ directory. No remote network MCP listener is introduced by default.
 
 ## MCP Process And Source Placement
 
-Future placement recommendation:
+Implemented source placement:
 
 ```text
 cmd/lmux-mcp/
+internal/hc2/
+internal/mcpapp/
 ```
 
-for the standalone MCP frontend, with any shared host-control client helpers in
-a small host-side library/module appropriate to the implementation language.
+`cmd/lmux-mcp/` contains the standalone MCP frontend. `internal/hc2/` contains
+the structured host-control client. `internal/mcpapp/` contains session,
+transcript, retention, and journal state.
 
-Preferred implementation target is a standalone Go `lmux-mcp` process. The C
-host daemon remains the owner of LMUX runtime state. P9 does not require adding
-Go code.
+The implementation is a standalone Go `lmux-mcp` process. The C host daemon
+remains the owner of LMUX runtime state.
 
 Host control protocol extensions remain in the current C tree near the existing
 host control implementation.

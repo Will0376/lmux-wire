@@ -1918,6 +1918,8 @@ short v2_host_control_poll_events(const struct v2_host *h)
         return 0;
     if (h->boot_upload_active && h->boot_pending)
         return 0;
+    if (h->deploy_active && !h->boot_upload_active)
+        return 0;
     return POLLIN;
 }
 
