@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/hex"
@@ -18,21 +16,9 @@ import (
 
 	"lmux/internal/hc2"
 	"lmux/internal/mcpapp"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
-
-type rpcMessage struct {
-	JSONRPC string          `json:"jsonrpc,omitempty"`
-	ID      json.RawMessage `json:"id,omitempty"`
-	Method  string          `json:"method,omitempty"`
-	Params  json.RawMessage `json:"params,omitempty"`
-	Result  any             `json:"result,omitempty"`
-	Error   *rpcError       `json:"error,omitempty"`
-}
-
-type rpcError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
 
 type app struct {
 	controlPath string
@@ -55,7 +41,8 @@ type fileResult struct {
 func main() {
 	var controlPath, runtimeDir string
 	flag.StringVar(&controlPath, "control", envDefault("LMUX_MCP_CONTROL", "/run/lmux/control-v2.sock"), "lmuxd structured control socket")
-	flag.StringVar(&runtimeDir, "runtime", envDefault("LMUX_MCP_RUNTIME_DIR", mcpapp.DefaultRuntimeDir), "lmux-mcp runtime directory")
+	flag.StringVar(&runtimeDir, "runtime-dir", envDefault("LMUX_MCP_RUNTIME_DIR", ""), "lmux-mcp runtime directory (default: $XDG_RUNTIME_DIR/lmux/mcp)")
+	flag.StringVar(&runtimeDir, "runtime", envDefault("LMUX_MCP_RUNTIME_DIR", ""), "alias for --runtime-dir")
 	flag.Parse()
 
 	a := &app{controlPath: controlPath, manager: mcpapp.NewManager(runtimeDir), execRefs: make(map[uint64]string), fileWait: make(map[uint64]chan fileResult), fileKind: make(map[uint64]string)}
@@ -69,7 +56,8 @@ func main() {
 	if err := a.ensureControl(context.Background()); err != nil {
 		s.Journal("ERROR", map[string]any{"message": err.Error()})
 	}
-	if err := serveRPC(os.Stdin, os.Stdout, a); err != nil && !errors.Is(err, io.EOF) {
+	server := newMCPServer(a)
+	if err := server.Run(context.Background(), &mcp.StdioTransport{}); err != nil && !errors.Is(err, io.EOF) {
 		fmt.Fprintf(os.Stderr, "lmux-mcp: %v\n", err)
 	}
 	s.Journal("SESSION_DISCONNECT", nil)
@@ -168,109 +156,37 @@ func (a *app) FileError(err hc2.FileError) {
 	}
 }
 
-func serveRPC(r io.Reader, w io.Writer, a *app) error {
-	br := bufio.NewReader(r)
-	bw := bufio.NewWriter(w)
-	for {
-		msg, err := readRPC(br)
-		if err != nil {
-			return err
-		}
-		if len(msg.ID) == 0 {
-			continue
-		}
-		resp := rpcMessage{JSONRPC: "2.0", ID: msg.ID}
-		res, rpcErr := a.handle(msg.Method, msg.Params)
-		if rpcErr != nil {
-			resp.Error = rpcErr
-		} else {
-			resp.Result = res
-		}
-		if err := writeRPC(bw, resp); err != nil {
-			return err
-		}
-	}
-}
-
-func readRPC(r *bufio.Reader) (rpcMessage, error) {
-	contentLen := -1
-	for {
-		line, err := r.ReadString('\n')
-		if err != nil {
-			return rpcMessage{}, err
-		}
-		line = strings.TrimRight(line, "\r\n")
-		if line == "" {
-			break
-		}
-		if strings.HasPrefix(strings.ToLower(line), "content-length:") {
-			fmt.Sscanf(line[len("content-length:"):], "%d", &contentLen)
-		}
-	}
-	if contentLen < 0 || contentLen > 10*1024*1024 {
-		return rpcMessage{}, errors.New("bad content length")
-	}
-	body := make([]byte, contentLen)
-	if _, err := io.ReadFull(r, body); err != nil {
-		return rpcMessage{}, err
-	}
-	var msg rpcMessage
-	if err := json.Unmarshal(body, &msg); err != nil {
-		return rpcMessage{}, err
-	}
-	return msg, nil
-}
-
-func writeRPC(w *bufio.Writer, msg rpcMessage) error {
-	body, err := json.Marshal(msg)
-	if err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintf(w, "Content-Length: %d\r\n\r\n", len(body)); err != nil {
-		return err
-	}
-	if _, err := w.Write(body); err != nil {
-		return err
-	}
-	return w.Flush()
-}
-
-func (a *app) handle(method string, params json.RawMessage) (any, *rpcError) {
-	switch method {
-	case "initialize":
-		return map[string]any{
-			"protocolVersion": "2024-11-05",
-			"capabilities":    map[string]any{"tools": map[string]any{}},
-			"serverInfo":      map[string]any{"name": "lmux-mcp", "version": "0.1"},
-		}, nil
-	case "tools/list":
-		return map[string]any{"tools": tools()}, nil
-	case "tools/call":
-		var p struct {
-			Name      string          `json:"name"`
-			Arguments json.RawMessage `json:"arguments"`
-		}
-		if err := json.Unmarshal(params, &p); err != nil {
-			return nil, rpcErr(-32602, err.Error())
-		}
-		out, err := a.callTool(p.Name, p.Arguments)
-		if err != nil {
-			return map[string]any{"isError": true, "content": []map[string]string{{"type": "text", "text": err.Error()}}}, nil
-		}
-		return map[string]any{"content": []map[string]string{{"type": "text", "text": mustJSON(out)}}}, nil
-	default:
-		return nil, rpcErr(-32601, "method not found")
-	}
-}
-
-func rpcErr(code int, msg string) *rpcError { return &rpcError{Code: code, Message: msg} }
-
 func mustJSON(v any) string {
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return fmt.Sprintf("%v", v)
 	}
 	return string(b)
+}
+
+func newMCPServer(a *app) *mcp.Server {
+	server := mcp.NewServer(&mcp.Implementation{Name: "lmux-mcp", Version: "0.1"}, nil)
+	for _, spec := range tools() {
+		name := spec.Name
+		server.AddTool(&mcp.Tool{
+			Name:        spec.Name,
+			Description: spec.Description,
+			InputSchema: spec.InputSchema,
+		}, func(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			out, err := a.callTool(name, req.Params.Arguments)
+			if err != nil {
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{&mcp.TextContent{Text: err.Error()}},
+					IsError: true,
+				}, nil
+			}
+			return &mcp.CallToolResult{
+				Content:           []mcp.Content{&mcp.TextContent{Text: mustJSON(out)}},
+				StructuredContent: out,
+			}, nil
+		})
+	}
+	return server
 }
 
 func (a *app) callTool(name string, args json.RawMessage) (any, error) {
@@ -281,11 +197,12 @@ func (a *app) callTool(name string, args json.RawMessage) (any, error) {
 		var p struct {
 			Argv []string `json:"argv"`
 			CWD  string   `json:"cwd"`
+			Kind string   `json:"kind"`
 		}
 		if err := json.Unmarshal(args, &p); err != nil {
 			return nil, err
 		}
-		return a.toolCommandStart(p.Argv, p.CWD)
+		return a.toolCommandStart(p.Argv, p.CWD, p.Kind)
 	case "command_status":
 		var p struct {
 			CommandToken string `json:"command_token"`
@@ -380,9 +297,20 @@ func (a *app) toolStatus() (any, error) {
 	return hc2.DecodeStatus(fr.Payload)
 }
 
-func (a *app) toolCommandStart(argv []string, cwd string) (any, error) {
+func (a *app) toolCommandStart(argv []string, cwd string, kind string) (any, error) {
 	if len(argv) == 0 || !strings.HasPrefix(argv[0], "/") {
 		return nil, errors.New("argv[0] must be an absolute target path")
+	}
+	kind, err := mcpapp.NormalizeCommandKind(kind)
+	if err != nil {
+		return nil, err
+	}
+	activeSession, activeTotal := a.session.ActiveCommandCounts()
+	if kind == "session" && activeSession >= mcpapp.DefaultMaxSessionCommands {
+		return nil, errors.New("RESOURCE_LIMIT: max active session commands reached")
+	}
+	if activeTotal >= mcpapp.DefaultMaxConcurrentCommand {
+		return nil, errors.New("RESOURCE_LIMIT: max concurrent commands reached")
 	}
 	c, caps, err := a.client()
 	if err != nil {
@@ -397,8 +325,21 @@ func (a *app) toolCommandStart(argv []string, cwd string) (any, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	fr, err := c.Request(ctx, hc2.TypeExecStart, p)
-	if err != nil {
+	var fr hc2.Frame
+	for {
+		fr, err = c.Request(ctx, hc2.TypeExecStart, p)
+		if err == nil {
+			break
+		}
+		var hc2Err *hc2.Error
+		if errors.As(err, &hc2Err) && hc2Err.Code == hc2.ErrNotConnected {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(20 * time.Millisecond):
+				continue
+			}
+		}
 		return nil, err
 	}
 	if fr.Type != hc2.TypeExecStarted {
@@ -408,7 +349,7 @@ func (a *app) toolCommandStart(argv []string, cwd string) (any, error) {
 	if !ok || st.Ref == 0 {
 		return nil, errors.New("bad EXEC_STARTED")
 	}
-	cmd, err := a.session.NewCommand(argv, cwd, st.Ref, st.TargetExecID)
+	cmd, err := a.session.NewCommand(argv, cwd, st.Ref, st.TargetExecID, kind)
 	if err != nil {
 		return nil, err
 	}
@@ -416,7 +357,7 @@ func (a *app) toolCommandStart(argv []string, cwd string) (any, error) {
 	a.execRefs[st.Ref] = cmd.Token
 	a.mu.Unlock()
 	_ = a.session.UpdateState(cmd.Token, st)
-	return map[string]any{"command_token": cmd.Token, "initial_cursor": a.session.InitialCursor(), "state": cmd.State}, nil
+	return map[string]any{"command_token": cmd.Token, "initial_cursor": a.session.InitialCursor(), "state": cmd.State, "kind": cmd.Kind}, nil
 }
 
 func (a *app) toolCommandStatus(token string) (any, error) {
@@ -600,12 +541,18 @@ func (a *app) toolFile(typ uint16, a0, a1 string) (any, error) {
 	}
 }
 
-func tools() []map[string]any {
-	return []map[string]any{
+type toolSpec struct {
+	Name        string
+	Description string
+	InputSchema map[string]any
+}
+
+func tools() []toolSpec {
+	return []toolSpec{
 		tool("lmux_status", "Return structured lmuxd status.", map[string]any{"type": "object", "properties": map[string]any{}}),
 		tool("file_put", "Upload a local host file to the target using LMUX FILE.", schemaProps("local_source", "target_destination")),
 		tool("file_get", "Download a target file to a local host path using LMUX FILE.", schemaProps("target_source", "local_destination")),
-		tool("command_start", "Start a private exec command with explicit argv.", map[string]any{"type": "object", "properties": map[string]any{"argv": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}, "cwd": map[string]any{"type": "string"}}, "required": []string{"argv"}}),
+		tool("command_start", "Start a private exec command with explicit argv.", map[string]any{"type": "object", "properties": map[string]any{"argv": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}, "cwd": map[string]any{"type": "string"}, "kind": map[string]any{"type": "string", "description": "oneshot (default) or session"}}, "required": []string{"argv"}}),
 		tool("command_status", "Return current command status.", schemaProps("command_token")),
 		tool("command_read", "Read command transcript from an opaque cursor.", map[string]any{"type": "object", "properties": map[string]any{"command_token": map[string]any{"type": "string"}, "cursor": map[string]any{"type": "string"}, "max_bytes": map[string]any{"type": "integer"}, "max_events": map[string]any{"type": "integer"}}, "required": []string{"command_token"}}),
 		tool("command_write_stdin", "Write bytes to command stdin using text or base64.", map[string]any{"type": "object", "properties": map[string]any{"command_token": map[string]any{"type": "string"}, "text": map[string]any{"type": "string"}, "base64": map[string]any{"type": "string"}}, "required": []string{"command_token"}}),
@@ -615,8 +562,8 @@ func tools() []map[string]any {
 	}
 }
 
-func tool(name, desc string, schema map[string]any) map[string]any {
-	return map[string]any{"name": name, "description": desc, "inputSchema": schema}
+func tool(name, desc string, schema map[string]any) toolSpec {
+	return toolSpec{Name: name, Description: desc, InputSchema: schema}
 }
 
 func schemaProps(names ...string) map[string]any {
@@ -625,12 +572,6 @@ func schemaProps(names ...string) map[string]any {
 		props[n] = map[string]any{"type": "string"}
 	}
 	return map[string]any{"type": "object", "properties": props, "required": names}
-}
-
-func encodeRPCForTest(v any) []byte {
-	var b bytes.Buffer
-	_ = writeRPC(bufio.NewWriter(&b), v.(rpcMessage))
-	return b.Bytes()
 }
 
 func hexString(b [32]byte) string { return hex.EncodeToString(b[:]) }

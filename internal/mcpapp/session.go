@@ -20,17 +20,18 @@ import (
 )
 
 const (
-	DefaultRuntimeDir           = "/run/lmux/mcp"
-	DefaultMaxSessions          = 5
-	DefaultSessionBytes         = 10 * 1024 * 1024
-	DefaultGrace                = 10 * time.Minute
-	DefaultJournalSegment       = 512 * 1024
-	DefaultJournalTotal         = DefaultJournalSegment * 2
-	transcriptRecordHeader      = 17
-	eventStdout            byte = 1
-	eventStderr            byte = 2
-	eventState             byte = 3
-	eventLost              byte = 4
+	DefaultMaxSessions               = 5
+	DefaultSessionBytes              = 10 * 1024 * 1024
+	DefaultGrace                     = 10 * time.Minute
+	DefaultJournalSegment            = 512 * 1024
+	DefaultJournalTotal              = DefaultJournalSegment * 2
+	DefaultMaxSessionCommands        = 3
+	DefaultMaxConcurrentCommand      = 4
+	transcriptRecordHeader           = 17
+	eventStdout                 byte = 1
+	eventStderr                 byte = 2
+	eventState                  byte = 3
+	eventLost                   byte = 4
 )
 
 type Manager struct {
@@ -68,6 +69,7 @@ type Command struct {
 	Token      string
 	ExecRef    uint64
 	TargetID   uint64
+	Kind       string
 	Argv       []string
 	CWD        string
 	State      string
@@ -94,9 +96,6 @@ type Event struct {
 }
 
 func NewManager(runtime string) *Manager {
-	if runtime == "" {
-		runtime = DefaultRuntimeDir
-	}
 	return &Manager{
 		RuntimeDir:     runtime,
 		MaxSessions:    DefaultMaxSessions,
@@ -106,9 +105,27 @@ func NewManager(runtime string) *Manager {
 	}
 }
 
+func DefaultRuntimeDir() (string, error) {
+	xdg := os.Getenv("XDG_RUNTIME_DIR")
+	if xdg == "" {
+		return "", errors.New("XDG_RUNTIME_DIR is not set; pass --runtime-dir")
+	}
+	if !filepath.IsAbs(xdg) {
+		return "", fmt.Errorf("XDG_RUNTIME_DIR must be absolute: %s", xdg)
+	}
+	return filepath.Join(xdg, "lmux", "mcp"), nil
+}
+
 func (m *Manager) Start() (*Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.RuntimeDir == "" {
+		runtime, err := DefaultRuntimeDir()
+		if err != nil {
+			return nil, err
+		}
+		m.RuntimeDir = runtime
+	}
 	if err := os.MkdirAll(filepath.Join(m.RuntimeDir, "sessions"), 0700); err != nil {
 		return nil, err
 	}
@@ -199,9 +216,52 @@ func (s *Session) Close() {
 	}
 }
 
-func (s *Session) NewCommand(argv []string, cwd string, execRef, targetID uint64) (*Command, error) {
+func NormalizeCommandKind(kind string) (string, error) {
+	if kind == "" {
+		return "oneshot", nil
+	}
+	switch kind {
+	case "oneshot", "session":
+		return kind, nil
+	default:
+		return "", errors.New("INVALID_ARGUMENT: command kind must be oneshot or session")
+	}
+}
+
+func commandActive(c *Command) bool {
+	if c == nil || c.Released {
+		return false
+	}
+	switch c.State {
+	case "DONE", "START_FAILED", "LOST":
+		return false
+	default:
+		return true
+	}
+}
+
+func (s *Session) ActiveCommandCounts() (sessionCommands, totalCommands int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	for _, c := range s.commands {
+		if !commandActive(c) {
+			continue
+		}
+		totalCommands++
+		if c.Kind == "session" {
+			sessionCommands++
+		}
+	}
+	return sessionCommands, totalCommands
+}
+
+func (s *Session) NewCommand(argv []string, cwd string, execRef, targetID uint64, kind string) (*Command, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	kind, err := NormalizeCommandKind(kind)
+	if err != nil {
+		return nil, err
+	}
 	s.nextToken++
 	token := fmt.Sprintf("c-%d-%s", s.nextToken, randomHex(4))
 	path := filepath.Join(s.Dir, "command-"+safeName(token)+".transcript")
@@ -209,9 +269,9 @@ func (s *Session) NewCommand(argv []string, cwd string, execRef, targetID uint64
 	if err != nil {
 		return nil, err
 	}
-	c := &Command{Token: token, ExecRef: execRef, TargetID: targetID, Argv: append([]string(nil), argv...), CWD: cwd, State: "STARTING", Created: time.Now(), file: f, path: path}
+	c := &Command{Token: token, ExecRef: execRef, TargetID: targetID, Kind: kind, Argv: append([]string(nil), argv...), CWD: cwd, State: "STARTING", Created: time.Now(), file: f, path: path}
 	s.commands[token] = c
-	s.JournalLocked("COMMAND_START", map[string]any{"cmd": token, "argv": argv, "cwd": cwd})
+	s.JournalLocked("COMMAND_START", map[string]any{"cmd": token, "kind": kind, "argv": argv, "cwd": cwd})
 	return c, nil
 }
 
@@ -458,6 +518,7 @@ func (s *Session) JournalLocked(event string, fields map[string]any) {
 func CommandStatus(c *Command) map[string]any {
 	return map[string]any{
 		"command_token": c.Token,
+		"kind":          c.Kind,
 		"state":         c.State,
 		"exit_code":     c.ExitCode,
 		"signal":        c.Signal,

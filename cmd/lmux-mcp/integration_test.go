@@ -1,13 +1,11 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net"
 	"os"
@@ -17,6 +15,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func TestMCPProcessIntegration(t *testing.T) {
@@ -43,14 +43,20 @@ func TestMCPProcessIntegration(t *testing.T) {
 	defer stopCmd(host)
 	waitLegacyReady(t, control)
 
-	mcp := startMCP(t, root, structured, runtime)
-	defer mcp.close()
-	mcp.call(t, "initialize", map[string]any{"protocolVersion": "2024-11-05"})
-	status := mcp.tool(t, "lmux_status", map[string]any{})
+	mcpSession := startMCP(t, root, structured, runtime)
+	defer mcpSession.Close()
+	tools, err := mcpSession.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasTool(tools, "lmux_status") {
+		t.Fatalf("tools/list missing lmux_status: %+v", tools.Tools)
+	}
+	status := callTool(t, mcpSession, "lmux_status", map[string]any{})
 	if !strings.Contains(mustJSON(status), "__exec") {
 		t.Fatalf("status missing __exec: %v", status)
 	}
-	start := mcp.tool(t, "command_start", map[string]any{"argv": []string{"/bin/sh", "-c", "printf OUT; printf ERR >&2"}})
+	start := callTool(t, mcpSession, "command_start", map[string]any{"argv": []string{"/bin/sh", "-c", "printf OUT; printf ERR >&2"}})
 	token, _ := start["command_token"].(string)
 	if token == "" {
 		t.Fatalf("missing command token: %v", start)
@@ -59,7 +65,7 @@ func TestMCPProcessIntegration(t *testing.T) {
 	cursor, _ := start["initial_cursor"].(string)
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) && (stdout != "OUT" || stderr != "ERR") {
-		read := mcp.tool(t, "command_read", map[string]any{"command_token": token, "cursor": cursor, "max_bytes": 4096, "max_events": 64})
+		read := callTool(t, mcpSession, "command_read", map[string]any{"command_token": token, "cursor": cursor, "max_bytes": 4096, "max_events": 64})
 		if next, _ := read["next_cursor"].(string); next != "" {
 			cursor = next
 		}
@@ -88,12 +94,12 @@ func TestMCPProcessIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	target := filepath.Join(os.TempDir(), "lmux-mcp-it-"+filepath.Base(dir))
-	put := mcp.tool(t, "file_put", map[string]any{"local_source": localSrc, "target_destination": target})
+	put := callTool(t, mcpSession, "file_put", map[string]any{"local_source": localSrc, "target_destination": target})
 	wantSum := sha256.Sum256(data)
 	if put["sha256"] != hex.EncodeToString(wantSum[:]) {
 		t.Fatalf("bad put sha: %v want %s", put, hex.EncodeToString(wantSum[:]))
 	}
-	get := mcp.tool(t, "file_get", map[string]any{"target_source": target, "local_destination": localDst})
+	get := callTool(t, mcpSession, "file_get", map[string]any{"target_source": target, "local_destination": localDst})
 	if get["sha256"] != hex.EncodeToString(wantSum[:]) {
 		t.Fatalf("bad get sha: %v want %s", get, hex.EncodeToString(wantSum[:]))
 	}
@@ -106,76 +112,60 @@ func TestMCPProcessIntegration(t *testing.T) {
 	}
 }
 
-type mcpProc struct {
-	cmd *exec.Cmd
-	in  io.WriteCloser
-	out *bufio.Reader
-	id  int
-}
-
-func startMCP(t *testing.T, root, control, runtime string) *mcpProc {
+func startMCP(t *testing.T, root, control, runtime string) *mcp.ClientSession {
 	t.Helper()
-	cmd := exec.Command(filepath.Join(root, "build/host/lmux-mcp"), "--control", control, "--runtime", runtime)
+	cmd := exec.Command(filepath.Join(root, "build/host/lmux-mcp"), "--control", control, "--runtime-dir", runtime)
 	cmd.Dir = root
 	cmd.Stderr = os.Stderr
-	in, err := cmd.StdinPipe()
+	client := mcp.NewClient(&mcp.Implementation{Name: "lmux-mcp-it", Version: "0.1"}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+	session, err := client.Connect(ctx, &mcp.CommandTransport{Command: cmd}, &mcp.ClientSessionOptions{ProtocolVersion: "2026-07-28"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
+	if got := session.InitializeResult().ProtocolVersion; got != "2026-07-28" {
+		t.Fatalf("protocol version = %q, want 2026-07-28", got)
 	}
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	return &mcpProc{cmd: cmd, in: in, out: bufio.NewReader(stdout)}
+	return session
 }
 
-func (m *mcpProc) close() {
-	_ = m.in.Close()
-	_ = m.cmd.Process.Kill()
-	_ = m.cmd.Wait()
-}
-
-func (m *mcpProc) call(t *testing.T, method string, params any) map[string]any {
+func callTool(t *testing.T, session *mcp.ClientSession, name string, args any) map[string]any {
 	t.Helper()
-	m.id++
-	msg := rpcMessage{JSONRPC: "2.0", ID: json.RawMessage(fmt.Sprintf("%d", m.id)), Method: method}
-	if params != nil {
-		msg.Params, _ = json.Marshal(params)
-	}
-	if err := writeRPC(bufio.NewWriter(m.in), msg); err != nil {
-		t.Fatal(err)
-	}
-	resp, err := readRPC(m.out)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Error != nil {
-		t.Fatalf("rpc error: %+v", resp.Error)
+	if res.IsError {
+		t.Fatalf("tool %s error: %s", name, toolText(res))
 	}
 	var out map[string]any
-	b, _ := json.Marshal(resp.Result)
+	b, _ := json.Marshal(res.StructuredContent)
 	if err := json.Unmarshal(b, &out); err != nil {
-		t.Fatal(err)
+		t.Fatalf("bad structured content for %s: %#v: %v", name, res.StructuredContent, err)
 	}
 	return out
 }
 
-func (m *mcpProc) tool(t *testing.T, name string, args any) map[string]any {
-	t.Helper()
-	resp := m.call(t, "tools/call", map[string]any{"name": name, "arguments": args})
-	content := resp["content"].([]any)
-	text := content[0].(map[string]any)["text"].(string)
-	var out map[string]any
-	if err := json.Unmarshal([]byte(text), &out); err != nil {
-		t.Fatalf("bad tool json %s: %v", text, err)
+func hasTool(list *mcp.ListToolsResult, name string) bool {
+	for _, tool := range list.Tools {
+		if tool.Name == name {
+			return true
+		}
 	}
-	if resp["isError"] == true {
-		t.Fatalf("tool %s error: %v", name, out)
+	return false
+}
+
+func toolText(res *mcp.CallToolResult) string {
+	if len(res.Content) == 0 {
+		return ""
 	}
-	return out
+	if txt, ok := res.Content[0].(*mcp.TextContent); ok {
+		return txt.Text
+	}
+	return mustJSON(res.Content)
 }
 
 func repoRoot(t *testing.T) string {

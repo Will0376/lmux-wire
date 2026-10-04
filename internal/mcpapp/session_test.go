@@ -3,6 +3,7 @@ package mcpapp
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -12,7 +13,7 @@ func TestTranscriptCursorAndExpiration(t *testing.T) {
 	if err := s.openJournal(); err != nil {
 		t.Fatal(err)
 	}
-	c, err := s.NewCommand([]string{"/bin/echo"}, "", 1, 1)
+	c, err := s.NewCommand([]string{"/bin/echo"}, "", 1, 1, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,6 +33,42 @@ func TestTranscriptCursorAndExpiration(t *testing.T) {
 	_, earliest, _, err := s.Read(c.Token, start, 100, 10)
 	if err == nil || err.Error() != "CURSOR_EXPIRED" || earliest == "" {
 		t.Fatalf("want cursor expired, earliest=%s err=%v", earliest, err)
+	}
+}
+
+func TestCommandKindAndActiveCounts(t *testing.T) {
+	dir := t.TempDir()
+	s := &Session{ID: "s", Dir: dir, MaxBytes: 4096, JournalSegment: 256, commands: map[string]*Command{}, floorEvent: 1}
+	if err := s.openJournal(); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < DefaultMaxSessionCommands; i++ {
+		if _, err := s.NewCommand([]string{"/bin/sleep"}, "", uint64(i+1), uint64(i+1), "session"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sessionCount, totalCount := s.ActiveCommandCounts()
+	if sessionCount != DefaultMaxSessionCommands || totalCount != DefaultMaxSessionCommands {
+		t.Fatalf("counts session=%d total=%d", sessionCount, totalCount)
+	}
+	one, err := s.NewCommand([]string{"/bin/true"}, "", 10, 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one.Kind != "oneshot" {
+		t.Fatalf("default kind = %q", one.Kind)
+	}
+	sessionCount, totalCount = s.ActiveCommandCounts()
+	if sessionCount != DefaultMaxSessionCommands || totalCount != DefaultMaxConcurrentCommand {
+		t.Fatalf("counts after oneshot session=%d total=%d", sessionCount, totalCount)
+	}
+	s.Release(one.Token)
+	sessionCount, totalCount = s.ActiveCommandCounts()
+	if sessionCount != DefaultMaxSessionCommands || totalCount != DefaultMaxSessionCommands {
+		t.Fatalf("counts after release session=%d total=%d", sessionCount, totalCount)
+	}
+	if _, err := NormalizeCommandKind("forever"); err == nil {
+		t.Fatal("invalid command kind accepted")
 	}
 }
 
@@ -71,4 +108,50 @@ func TestManagerStartupCleanupAndLock(t *testing.T) {
 		t.Fatal("second instance acquired lock")
 	}
 	m.Close()
+}
+
+func TestManagerDefaultRuntimeUsesXDG(t *testing.T) {
+	xdg := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", xdg)
+	m := NewManager("")
+	s, err := m.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	want := filepath.Join(xdg, "lmux", "mcp")
+	if m.RuntimeDir != want {
+		t.Fatalf("runtime dir = %q, want %q", m.RuntimeDir, want)
+	}
+	if !strings.HasPrefix(s.Dir, filepath.Join(want, "sessions")+string(os.PathSeparator)) {
+		t.Fatalf("session dir %q not under %q", s.Dir, want)
+	}
+	if _, err := os.Stat(filepath.Join(want, "current", "session.log")); err != nil {
+		t.Fatalf("journal not discoverable under XDG runtime: %v", err)
+	}
+}
+
+func TestManagerRuntimeOverride(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	dir := filepath.Join(t.TempDir(), "explicit-mcp")
+	m := NewManager(dir)
+	s, err := m.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if !strings.HasPrefix(s.Dir, filepath.Join(dir, "sessions")+string(os.PathSeparator)) {
+		t.Fatalf("session dir %q not under explicit runtime %q", s.Dir, dir)
+	}
+}
+
+func TestManagerDefaultRuntimeRequiresXDG(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	m := NewManager("")
+	if _, err := m.Start(); err == nil || !strings.Contains(err.Error(), "XDG_RUNTIME_DIR") {
+		t.Fatalf("want XDG_RUNTIME_DIR error, got %v", err)
+	}
+	if m.RuntimeDir == "/run/lmux/mcp" {
+		t.Fatal("default runtime must not fall back to /run/lmux/mcp")
+	}
 }

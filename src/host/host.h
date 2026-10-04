@@ -8,6 +8,7 @@
 #include "lxf.h"
 #include "lmux2_core.h"
 #include "lmux2_service.h"
+#include "services.h"
 
 #include <poll.h>
 #include <stdint.h>
@@ -80,6 +81,65 @@ struct v2_target_service_status {
     struct v2_target_binding_status bindings[V2_MAX_BINDINGS];
 };
 
+#define V2_HOST_STRUCTURED_MAX_EXECS V2_EXEC_MAX_RUNNING
+#define V2_HOST_STRUCTURED_CTL_QUEUE_MAX 8
+
+struct v2_host_structured_exec {
+    int used;
+    uint64_t ref;
+    uint64_t exec_id;
+    uint64_t incarnation;
+    uint64_t req_id;
+    int active;
+    int lost;
+    int lost_emitted;
+    int done;
+    int auto_reattach;
+    int status_pending;
+    int final_pending;
+    int final_queued;
+    long long next_status_ms;
+    uint8_t final_state;
+    uint8_t final_fail;
+    uint16_t final_errno;
+    uint32_t final_exit_code;
+    uint32_t final_term_signal;
+    uint8_t final_payload[64];
+    uint16_t final_payload_len;
+    uint64_t stdin_stream;
+    uint64_t stdout_stream;
+    uint64_t stderr_stream;
+    uint8_t stdin_buf[4096];
+    size_t stdin_len;
+    size_t stdin_pos;
+    int stdin_close_requested;
+    int stdin_close_pending;
+};
+
+enum v2_host_structured_control_kind {
+    V2_HC2_CTL_NONE = 0,
+    V2_HC2_CTL_INFO,
+    V2_HC2_CTL_START,
+    V2_HC2_CTL_ATTACH,
+    V2_HC2_CTL_STATUS,
+    V2_HC2_CTL_SIGNAL,
+    V2_HC2_CTL_RELEASE
+};
+
+struct v2_host_structured_control_op {
+    enum v2_host_structured_control_kind kind;
+    uint64_t request_id;
+    uint64_t ref;
+};
+
+struct v2_host_structured_pending_frame {
+    uint16_t type;
+    uint16_t flags;
+    uint64_t request_id;
+    uint32_t payload_len;
+    uint8_t payload[LMUX_HC2_MAX_PAYLOAD];
+};
+
 struct v2_host {
     int factory_unix;
     int factory_pty;
@@ -104,17 +164,12 @@ struct v2_host {
     size_t structured_tx_pos;
     uint64_t structured_next_ref;
     uint64_t structured_known_exec_incarnation;
-    uint64_t structured_exec_ref;
-    uint64_t structured_exec_id;
-    uint64_t structured_exec_incarnation;
-    uint64_t structured_exec_req_id;
     int structured_exec_info_pending;
-    int structured_exec_active;
-    int structured_exec_lost;
-    int structured_exec_lost_emitted;
-    int structured_exec_done;
-    int structured_exec_auto_reattach;
-    int structured_exec_stdin_close_requested;
+    struct v2_host_structured_control_op structured_control_op;
+    struct v2_host_structured_pending_frame structured_control_queue[V2_HOST_STRUCTURED_CTL_QUEUE_MAX];
+    int structured_control_queue_head;
+    int structured_control_queue_len;
+    struct v2_host_structured_exec structured_execs[V2_HOST_STRUCTURED_MAX_EXECS];
     uint64_t structured_next_file_op_id;
     uint64_t structured_file_op_id;
     uint64_t structured_file_req_id;

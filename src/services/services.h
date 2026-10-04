@@ -104,6 +104,7 @@ struct v2_exec_obj {
     int exit_code;
     int term_signal;
     int start_errno;
+    int start_reply_pending;
     enum v2_exec_start_failure start_failure;
     uint64_t control_stream_id;
     uint64_t stdin_stream_id;

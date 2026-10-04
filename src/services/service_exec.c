@@ -332,6 +332,19 @@ static int queue_exec_status(struct v2_service *s, struct v2_exec_obj *e,
                                 payload, len);
 }
 
+static int queue_pending_start_reply(struct v2_service *s,
+                                     struct v2_exec_obj *e)
+{
+    if (!e->start_reply_pending)
+        return 0;
+    if (!s->exec.control_stream_id)
+        return -1;
+    if (queue_exec_status(s, e, V2_EXEC_REC_START_REPLY) < 0)
+        return -1;
+    e->start_reply_pending = 0;
+    return 0;
+}
+
 static int queue_exec_error(struct v2_service *s, uint64_t exec_id,
                             uint8_t err)
 {
@@ -643,6 +656,13 @@ static void pump_control_output(struct v2_service *s, struct lmux2_conn *conn)
         s->exec.ctl_out_pos = s->exec.ctl_out_len = 0;
 }
 
+static void clear_pending_start_replies(struct v2_service *s)
+{
+    int i;
+    for (i = 0; i < V2_EXEC_MAX_SLOTS; i++)
+        s->exec.execs[i].start_reply_pending = 0;
+}
+
 static void cleanup_service_control_stream(struct v2_service *s,
                                            struct lmux2_conn *conn)
 {
@@ -655,6 +675,7 @@ static void cleanup_service_control_stream(struct v2_service *s,
         s->exec.control_stream_id = 0;
         s->exec.ctl_in_len = 0;
         s->exec.ctl_out_len = s->exec.ctl_out_pos = 0;
+        clear_pending_start_replies(s);
         return;
     }
     if (st->state == LMUX2_STREAM_REMOTE_CLOSED) {
@@ -662,6 +683,31 @@ static void cleanup_service_control_stream(struct v2_service *s,
         s->exec.control_stream_id = 0;
         s->exec.ctl_in_len = 0;
         s->exec.ctl_out_len = s->exec.ctl_out_pos = 0;
+        clear_pending_start_replies(s);
+    }
+}
+
+static void retire_idle_service_control_stream(struct v2_service *s,
+                                               struct lmux2_conn *conn)
+{
+    const struct lmux2_stream *st;
+    if (!s->exec.control_stream_id ||
+        s->exec.ctl_in_len != 0 ||
+        s->exec.ctl_out_len != s->exec.ctl_out_pos)
+        return;
+    st = lmux2_find_stream_const(conn, s->exec.control_stream_id);
+    if (!st)
+        return;
+    if (st->rx.len != 0)
+        return;
+    if (st->state == LMUX2_STREAM_OPEN ||
+        st->state == LMUX2_STREAM_LOCAL_CLOSED ||
+        st->state == LMUX2_STREAM_REMOTE_CLOSED) {
+        (void)lmux2_close_stream(conn, st->id);
+        s->exec.control_stream_id = 0;
+        s->exec.ctl_in_len = 0;
+        s->exec.ctl_out_len = s->exec.ctl_out_pos = 0;
+        clear_pending_start_replies(s);
     }
 }
 
@@ -677,6 +723,7 @@ int v2_exec_handle_stream_open(struct v2_app *a, struct lmux2_conn *conn,
         return 0;
     if (st->open_token == 0 || role == V2_EXEC_ROLE_CONTROL) {
         cleanup_service_control_stream(s, conn);
+        retire_idle_service_control_stream(s, conn);
         if (s->exec.control_stream_id) {
             (void)lmux2_reject_stream(conn, st->id, LMUX2_OPEN_E_BAD_STATE);
             return 1;
@@ -765,6 +812,7 @@ void v2_exec_cleanup_connection(struct v2_app *a, struct v2_service *s,
     s->exec.control_stream_id = 0;
     s->exec.ctl_in_len = 0;
     s->exec.ctl_out_len = s->exec.ctl_out_pos = 0;
+    clear_pending_start_replies(s);
     for (i = 0; i < V2_EXEC_MAX_SLOTS; i++)
         exec_obj_close_streams(conn, &s->exec.execs[i], 0);
 }
@@ -933,13 +981,15 @@ static void check_start_pipe(struct v2_service *s, struct v2_exec_obj *e)
     if (r == 0) {
         close_fd(&e->err_fd);
         e->status = V2_EXEC_STATUS_RUNNING;
-        (void)queue_exec_status(s, e, V2_EXEC_REC_START_REPLY);
+        e->start_reply_pending = 1;
+        (void)queue_pending_start_reply(s, e);
     } else if (r == (ssize_t)sizeof(ce)) {
         close_fd(&e->err_fd);
         e->start_failure = (enum v2_exec_start_failure)ce.stage;
         e->start_errno = (int)ce.errnum;
         e->status = V2_EXEC_STATUS_START_FAILED;
-        (void)queue_exec_status(s, e, V2_EXEC_REC_START_REPLY);
+        e->start_reply_pending = 1;
+        (void)queue_pending_start_reply(s, e);
     } else if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
         return;
     }
@@ -999,6 +1049,12 @@ int v2_exec_service_step(struct v2_app *a, struct lmux2_conn *conn,
     if (s->exec.control_stream_id) {
         process_control_stream(s, conn);
         pump_control_output(s, conn);
+        for (i = 0; i < V2_EXEC_MAX_SLOTS; i++) {
+            struct v2_exec_obj *e = &s->exec.execs[i];
+            if (e->used && e->start_reply_pending &&
+                queue_pending_start_reply(s, e) == 0)
+                break;
+        }
     }
     for (i = 0; i < V2_EXEC_MAX_SLOTS; i++) {
         struct v2_exec_obj *e = &s->exec.execs[i];
@@ -1006,6 +1062,8 @@ int v2_exec_service_step(struct v2_app *a, struct lmux2_conn *conn,
             continue;
         detach_dead_streams(e, conn);
         check_start_pipe(s, e);
+        if (e->start_reply_pending)
+            (void)queue_pending_start_reply(s, e);
         pump_stdin_rx(e, conn);
         write_child_stdin(e);
         pump_child_output(e, conn, e->stdout_fd, e->stdout_stream_id, &e->stdout_eof);
@@ -1070,7 +1128,7 @@ void v2_exec_on_fd_event(struct v2_app *a, struct lmux2_conn *conn,
         pump_child_output(e, conn, e->stdout_fd, e->stdout_stream_id, &e->stdout_eof);
     else if (fd_kind == V2_EXEC_FD_STDERR && (revents & (POLLIN | POLLHUP)))
         pump_child_output(e, conn, e->stderr_fd, e->stderr_stream_id, &e->stderr_eof);
-    else if (fd_kind == V2_EXEC_FD_ERR && (revents & POLLIN))
+    else if (fd_kind == V2_EXEC_FD_ERR && (revents & (POLLIN | POLLHUP)))
         check_start_pipe(s, e);
     if (revents & (POLLERR | POLLNVAL)) {
         if (fd_kind == V2_EXEC_FD_STDOUT)

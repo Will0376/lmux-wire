@@ -28,8 +28,10 @@ The standard host launcher currently uses:
 The socket is a local Unix stream socket only. It is intended for trusted local
 clients such as future `lmux-mcp`. It exposes target execution and host file
 paths and therefore must not be exposed as a network service. Socket permissions
-come from the runtime directory and process `umask`; deployments that need
-stricter local isolation should restrict the runtime directory.
+are set to `0777` by `lmuxd`, matching the existing local LMUX runtime policy
+for host-created sockets under `/run/lmux`. This keeps a normal-user
+`lmux-mcp` process able to connect when host `lmuxd` intentionally runs as
+root. Do not make the structured socket a TCP listener.
 
 P10a supports one active structured client at a time. A second structured client
 connection is closed immediately. Legacy control clients remain separate and

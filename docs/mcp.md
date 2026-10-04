@@ -43,13 +43,14 @@ LMUX services
 P10b adds:
 
 - `build/host/lmux-mcp`, a Go-only host binary;
-- MCP over stdio using JSON-RPC `Content-Length` framing;
+- MCP over stdio through the official `github.com/modelcontextprotocol/go-sdk`
+  transport, currently pinned at v1.8.0 with `2026-07-28` protocol support;
 - an HC2 structured-control client for `/run/lmux/control-v2.sock`;
 - tools for structured status, private exec commands, stdin/signals/release,
   and FILE PUT/GET;
 - host-side MCP sessions, opaque command tokens, cursor-based transcript reads,
   and human-readable session journals;
-- a single-instance runtime owner for `/run/lmux/mcp/`;
+- a single-instance per-user runtime owner for `$XDG_RUNTIME_DIR/lmux/mcp/`;
 - default retention of five sessions and 10 MiB per session.
 
 The implementation is intentionally a host frontend over P10a. It does not
@@ -417,13 +418,18 @@ Chosen v1 storage: file-backed host spool with bounded metadata in memory.
 Default runtime directory:
 
 ```text
-/run/lmux/mcp/
+$XDG_RUNTIME_DIR/lmux/mcp/
 ```
+
+`lmux-mcp` owns this per-user runtime tree. If `XDG_RUNTIME_DIR` is unavailable,
+the user must pass an explicit `--runtime-dir PATH` or set
+`LMUX_MCP_RUNTIME_DIR`; v1 does not silently fall back to the shared
+`/run/lmux` system runtime.
 
 Recommended layout:
 
 ```text
-/run/lmux/mcp/
+$XDG_RUNTIME_DIR/lmux/mcp/
     sessions/
         session-<session_id>/
             session.log
@@ -473,14 +479,14 @@ per request in v1.
 Every MCP logical session should also have a live host-side journal:
 
 ```text
-/run/lmux/mcp/sessions/session-<session_id>/session.log
+$XDG_RUNTIME_DIR/lmux/mcp/sessions/session-<session_id>/session.log
 ```
 
 This is a human observability surface for normal host tools:
 
 ```sh
-tail -F /run/lmux/mcp/current/session.log
-lnav /run/lmux/mcp/current/session.log
+tail -F "$XDG_RUNTIME_DIR/lmux/mcp/current/session.log"
+lnav "$XDG_RUNTIME_DIR/lmux/mcp/current/session.log"
 ```
 
 The journal is append-only by convention and updates as session events happen.
@@ -493,7 +499,7 @@ in-memory session state remain authoritative.
 For the common single-agent case, `lmux-mcp` should maintain:
 
 ```text
-/run/lmux/mcp/current
+$XDG_RUNTIME_DIR/lmux/mcp/current
 ```
 
 as an atomic symlink to the most recent active session directory.
@@ -505,7 +511,7 @@ confusion. Acceptable v1 policy:
 - create additional aliases such as `current-<safe-client-alias>` when a stable
   client/session alias exists;
 - otherwise rely on the `sessions/` directory and a small human-readable index
-  file such as `/run/lmux/mcp/sessions.txt`.
+  file such as `$XDG_RUNTIME_DIR/lmux/mcp/sessions.txt`.
 
 No database is required. Discovery is for humans, not for protocol correctness.
 
@@ -672,7 +678,7 @@ part of this design.
 
 ## Host-Side Retention Policy
 
-P10 v1 uses simple bounded retention for `/run/lmux/mcp/`:
+P10 v1 uses simple bounded retention for the per-user MCP runtime tree:
 
 ```text
 max retained sessions:       5
@@ -689,7 +695,7 @@ change retention policy per request in v1.
 The per-session 10 MiB budget applies to logical storage owned by:
 
 ```text
-/run/lmux/mcp/sessions/session-<session_id>/
+$XDG_RUNTIME_DIR/lmux/mcp/sessions/session-<session_id>/
 ```
 
 It includes:
@@ -832,15 +838,16 @@ practical.
 P10 v1 should use a single-instance ownership model:
 
 ```text
-one lmux-mcp instance owns /run/lmux/mcp/
+one lmux-mcp instance owns $XDG_RUNTIME_DIR/lmux/mcp/
 ```
 
 A second instance should fail with a clear already-running/resource error
 rather than race the global five-session cleanup. This is the simplest safe
 default for Codex-launched `lmux-mcp`.
 
-Startup should clean stale `/run/lmux/mcp` state from an abnormal previous
-exit. Since the directory is under `/run`, durable recovery is not required.
+Startup should clean stale `$XDG_RUNTIME_DIR/lmux/mcp` state from an abnormal
+previous exit. The runtime tree is non-durable host state, so durable recovery
+is not required.
 Use an ownership marker such as a pid plus process-generation/lock file to
 distinguish:
 
@@ -1241,7 +1248,7 @@ Recommended split:
 
 - Add standalone `lmux-mcp`.
 - Implement session and command token management.
-- Implement file-backed transcript spool under `/run/lmux/mcp`.
+- Implement file-backed transcript spool under `$XDG_RUNTIME_DIR/lmux/mcp`.
 - Implement per-session runtime directories.
 - Implement live human-readable `session.log`.
 - Implement active-session discovery via `current` symlink, `current-<alias>`,
@@ -1249,7 +1256,7 @@ Recommended split:
 - Implement default retention:
   - maximum retained sessions: 5;
   - maximum logical storage per session: 10 MiB.
-- Implement single-instance ownership for `/run/lmux/mcp/` and startup cleanup
+- Implement single-instance ownership for `$XDG_RUNTIME_DIR/lmux/mcp/` and startup cleanup
   of stale runtime directories.
 - Implement cursors, reads, tail reads, and cursor expiration.
 - Implement command start/status/stdin/close/signal/release.

@@ -150,6 +150,8 @@ static int stream_slot_reclaimable(const struct lmux2_stream *s)
         return 1;
     if (s->state == LMUX2_STREAM_TERMINAL && s->rx.len == 0 && s->tx.len == 0)
         return 1;
+    if (s->state == LMUX2_STREAM_RESET && s->rx.len == 0 && s->tx.len == 0)
+        return 1;
     if (s->local_close_sent && s->rx.len == 0 && s->tx.len == 0 &&
         (s->state == LMUX2_STREAM_LOCAL_CLOSED ||
          s->state == LMUX2_STREAM_REMOTE_CLOSED))

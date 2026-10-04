@@ -311,8 +311,23 @@ static int exec_request_test(const char *control, const char *req,
             close(fd);
             return -1;
         }
-        if (re & (POLLHUP | POLLERR | POLLNVAL))
+        if (re & (POLLHUP | POLLERR | POLLNVAL)) {
+            for (;;) {
+                ssize_t r = read(fd, out + len, cap - len - 1);
+                if (r > 0) {
+                    len += (size_t)r;
+                    out[len] = 0;
+                    if (len + 1 >= cap ||
+                        strstr(out, "\nDONE\n") || strstr(out, "ERR EXEC"))
+                        break;
+                    continue;
+                }
+                if (r < 0 && errno == EINTR)
+                    continue;
+                break;
+            }
             break;
+        }
     }
     close(fd);
     return len ? 0 : -1;
@@ -845,6 +860,59 @@ static int hc2_exec_start(int fd, uint64_t req, const char *cwd,
         if (hc2_put_string(p, sizeof(p), &off, argv[i]) < 0)
             return -1;
     return hc2_send_frame(fd, LMUX_HC2_EXEC_START, req, p, (uint32_t)off);
+}
+
+static int hc2_exec_start_ready_ref(int fd, uint64_t req, const char *cwd,
+                                    const char **argv, uint16_t argc,
+                                    uint64_t *ref_out)
+{
+    uint8_t payload[LMUX_HC2_MAX_PAYLOAD];
+    uint16_t type;
+    uint64_t got_req;
+    uint32_t len;
+    long long end = now_ms() + 7000;
+    while (now_ms() < end) {
+        int rem = (int)(end - now_ms());
+        if (hc2_exec_start(fd, req, cwd, argv, argc) < 0)
+            return -1;
+        for (;;) {
+            int rr;
+            rem = (int)(end - now_ms());
+            if (rem <= 0)
+                return -1;
+            rr = hc2_read_frame(fd, &type, &got_req, payload, &len, rem);
+            if (rr < 0)
+                return -1;
+            if (type == LMUX_HC2_ERROR && got_req == req &&
+                len >= 4 &&
+                (lmux_get_le32(payload) == LMUX_HC2_E_NOT_CONNECTED ||
+                 lmux_get_le32(payload) == LMUX_HC2_E_BUSY)) {
+                usleep(20000);
+                break;
+            }
+            if (type == LMUX_HC2_ERROR && got_req == req)
+                return -1;
+            if (type == LMUX_HC2_EXEC_STARTED && got_req == req && len >= 32) {
+                if (ref_out)
+                    *ref_out = hc2_test_get_u64(payload);
+                return 0;
+            }
+            if (got_req != req ||
+                type == LMUX_HC2_EXEC_STDOUT ||
+                type == LMUX_HC2_EXEC_STDERR ||
+                type == LMUX_HC2_EXEC_STATE ||
+                type == LMUX_HC2_EXEC_LOST)
+                continue;
+            return -1;
+        }
+    }
+    return -1;
+}
+
+static int hc2_exec_start_ready(int fd, uint64_t req, const char *cwd,
+                                const char **argv, uint16_t argc)
+{
+    return hc2_exec_start_ready_ref(fd, req, cwd, argv, argc, NULL);
 }
 
 static int hc2_file_start(int fd, uint16_t type, uint64_t req,
@@ -4167,6 +4235,15 @@ static int integration_test(void)
             dump_excerpt("deploy disconnect before activate", out);
             goto out;
         }
+        where = "high-level deploy after disconnect cleanup";
+        if (run_lmux_deploy(control, deploy_src, 30000, out, sizeof(out)) < 0 ||
+            !strstr(out, "OK DEPLOY") ||
+            run_lmux_boot_cli("update-status", control, out, sizeof(out)) < 0 ||
+            !strstr(out, "phase=STABLE") ||
+            !strstr(out, deploy_hex)) {
+            dump_excerpt("deploy after disconnect cleanup", out);
+            goto out;
+        }
         where = "high-level deploy disconnect after activate";
         fd_base = count_fds(host);
         if (fd_base < 0 ||
@@ -6391,11 +6468,77 @@ static int private_exec_basic_test(void)
 
     rc = 0;
 out:
-    if (rc)
+    if (rc) {
         fprintf(stderr, "private_exec_basic where=%s\n", where);
+        if (read_status(control, out, sizeof(out)) == 0)
+            dump_excerpt("private exec final status", out);
+    }
     stop_pid(host);
     stop_pid(sup);
     free(big);
+    unlink(carrier);
+    unlink(control);
+    unlink(console);
+    unlink(file_sock);
+    rmdir(storage);
+    rmdir(dir);
+    return rc;
+}
+
+static int private_exec_stdin_epipe_test(void)
+{
+    char dir[] = "/tmp/lmux-private-exec-epipe-it-XXXXXX";
+    char carrier[160], control[160], console[160], file_sock[160], storage[160];
+    char pty_arg[360], file_arg[240];
+    char out[32768];
+    pid_t sup = -1, host = -1;
+    int rc = 1;
+    const char *where = "setup";
+
+    if (!mkdtemp(dir))
+        return fail("mkdtemp private exec epipe");
+    snprintf(carrier, sizeof(carrier), "%s/carrier.sock", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(console, sizeof(console), "%s/console.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(storage, sizeof(storage), "%s/storage", dir);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+    if (mkdir(storage, 0700) < 0)
+        goto out;
+    sup = spawn_supervisor_with_storage(carrier, storage);
+    if (sup <= 0)
+        goto out;
+    host = spawn_host(carrier, control, pty_arg, file_arg);
+    if (host <= 0)
+        goto out;
+
+    where = "ready";
+    if (wait_ready_layers(control, getenv("LMUX_SUP_IT_OUTER") ? 1 : 0,
+                          15000, out, sizeof(out)) < 0) {
+        dump_excerpt("private exec epipe status", out);
+        goto out;
+    }
+
+    where = "stdin epipe";
+    if (exec_request_test(control,
+                          "EXEC START - 2f62696e2f7368 2d63 6578656320303c262d3b20657869742030 --stdin 00010203040506070809\n",
+                          out, sizeof(out)) < 0 ||
+        !strstr(out, "OK EXEC") ||
+        !strstr(out, "STATUS state=4") ||
+        !strstr(out, "\nDONE\n")) {
+        dump_excerpt("private exec epipe focused", out);
+        goto out;
+    }
+    rc = 0;
+out:
+    if (rc) {
+        fprintf(stderr, "private_exec_stdin_epipe where=%s\n", where);
+        if (read_status(control, out, sizeof(out)) == 0)
+            dump_excerpt("private exec epipe final status", out);
+    }
+    stop_pid(host);
+    stop_pid(sup);
     unlink(carrier);
     unlink(control);
     unlink(console);
@@ -6454,6 +6597,16 @@ static int structured_control_test(void)
     if (wait_ready_layers(control, getenv("LMUX_SUP_IT_OUTER") ? 1 : 0,
                           15000, out, sizeof(out)) < 0)
         goto out;
+    {
+        struct stat st_sock;
+        where = "structured socket mode";
+        if (lstat(structured, &st_sock) < 0 ||
+            (st_sock.st_mode & 0777) != 0777) {
+            fprintf(stderr, "structured socket mode=%03o\n",
+                    (unsigned)(st_sock.st_mode & 0777));
+            goto out;
+        }
+    }
     if (wait_exec_service_ready(control, 15000, out, sizeof(out)) < 0) {
         fprintf(stderr, "has_exec=%d has_type=%d has_ack=%d\n",
                 strstr(out, "__exec") != NULL,
@@ -6490,23 +6643,26 @@ static int structured_control_test(void)
     if (hc2_send_frame(fd, LMUX_HC2_CLIENT_HELLO, 24, NULL, 0) < 0 ||
         hc2_expect_error(fd, 24, LMUX_HC2_E_PROTOCOL) < 0)
         goto out;
+    close(fd);
+    fd = -1;
+    where = "handshake fresh after duplicate";
+    fd = hc2_connect_hello_retry(structured, 3000);
+    if (fd < 0)
+        goto out;
     where = "handshake legacy status";
     if (wait_ready_layers(control, getenv("LMUX_SUP_IT_OUTER") ? 1 : 0,
                           3000, out, sizeof(out)) < 0)
         goto out;
 
     where = "exec stdout stderr";
-    if (hc2_exec_start(fd, 3, "", argv1, 3) < 0)
+    if (hc2_exec_start_ready(fd, 3, "", argv1, 3) < 0)
         goto out;
     done = 0;
     while (!done) {
+        where = "exec stdout stderr read";
         if (hc2_read_frame(fd, &type, &req, payload, &len, 7000) < 0)
             goto out;
-        if (type == LMUX_HC2_EXEC_STARTED && len >= 32) {
-            ref = hc2_test_get_u64(payload);
-            if (!ref)
-                goto out;
-        } else if (type == LMUX_HC2_EXEC_STDOUT && len >= 8) {
+        if (type == LMUX_HC2_EXEC_STDOUT && len >= 8) {
             size_t n = len - 8;
             if (n + strlen(stdout_seen) >= sizeof(stdout_seen))
                 goto out;
@@ -6526,6 +6682,7 @@ static int structured_control_test(void)
             goto out;
         }
     }
+    where = "exec stdout stderr compare";
     if (strcmp(stdout_seen, "OUT") != 0 || strcmp(stderr_seen, "ERR") != 0)
         goto out;
 
@@ -6662,6 +6819,14 @@ static int structured_control_test(void)
         if (type == LMUX_HC2_EXEC_STARTED && len >= 32)
             ref = hc2_test_get_u64(payload);
     }
+    where = "legacy status during structured exec";
+    if (read_status(control, out, sizeof(out)) < 0 ||
+        !strstr(out, "connection: ESTABLISHED") ||
+        !strstr(out, "__exec")) {
+        dump_excerpt("structured legacy status during exec", out);
+        goto out;
+    }
+    where = "disconnect reattach";
     close(fd);
     fd = -1;
     usleep(250000);
@@ -6684,6 +6849,12 @@ static int structured_control_test(void)
         } else if (type == LMUX_HC2_EXEC_STATE && len >= 32 &&
                    payload[16] == V2_EXEC_STATUS_DONE) {
             done = 1;
+        } else if (type == LMUX_HC2_ERROR && req == 8 && len >= 4 &&
+                   (lmux_get_le32(payload) == LMUX_HC2_E_BUSY ||
+                    lmux_get_le32(payload) == LMUX_HC2_E_NOT_CONNECTED)) {
+            hc2_test_put_u64(payload, ref);
+            if (hc2_send_frame(fd, LMUX_HC2_EXEC_ATTACH, 8, payload, 8) < 0)
+                goto out;
         } else if (type == LMUX_HC2_ERROR && len >= 4 &&
                    lmux_get_le32(payload) != LMUX_HC2_OK) {
             goto out;
@@ -6694,8 +6865,194 @@ static int structured_control_test(void)
 
     rc = 0;
 out:
-    if (rc)
+    if (rc) {
         fprintf(stderr, "structured_control where=%s\n", where);
+        fprintf(stderr, "last=%s(%u) req=%llu len=%u err=%u\n",
+                hc2_type_name(type), type, (unsigned long long)req, len,
+                (type == LMUX_HC2_ERROR && len >= 4) ? lmux_get_le32(payload) : 0);
+    }
+    if (fd >= 0)
+        close(fd);
+    stop_pid(host);
+    stop_pid(sup);
+    unlink(carrier);
+    unlink(control);
+    unlink(structured);
+    unlink(console);
+    unlink(file_sock);
+    rmdir(dir);
+    return rc;
+}
+
+static int marker_bad(const char *buf, const char *own, const char *a,
+                      const char *b)
+{
+    return strstr(buf, own) == NULL || strstr(buf, a) != NULL ||
+        strstr(buf, b) != NULL;
+}
+
+static int structured_concurrent_exec_test(void)
+{
+    char dir[] = "/tmp/lmux-structured-concurrent-XXXXXX";
+    char carrier[160], control[160], structured[160], console[160], file_sock[160];
+    char pty_arg[360], file_arg[240], out[32768];
+    pid_t sup = -1, host = -1;
+    int fd = -1, rc = 1;
+    uint8_t payload[LMUX_HC2_MAX_PAYLOAD];
+    uint16_t type;
+    uint64_t req, refs[4] = {0, 0, 0, 0};
+    uint32_t len;
+    const char *argv_a[] = {"/bin/sh", "-c", "i=0; while [ $i -lt 10 ]; do echo AAA:$i; i=$((i+1)); sleep 1; done"};
+    const char *argv_b[] = {"/bin/sh", "-c", "i=0; while [ $i -lt 10 ]; do echo BBB:$i; i=$((i+1)); sleep 1; done"};
+    const char *argv_c[] = {"/bin/sh", "-c", "i=0; while [ $i -lt 10 ]; do echo CCC:$i; i=$((i+1)); sleep 1; done"};
+    const char *argv_d[] = {"/bin/echo", "ONESHOT"};
+    const char *argv_e[] = {"/bin/echo", "EXTRA"};
+    const char **argvs[4] = {argv_a, argv_b, argv_c, argv_d};
+    char seen[4][512];
+    int got_marker[4] = {0, 0, 0, 0};
+    int done[4] = {0, 0, 0, 0};
+    int over_capacity_seen = 0;
+    long long end;
+    const char *where = "setup";
+    int i, j;
+
+    memset(seen, 0, sizeof(seen));
+    if (!mkdtemp(dir))
+        return fail("mkdtemp structured concurrent");
+    snprintf(carrier, sizeof(carrier), "%s/carrier.sock", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(structured, sizeof(structured), "%s/control-v2.sock", dir);
+    snprintf(console, sizeof(console), "%s/console.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+
+    sup = spawn_supervisor_with_storage(carrier, NULL);
+    if (sup <= 0)
+        goto out;
+    host = spawn_host_structured(carrier, control, structured, pty_arg, file_arg);
+    if (host <= 0)
+        goto out;
+    where = "ready";
+    if (wait_ready_layers(control, getenv("LMUX_SUP_IT_OUTER") ? 1 : 0,
+                          15000, out, sizeof(out)) < 0 ||
+        wait_exec_service_ready(control, 15000, out, sizeof(out)) < 0)
+        goto out;
+    fd = hc2_connect_hello_retry(structured, 3000);
+    if (fd < 0)
+        goto out;
+
+    where = "start A/B/C/D";
+    for (i = 0; i < 4; i++)
+        if (hc2_exec_start_ready_ref(fd, 100 + (uint64_t)i, "",
+                                     argvs[i], i == 3 ? 2 : 3,
+                                     &refs[i]) < 0 || refs[i] == 0)
+            goto out;
+    for (i = 0; i < 4; i++)
+        for (j = i + 1; j < 4; j++)
+            if (refs[i] == refs[j])
+                goto out;
+
+    where = "over capacity";
+    if (hc2_exec_start(fd, 200, "", argv_e, 2) < 0)
+        goto out;
+    end = now_ms() + 3000;
+    while (now_ms() < end && !over_capacity_seen) {
+        if (hc2_read_frame(fd, &type, &req, payload, &len,
+                           (int)(end - now_ms())) < 0)
+            goto out;
+        if (type == LMUX_HC2_ERROR && req == 200 && len >= 4 &&
+            (lmux_get_le32(payload) == LMUX_HC2_E_RESOURCE_LIMIT ||
+             lmux_get_le32(payload) == LMUX_HC2_E_BUSY)) {
+            over_capacity_seen = 1;
+            break;
+        }
+        if (type == LMUX_HC2_EXEC_STDOUT && len >= 8) {
+            uint64_t ref = hc2_test_get_u64(payload);
+            for (i = 0; i < 4; i++) {
+                if (ref == refs[i]) {
+                    size_t old = strlen(seen[i]), n = len - 8;
+                    if (old + n >= sizeof(seen[i]))
+                        goto out;
+                    memcpy(seen[i] + old, payload + 8, n);
+                    break;
+                }
+            }
+        } else if (type == LMUX_HC2_EXEC_STATE && len >= 32) {
+            uint64_t ref = hc2_test_get_u64(payload);
+            for (i = 0; i < 4; i++)
+                if (ref == refs[i] && payload[16] == V2_EXEC_STATUS_DONE)
+                    done[i] = 1;
+        } else if (type == LMUX_HC2_ERROR && req == 200) {
+            goto out;
+        }
+    }
+    if (!over_capacity_seen)
+        goto out;
+
+    where = "legacy status while running";
+    if (read_status(control, out, sizeof(out)) < 0 ||
+        !strstr(out, "connection: ESTABLISHED") ||
+        !strstr(out, "__exec"))
+        goto out;
+
+    where = "collect concurrent output";
+    end = now_ms() + 16000;
+    while (now_ms() < end) {
+        if (!got_marker[0] && strstr(seen[0], "AAA:1"))
+            got_marker[0] = 1;
+        if (!got_marker[1] && strstr(seen[1], "BBB:1"))
+            got_marker[1] = 1;
+        if (!got_marker[2] && strstr(seen[2], "CCC:1"))
+            got_marker[2] = 1;
+        if (!got_marker[3] && strcmp(seen[3], "ONESHOT\n") == 0)
+            got_marker[3] = 1;
+        if (got_marker[0] && got_marker[1] && got_marker[2] &&
+            got_marker[3] && done[3] && !done[0] && !done[1] && !done[2])
+            break;
+        if (hc2_read_frame(fd, &type, &req, payload, &len,
+                           (int)(end - now_ms())) < 0)
+            goto out;
+        if (type == LMUX_HC2_EXEC_STDOUT && len >= 8) {
+            uint64_t ref = hc2_test_get_u64(payload);
+            for (i = 0; i < 4; i++) {
+                if (ref == refs[i]) {
+                    size_t old = strlen(seen[i]), n = len - 8;
+                    if (old + n >= sizeof(seen[i]))
+                        goto out;
+                    memcpy(seen[i] + old, payload + 8, n);
+                    break;
+                }
+            }
+        } else if (type == LMUX_HC2_EXEC_STATE && len >= 32) {
+            uint64_t ref = hc2_test_get_u64(payload);
+            for (i = 0; i < 4; i++)
+                if (ref == refs[i] && payload[16] == V2_EXEC_STATUS_DONE)
+                    done[i] = 1;
+        } else if (type == LMUX_HC2_ERROR) {
+            goto out;
+        }
+    }
+    if (!got_marker[0] || !got_marker[1] || !got_marker[2] ||
+        !got_marker[3] || !done[3] || done[0] || done[1] || done[2])
+        goto out;
+    if (marker_bad(seen[0], "AAA:", "BBB:", "CCC:") ||
+        marker_bad(seen[1], "BBB:", "AAA:", "CCC:") ||
+        marker_bad(seen[2], "CCC:", "AAA:", "BBB:") ||
+        strcmp(seen[3], "ONESHOT\n") != 0)
+        goto out;
+
+    rc = 0;
+out:
+    if (rc) {
+        fprintf(stderr, "structured_concurrent where=%s\n", where);
+        fprintf(stderr, "refs=%llu,%llu,%llu,%llu done=%d,%d,%d,%d\n",
+                (unsigned long long)refs[0], (unsigned long long)refs[1],
+                (unsigned long long)refs[2], (unsigned long long)refs[3],
+                done[0], done[1], done[2], done[3]);
+        fprintf(stderr, "A=%s\nB=%s\nC=%s\nD=%s\n",
+                seen[0], seen[1], seen[2], seen[3]);
+    }
     if (fd >= 0)
         close(fd);
     stop_pid(host);
@@ -6799,18 +7156,18 @@ static int structured_lmux_reconnect_test(void)
         dump_excerpt("structured reconnect initial exec", out);
         goto out;
     }
+    where = "structured hello";
     fd = hc2_connect_hello(structured);
-    if (fd < 0 || hc2_exec_start(fd, 101, "", argv, 3) < 0)
+    where = "structured start";
+    if (fd < 0 ||
+        hc2_exec_start_ready_ref(fd, 101, "", argv, 3, &ref) < 0 ||
+        !ref)
         goto out;
     where = "prefix";
     while (!strstr(stdout_seen, "PRE")) {
         if (hc2_read_frame(fd, &type, &req, payload, &len, 7000) < 0)
             goto out;
-        if (type == LMUX_HC2_EXEC_STARTED && len >= 32) {
-            ref = hc2_test_get_u64(payload);
-            if (!ref)
-                goto out;
-        } else if (type == LMUX_HC2_EXEC_STDOUT && len >= 8) {
+        if (type == LMUX_HC2_EXEC_STDOUT && len >= 8) {
             size_t old = strlen(stdout_seen), n = len - 8;
             if (old + n >= sizeof(stdout_seen))
                 goto out;
@@ -7001,17 +7358,15 @@ static int structured_worker_replacement_test(void)
         wait_exec_service_ready(control, 15000, out, sizeof(out)) < 0)
         goto out;
     fd = hc2_connect_hello(structured);
-    if (fd < 0 || hc2_exec_start(fd, 201, "", argv, 3) < 0)
+    if (fd < 0 ||
+        hc2_exec_start_ready_ref(fd, 201, "", argv, 3, &ref) < 0 ||
+        !ref)
         goto out;
     where = "prefix";
     while (!strstr(stdout_seen, "PRE")) {
         if (hc2_read_frame(fd, &type, &req, payload, &len, 7000) < 0)
             goto out;
-        if (type == LMUX_HC2_EXEC_STARTED && len >= 32) {
-            ref = hc2_test_get_u64(payload);
-            if (!ref)
-                goto out;
-        } else if (type == LMUX_HC2_EXEC_STDOUT && len >= 8) {
+        if (type == LMUX_HC2_EXEC_STDOUT && len >= 8) {
             size_t old = strlen(stdout_seen), n = len - 8;
             if (old + n >= sizeof(stdout_seen))
                 goto out;
@@ -7072,7 +7427,8 @@ static int structured_worker_replacement_test(void)
         goto out;
 
     where = "fresh exec without old release";
-    if (hc2_exec_start(fd, 207, "", argv_true, 1) < 0)
+    if (hc2_exec_start_ready_ref(fd, 207, "", argv_true, 1, &fresh_ref) < 0 ||
+        !fresh_ref || fresh_ref == ref)
         goto out;
     done = 0;
     while (!done) {
@@ -7083,13 +7439,7 @@ static int structured_worker_replacement_test(void)
         last_len = len;
         if (type == LMUX_HC2_ERROR && len >= 4)
             last_error = lmux_get_le32(payload);
-        if (type == LMUX_HC2_EXEC_STARTED && len >= 32) {
-            fresh_ref = hc2_test_get_u64(payload);
-            if (!fresh_ref || fresh_ref == ref)
-                goto out;
-            if (payload[16] == V2_EXEC_STATUS_DONE)
-                done = 1;
-        } else if (type == LMUX_HC2_EXEC_STDOUT && len >= 8) {
+        if (type == LMUX_HC2_EXEC_STDOUT && len >= 8) {
             size_t old = strlen(fresh_stdout_seen), n = len - 8;
             if (old + n >= sizeof(fresh_stdout_seen))
                 goto out;
@@ -7103,6 +7453,10 @@ static int structured_worker_replacement_test(void)
             goto out;
         }
     }
+    if (getenv("LMUX_SUP_IT_ONLY_STRUCTURED_WORKER_FRESH")) {
+        rc = 0;
+        goto out;
+    }
 
     where = "release old lost ref";
     hc2_test_put_u64(payload, ref);
@@ -7111,7 +7465,8 @@ static int structured_worker_replacement_test(void)
         goto out;
 
     where = "fresh exec after old release";
-    if (hc2_exec_start(fd, 209, "", argv_true, 1) < 0)
+    if (hc2_exec_start_ready_ref(fd, 209, "", argv_true, 1, &second_ref) < 0 ||
+        !second_ref || second_ref == ref || second_ref == fresh_ref)
         goto out;
     done = 0;
     while (!done) {
@@ -7122,13 +7477,7 @@ static int structured_worker_replacement_test(void)
         last_len = len;
         if (type == LMUX_HC2_ERROR && len >= 4)
             last_error = lmux_get_le32(payload);
-        if (type == LMUX_HC2_EXEC_STARTED && len >= 32) {
-            second_ref = hc2_test_get_u64(payload);
-            if (!second_ref || second_ref == ref || second_ref == fresh_ref)
-                goto out;
-            if (payload[16] == V2_EXEC_STATUS_DONE)
-                done = 1;
-        } else if (type == LMUX_HC2_EXEC_STATE && len >= 32 &&
+        if (type == LMUX_HC2_EXEC_STATE && len >= 32 &&
                    payload[16] == V2_EXEC_STATUS_DONE) {
             done = 1;
         } else if (type == LMUX_HC2_EXEC_LOST ||
@@ -7157,6 +7506,626 @@ out:
     unlink(console);
     unlink(file_sock);
     rmdir(dir);
+    return rc;
+}
+
+static int structured_multi_reconnect_test(void)
+{
+    char dir[] = "/tmp/lmux-structured-mreconnect-XXXXXX";
+    char carrier[160], control[160], structured[160], console[160], file_sock[160];
+    char pty_arg[360], file_arg[240], out[32768];
+    int host_pair[2] = {-1, -1}, target_pair[2] = {-1, -1};
+    int arm[2] = {-1, -1}, note[2] = {-1, -1};
+    pid_t proxy = -1, sup = -1, host = -1;
+    int fd = -1, console_fd = -1, rc = 1;
+    uint8_t payload[LMUX_HC2_MAX_PAYLOAD], stdin_payload[64];
+    uint16_t type;
+    uint64_t req, refs[3] = {0, 0, 0};
+    uint32_t len;
+    const char *argv_a[] = {"/bin/sh", "-c", "printf AAA_PRE; cat; printf AAA_SUF"};
+    const char *argv_b[] = {"/bin/sh", "-c", "printf BBB_PRE; cat; printf BBB_SUF"};
+    const char *argv_c[] = {"/bin/sh", "-c", "printf CCC_PRE; cat; printf CCC_SUF"};
+    const char **argvs[3] = {argv_a, argv_b, argv_c};
+    const char *prefix[3] = {"AAA_PRE", "BBB_PRE", "CCC_PRE"};
+    const char *mid[3] = {"AAA_MID", "BBB_MID", "CCC_MID"};
+    const char *want[3] = {
+        "AAA_PREAAA_MIDAAA_SUF",
+        "BBB_PREBBB_MIDBBB_SUF",
+        "CCC_PRECCC_MIDCCC_SUF"
+    };
+    char seen[3][128];
+    int pref[3] = {0, 0, 0}, reattached[3] = {0, 0, 0}, done[3] = {0, 0, 0};
+    int i;
+    const char *where = "setup";
+    uint16_t last_type = 0;
+    uint64_t last_req = 0;
+    uint32_t last_len = 0, last_err0 = 0, last_err8 = 0;
+    int last_read_rc = 0;
+    struct saved_env outer_env = {0, NULL};
+
+    memset(seen, 0, sizeof(seen));
+    if (!mkdtemp(dir))
+        return fail("mkdtemp structured multi reconnect");
+    snprintf(carrier, sizeof(carrier), "%s/proxy.sock", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(structured, sizeof(structured), "%s/control-v2.sock", dir);
+    snprintf(console, sizeof(console), "%s/console.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, host_pair) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, target_pair) < 0 ||
+        pipe(arm) < 0 || pipe(note) < 0)
+        goto out;
+    proxy = spawn_fault_proxy_fds(host_pair[0], target_pair[0],
+                                  OUTER_FAULT_BAD_CRC,
+                                  OUTER_FAULT_TARGET_TO_HOST,
+                                  arm[0], note[1]);
+    close(host_pair[0]); host_pair[0] = -1;
+    close(target_pair[0]); target_pair[0] = -1;
+    close(arm[0]); arm[0] = -1;
+    close(note[1]); note[1] = -1;
+    if (proxy < 0)
+        goto out;
+    sup = spawn_supervisor_fd(target_pair[1], 1);
+    close(target_pair[1]); target_pair[1] = -1;
+    if (sup < 0 || save_env_var(&outer_env, "LMUX_SUP_IT_OUTER") < 0)
+        goto out;
+    setenv("LMUX_SUP_IT_OUTER", "1", 1);
+    host = spawn_host_fd_structured(host_pair[1], control, structured,
+                                    pty_arg, file_arg, 1);
+    restore_env_var("LMUX_SUP_IT_OUTER", &outer_env);
+    close(host_pair[1]); host_pair[1] = -1;
+    if (host < 0 ||
+        wait_ready_layers(control, 1, 15000, out, sizeof(out)) < 0 ||
+        wait_exec_service_ready(control, 15000, out, sizeof(out)) < 0)
+        goto out;
+    fd = hc2_connect_hello(structured);
+    if (fd < 0)
+        goto out;
+    where = "start";
+    for (i = 0; i < 3; i++) {
+        if (hc2_exec_start_ready_ref(fd, 300 + (uint64_t)i, "",
+                                     argvs[i], 3, &refs[i]) < 0 || !refs[i])
+            goto out;
+        where = "prefix";
+        while (!pref[i]) {
+            if (hc2_read_frame(fd, &type, &req, payload, &len, 7000) < 0)
+                goto out;
+            if (type == LMUX_HC2_EXEC_STDOUT && len >= 8) {
+                uint64_t ref = hc2_test_get_u64(payload);
+                int j;
+                for (j = 0; j < 3; j++) {
+                    if (ref == refs[j]) {
+                        size_t old = strlen(seen[j]), n = len - 8;
+                        if (old + n >= sizeof(seen[j]))
+                            goto out;
+                        memcpy(seen[j] + old, payload + 8, n);
+                        if (strstr(seen[j], prefix[j]))
+                            pref[j] = 1;
+                    }
+                }
+            } else if (type == LMUX_HC2_ERROR) {
+                goto out;
+            }
+        }
+        where = "start";
+    }
+    where = "fault";
+    console_fd = wait_connect(console, 5000);
+    {
+        const char *fault_cmd = "printf RECONNECT_FAULT\\n\n";
+        if (console_fd < 0 || write_all(arm[1], "A", 1) < 0 ||
+            write_all(console_fd, fault_cmd, strlen(fault_cmd)) < 0 ||
+        wait_fault_injected(note[0], 5000) < 0)
+            goto out;
+    }
+    close(console_fd); console_fd = -1;
+    where = "reattach";
+    while (!reattached[0] || !reattached[1] || !reattached[2]) {
+        if (hc2_read_frame(fd, &type, &req, payload, &len, 15000) < 0)
+            goto out;
+        if (type == LMUX_HC2_EXEC_STATE && req == 0 && len >= 32) {
+            uint64_t ref = hc2_test_get_u64(payload);
+            for (i = 0; i < 3; i++)
+                if (ref == refs[i])
+                    reattached[i] = 1;
+        } else if (type == LMUX_HC2_ERROR && len >= 4 &&
+                   lmux_get_le32(payload) == LMUX_HC2_OK) {
+            continue;
+        } else if (type == LMUX_HC2_EXEC_LOST || type == LMUX_HC2_ERROR) {
+            goto out;
+        }
+    }
+    where = "stdin";
+    for (i = 0; i < 3; i++) {
+        size_t n = strlen(mid[i]);
+        hc2_test_put_u64(stdin_payload, refs[i]);
+        memcpy(stdin_payload + 8, mid[i], n);
+        if (hc2_send_frame(fd, LMUX_HC2_EXEC_STDIN_DATA, 400 + (uint64_t)i,
+                           stdin_payload, (uint32_t)(8 + n)) < 0 ||
+            hc2_send_frame(fd, LMUX_HC2_EXEC_STDIN_CLOSE, 410 + (uint64_t)i,
+                           stdin_payload, 8) < 0)
+            goto out;
+    }
+    where = "finish";
+    while (!done[0] || !done[1] || !done[2]) {
+        last_read_rc = hc2_read_frame(fd, &type, &req, payload, &len, 15000);
+        if (last_read_rc < 0)
+            goto out;
+        last_type = type;
+        last_req = req;
+        last_len = len;
+        last_err0 = len >= 4 ? lmux_get_le32(payload) : 0;
+        last_err8 = len >= 12 ? lmux_get_le32(payload + 8) : 0;
+        if (type == LMUX_HC2_EXEC_STDOUT && len >= 8) {
+            uint64_t ref = hc2_test_get_u64(payload);
+            for (i = 0; i < 3; i++) {
+                if (ref == refs[i]) {
+                    size_t old = strlen(seen[i]), n = len - 8;
+                    if (old + n >= sizeof(seen[i]))
+                        goto out;
+                    memcpy(seen[i] + old, payload + 8, n);
+                }
+            }
+        } else if (type == LMUX_HC2_EXEC_STATE && len >= 32 &&
+                   payload[16] == V2_EXEC_STATUS_DONE) {
+            uint64_t ref = hc2_test_get_u64(payload);
+            for (i = 0; i < 3; i++)
+                if (ref == refs[i])
+                    done[i] = 1;
+        } else if (type == LMUX_HC2_ERROR && len >= 4 &&
+                   lmux_get_le32(payload) == LMUX_HC2_OK) {
+            continue;
+        } else if (type == LMUX_HC2_EXEC_LOST || type == LMUX_HC2_ERROR) {
+            goto out;
+        }
+    }
+    for (i = 0; i < 3; i++)
+        if (strcmp(seen[i], want[i]) != 0)
+            goto out;
+    rc = 0;
+out:
+    if (rc)
+        fprintf(stderr, "structured_multi_reconnect where=%s A=%s B=%s C=%s last=%u req=%llu len=%u err0=%u err8=%u read_rc=%d\n",
+                where, seen[0], seen[1], seen[2], last_type,
+                (unsigned long long)last_req, last_len, last_err0, last_err8,
+                last_read_rc);
+    if (fd >= 0) close(fd);
+    if (console_fd >= 0) close(console_fd);
+    stop_pid(host); stop_pid(sup); stop_pid(proxy);
+    if (host_pair[0] >= 0) close(host_pair[0]);
+    if (host_pair[1] >= 0) close(host_pair[1]);
+    if (target_pair[0] >= 0) close(target_pair[0]);
+    if (target_pair[1] >= 0) close(target_pair[1]);
+    if (arm[0] >= 0) close(arm[0]);
+    if (arm[1] >= 0) close(arm[1]);
+    if (note[0] >= 0) close(note[0]);
+    if (note[1] >= 0) close(note[1]);
+    unlink(carrier); unlink(control); unlink(structured);
+    unlink(console); unlink(file_sock); rmdir(dir);
+    return rc;
+}
+
+static int structured_multi_worker_replacement_test(void)
+{
+    char dir[] = "/tmp/lmux-structured-mworker-XXXXXX";
+    char carrier[160], control[160], structured[160], console[160], file_sock[160];
+    char pty_arg[360], file_arg[240], out[32768];
+    pid_t sup = -1, host = -1, worker = -1, worker2 = -1;
+    int fd = -1, rc = 1;
+    uint8_t payload[LMUX_HC2_MAX_PAYLOAD];
+    uint16_t type = 0;
+    uint64_t req = 0, refs[3] = {0, 0, 0}, fresh = 0;
+    uint32_t len = 0;
+    const char *argv_a[] = {"/bin/sh", "-c", "printf AAA; sleep 120"};
+    const char *argv_b[] = {"/bin/sh", "-c", "printf BBB; sleep 120"};
+    const char *argv_c[] = {"/bin/sh", "-c", "printf CCC; sleep 120"};
+    const char *argv_true[] = {"/bin/true"};
+    const char **argvs[3] = {argv_a, argv_b, argv_c};
+    char seen[3][32];
+    int pref[3] = {0, 0, 0}, lost[3] = {0, 0, 0}, done = 0;
+    int i;
+    const char *where = "setup";
+    memset(seen, 0, sizeof(seen));
+    if (!mkdtemp(dir))
+        return fail("mkdtemp structured multi worker");
+    snprintf(carrier, sizeof(carrier), "%s/carrier.sock", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(structured, sizeof(structured), "%s/control-v2.sock", dir);
+    snprintf(console, sizeof(console), "%s/console.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+    sup = spawn_supervisor_with_storage(carrier, NULL);
+    if (sup <= 0)
+        goto out;
+    worker = wait_child_pid(sup, -1, 10000);
+    host = spawn_host_structured(carrier, control, structured, pty_arg, file_arg);
+    if (worker <= 0 || host <= 0 ||
+        wait_ready_layers(control, getenv("LMUX_SUP_IT_OUTER") ? 1 : 0,
+                          15000, out, sizeof(out)) < 0 ||
+        wait_exec_service_ready(control, 15000, out, sizeof(out)) < 0)
+        goto out;
+    fd = hc2_connect_hello(structured);
+    if (fd < 0)
+        goto out;
+    where = "start";
+    for (i = 0; i < 3; i++) {
+        if (hc2_exec_start_ready_ref(fd, 500 + (uint64_t)i, "",
+                                     argvs[i], 3, &refs[i]) < 0 || !refs[i])
+            goto out;
+        where = "prefix";
+        while (!pref[i]) {
+            if (hc2_read_frame(fd, &type, &req, payload, &len, 7000) < 0)
+                goto out;
+            if (type == LMUX_HC2_EXEC_STDOUT && len >= 8) {
+                uint64_t ref = hc2_test_get_u64(payload);
+                int j;
+                for (j = 0; j < 3; j++) {
+                    if (ref == refs[j]) {
+                        size_t old = strlen(seen[j]), n = len - 8;
+                        if (old + n >= sizeof(seen[j]))
+                            goto out;
+                        memcpy(seen[j] + old, payload + 8, n);
+                        if ((j == 0 && strstr(seen[j], "AAA")) ||
+                            (j == 1 && strstr(seen[j], "BBB")) ||
+                            (j == 2 && strstr(seen[j], "CCC")))
+                            pref[j] = 1;
+                    }
+                }
+            } else if (type == LMUX_HC2_ERROR) {
+                goto out;
+            }
+        }
+        where = "start";
+    }
+    where = "replace";
+    kill(worker, SIGKILL);
+    worker2 = wait_child_pid(sup, worker, 10000);
+    if (worker2 <= 0 || worker2 == worker ||
+        wait_ready_layers(control, getenv("LMUX_SUP_IT_OUTER") ? 1 : 0,
+                          15000, out, sizeof(out)) < 0 ||
+        wait_exec_service_ready(control, 15000, out, sizeof(out)) < 0)
+        goto out;
+    where = "lost";
+    while (!lost[0] || !lost[1] || !lost[2]) {
+        if (hc2_read_frame(fd, &type, &req, payload, &len, 10000) < 0)
+            goto out;
+        if (type == LMUX_HC2_EXEC_LOST && len >= 12) {
+            uint64_t ref = hc2_test_get_u64(payload);
+            for (i = 0; i < 3; i++) {
+                if (ref == refs[i]) {
+                    if (lost[i])
+                        goto out;
+                    lost[i] = 1;
+                }
+            }
+        } else if (type == LMUX_HC2_EXEC_STDOUT || type == LMUX_HC2_ERROR) {
+            goto out;
+        }
+    }
+    where = "fresh";
+    if (hc2_exec_start_ready_ref(fd, 600, "", argv_true, 1, &fresh) < 0 ||
+        !fresh)
+        goto out;
+    while (!done) {
+        if (hc2_read_frame(fd, &type, &req, payload, &len, 7000) < 0)
+            goto out;
+        if (type == LMUX_HC2_EXEC_STATE && len >= 32 &&
+            payload[16] == V2_EXEC_STATUS_DONE)
+            done = 1;
+        else if (type == LMUX_HC2_EXEC_LOST || type == LMUX_HC2_ERROR)
+            goto out;
+    }
+    rc = 0;
+out:
+    if (rc)
+        fprintf(stderr, "structured_multi_worker where=%s A=%s B=%s C=%s\n",
+                where, seen[0], seen[1], seen[2]);
+    if (fd >= 0) close(fd);
+    stop_pid(host); stop_pid(sup);
+    unlink(carrier); unlink(control); unlink(structured);
+    unlink(console); unlink(file_sock); rmdir(dir);
+    return rc;
+}
+
+static int structured_control_scheduler_test(void)
+{
+    char dir[] = "/tmp/lmux-structured-scheduler-XXXXXX";
+    char carrier[160], control[160], structured[160], console[160], file_sock[160];
+    char pty_arg[360], file_arg[240], out[32768];
+    pid_t sup = -1, host = -1;
+    int fd = -1, rc = 1;
+    uint8_t payload[LMUX_HC2_MAX_PAYLOAD];
+    uint16_t type = 0;
+    uint64_t req = 0, refs[3] = {0, 0, 0};
+    uint64_t reqs[9];
+    uint32_t len = 0;
+    int pending[9];
+    int remaining = 9;
+    int i, j;
+    long long end;
+    const char *argv_a[] = {"/bin/sh", "-c", "trap '' INT TERM HUP; printf AAA; sleep 4; printf AAA_DONE"};
+    const char *argv_b[] = {"/bin/sh", "-c", "trap '' INT TERM HUP; printf BBB; sleep 4; printf BBB_DONE"};
+    const char *argv_c[] = {"/bin/sh", "-c", "trap '' INT TERM HUP; printf CCC; sleep 4; printf CCC_DONE"};
+    const char **argvs[3] = {argv_a, argv_b, argv_c};
+    const char *where = "setup";
+
+    if (!mkdtemp(dir))
+        return fail("mkdtemp structured scheduler");
+    snprintf(carrier, sizeof(carrier), "%s/carrier.sock", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(structured, sizeof(structured), "%s/control-v2.sock", dir);
+    snprintf(console, sizeof(console), "%s/console.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+    sup = spawn_supervisor_with_storage(carrier, NULL);
+    if (sup <= 0)
+        goto out;
+    host = spawn_host_structured(carrier, control, structured, pty_arg, file_arg);
+    if (host <= 0 ||
+        wait_ready_layers(control, getenv("LMUX_SUP_IT_OUTER") ? 1 : 0,
+                          15000, out, sizeof(out)) < 0 ||
+        wait_exec_service_ready(control, 15000, out, sizeof(out)) < 0)
+        goto out;
+    fd = hc2_connect_hello_retry(structured, 3000);
+    if (fd < 0)
+        goto out;
+    where = "start";
+    for (i = 0; i < 3; i++)
+        if (hc2_exec_start_ready_ref(fd, 700 + (uint64_t)i, "",
+                                     argvs[i], 3, &refs[i]) < 0 ||
+            !refs[i])
+            goto out;
+    where = "burst control";
+    memset(pending, 1, sizeof(pending));
+    for (i = 0; i < 3; i++) {
+        uint64_t base = 800 + (uint64_t)i * 3;
+        hc2_test_put_u64(payload, refs[i]);
+        reqs[i * 3] = base;
+        reqs[i * 3 + 1] = base + 1;
+        reqs[i * 3 + 2] = base + 2;
+        if (hc2_send_frame(fd, LMUX_HC2_EXEC_STATUS, base, payload, 8) < 0)
+            goto out;
+        payload[8] = LMUX_HC2_SIG_HUP;
+        if (hc2_send_frame(fd, LMUX_HC2_EXEC_SIGNAL, base + 1, payload, 9) < 0)
+            goto out;
+        if (hc2_send_frame(fd, LMUX_HC2_EXEC_STATUS, base + 2, payload, 8) < 0)
+            goto out;
+    }
+    where = "burst replies";
+    end = now_ms() + 12000;
+    while (remaining > 0 && now_ms() < end) {
+        if (hc2_read_frame(fd, &type, &req, payload, &len,
+                           (int)(end - now_ms())) < 0)
+            goto out;
+        if (type == LMUX_HC2_ERROR && len >= 4) {
+            uint32_t code = lmux_get_le32(payload);
+            if (code == LMUX_HC2_E_BUSY)
+                goto out;
+            for (j = 0; j < 9; j++) {
+                if (pending[j] && req == reqs[j]) {
+                    if (code != LMUX_HC2_OK)
+                        goto out;
+                    pending[j] = 0;
+                    remaining--;
+                    break;
+                }
+            }
+        } else if (type == LMUX_HC2_EXEC_STATE && len >= 32) {
+            for (j = 0; j < 9; j++) {
+                if (pending[j] && req == reqs[j]) {
+                    pending[j] = 0;
+                    remaining--;
+                    break;
+                }
+            }
+        } else if (type == LMUX_HC2_EXEC_LOST) {
+            goto out;
+        }
+    }
+    if (remaining != 0)
+        goto out;
+    rc = 0;
+out:
+    if (rc)
+        fprintf(stderr, "structured_control_scheduler where=%s remaining=%d last=%s(%u) req=%llu len=%u err=%u\n",
+                where, remaining, hc2_type_name(type), type,
+                (unsigned long long)req, len,
+                (type == LMUX_HC2_ERROR && len >= 4) ? lmux_get_le32(payload) : 0);
+    if (fd >= 0)
+        close(fd);
+    stop_pid(host); stop_pid(sup);
+    unlink(carrier); unlink(control); unlink(structured);
+    unlink(console); unlink(file_sock); rmdir(dir);
+    return rc;
+}
+
+static int structured_deploy_coexistence_test(void)
+{
+    char dir[] = "/tmp/lmux-structured-deploy-XXXXXX";
+    char storage[200], carrier[200], control[200], structured[200];
+    char console[200], file_sock[200], pty_arg[420], file_arg[260];
+    char deploy_src[220], out[65536];
+    pid_t sup = -1, host = -1;
+    int fd = -1, rc = 1;
+    uint8_t payload[LMUX_HC2_MAX_PAYLOAD];
+    uint16_t type = 0;
+    uint64_t req = 0, refs[3] = {0, 0, 0}, fresh = 0;
+    uint32_t len = 0;
+    const char *argv_a[] = {"/bin/sh", "-c", "printf AAA; sleep 120"};
+    const char *argv_b[] = {"/bin/sh", "-c", "printf BBB; sleep 120"};
+    const char *argv_c[] = {"/bin/sh", "-c", "printf CCC; sleep 120"};
+    const char *argv_true[] = {"/bin/true"};
+    const char **argvs[3] = {argv_a, argv_b, argv_c};
+    char seen[3][32];
+    int pref[3] = {0, 0, 0}, terminal[3] = {0, 0, 0}, done = 0;
+    int i;
+    const char *where = "setup";
+
+    memset(seen, 0, sizeof(seen));
+    if (!mkdtemp(dir))
+        return fail("mkdtemp structured deploy");
+    snprintf(storage, sizeof(storage), "%s/storage", dir);
+    snprintf(carrier, sizeof(carrier), "%s/carrier.sock", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(structured, sizeof(structured), "%s/control-v2.sock", dir);
+    snprintf(console, sizeof(console), "%s/console.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(deploy_src, sizeof(deploy_src), "%s/deploy-worker.lmuxd", dir);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+    if (mkdir(storage, 0700) < 0)
+        goto out;
+    sup = spawn_supervisor_with_storage(carrier, storage);
+    if (sup <= 0)
+        goto out;
+    host = spawn_host_structured(carrier, control, structured, pty_arg, file_arg);
+    if (host <= 0 ||
+        wait_ready_layers(control, getenv("LMUX_SUP_IT_OUTER") ? 1 : 0,
+                          15000, out, sizeof(out)) < 0 ||
+        wait_exec_service_ready(control, 15000, out, sizeof(out)) < 0)
+        goto out;
+    fd = hc2_connect_hello_retry(structured, 3000);
+    if (fd < 0)
+        goto out;
+    where = "start";
+    for (i = 0; i < 3; i++) {
+        if (hc2_exec_start_ready_ref(fd, 900 + (uint64_t)i, "",
+                                     argvs[i], 3, &refs[i]) < 0 ||
+            !refs[i])
+            goto out;
+        where = "prefix";
+        while (!pref[i]) {
+            if (hc2_read_frame(fd, &type, &req, payload, &len, 7000) < 0)
+                goto out;
+            if (type == LMUX_HC2_EXEC_STDOUT && len >= 8) {
+                uint64_t ref = hc2_test_get_u64(payload);
+                int j;
+                for (j = 0; j < 3; j++) {
+                    if (ref == refs[j]) {
+                        size_t old = strlen(seen[j]), n = len - 8;
+                        if (old + n >= sizeof(seen[j]))
+                            goto out;
+                        memcpy(seen[j] + old, payload + 8, n);
+                        if ((j == 0 && strstr(seen[j], "AAA")) ||
+                            (j == 1 && strstr(seen[j], "BBB")) ||
+                            (j == 2 && strstr(seen[j], "CCC")))
+                            pref[j] = 1;
+                    }
+                }
+            } else if (type == LMUX_HC2_ERROR) {
+                goto out;
+            }
+        }
+        where = "start";
+    }
+    where = "legacy status";
+    if (read_status(control, out, sizeof(out)) < 0 ||
+        !strstr(out, "connection: ESTABLISHED") ||
+        !strstr(out, "__exec"))
+        goto out;
+    where = "deploy busy";
+    if (copy_with_suffix("build/host/lmuxd", deploy_src,
+                         "LMUX_STRUCTURED_DEPLOY_CANDIDATE\n") < 0 ||
+        run_lmux_deploy(control, deploy_src, 120000, out, sizeof(out)) == 0 ||
+        !strstr(out, "ERR DEPLOY BUSY structured-exec-active")) {
+        dump_excerpt("structured deploy busy", out);
+        goto out;
+    }
+    where = "status after busy";
+    if (read_status(control, out, sizeof(out)) < 0 ||
+        !strstr(out, "connection: ESTABLISHED") ||
+        !strstr(out, "__exec"))
+        goto out;
+    where = "kill";
+    for (i = 0; i < 3; i++) {
+        hc2_test_put_u64(payload, refs[i]);
+        payload[8] = LMUX_HC2_SIG_KILL;
+        if (hc2_send_frame(fd, LMUX_HC2_EXEC_SIGNAL,
+                           960 + (uint64_t)i, payload, 9) < 0)
+            goto out;
+    }
+    where = "terminal";
+    while (!terminal[0] || !terminal[1] || !terminal[2]) {
+        if (hc2_read_frame(fd, &type, &req, payload, &len, 15000) < 0)
+            goto out;
+        if (type == LMUX_HC2_EXEC_STATE && len >= 32 &&
+            payload[16] == V2_EXEC_STATUS_DONE) {
+            uint64_t ref = hc2_test_get_u64(payload);
+            for (i = 0; i < 3; i++) {
+                if (ref == refs[i]) {
+                    if (terminal[i])
+                        goto out;
+                    terminal[i] = 1;
+                }
+            }
+        } else if (type == LMUX_HC2_EXEC_LOST ||
+                   (type == LMUX_HC2_ERROR && len >= 4 &&
+                    lmux_get_le32(payload) != LMUX_HC2_OK)) {
+            goto out;
+        }
+    }
+    where = "status after terminal";
+    if (read_status(control, out, sizeof(out)) < 0 ||
+        !strstr(out, "connection: ESTABLISHED") ||
+        !strstr(out, "__exec"))
+        goto out;
+    where = "deploy abort cleanup";
+    {
+        struct stat st;
+        if (stat(deploy_src, &st) < 0 ||
+            partial_deploy_disconnect(control, deploy_src,
+                                      (uint64_t)st.st_size,
+                                      st.st_size > 4096 ? 4096 : (size_t)st.st_size,
+                                      120000) < 0)
+            goto out;
+    }
+    where = "status after deploy abort";
+    if (wait_ready_layers(control, getenv("LMUX_SUP_IT_OUTER") ? 1 : 0,
+                          15000, out, sizeof(out)) < 0)
+        goto out;
+    where = "deploy after terminal";
+    if (run_lmux_deploy(control, deploy_src, 120000, out, sizeof(out)) < 0 &&
+        !strstr(out, "activation started")) {
+        dump_excerpt("structured deploy after terminal", out);
+        goto out;
+    }
+    where = "status after deploy progress";
+    if (wait_ready_layers(control, getenv("LMUX_SUP_IT_OUTER") ? 1 : 0,
+                          15000, out, sizeof(out)) < 0 ||
+        wait_exec_service_ready(control, 15000, out, sizeof(out)) < 0)
+        goto out;
+    where = "fresh";
+    if (hc2_exec_start_ready_ref(fd, 950, "", argv_true, 1, &fresh) < 0 ||
+        !fresh)
+        goto out;
+    while (!done) {
+        if (hc2_read_frame(fd, &type, &req, payload, &len, 7000) < 0)
+            goto out;
+        if (type == LMUX_HC2_EXEC_STATE && len >= 32 &&
+            payload[16] == V2_EXEC_STATUS_DONE)
+            done = 1;
+        else if (type == LMUX_HC2_EXEC_LOST ||
+                 (type == LMUX_HC2_ERROR && len >= 4 &&
+                  lmux_get_le32(payload) != LMUX_HC2_OK))
+            goto out;
+    }
+    rc = 0;
+out:
+    if (rc)
+        fprintf(stderr, "structured_deploy_coexistence where=%s A=%s B=%s C=%s last=%s(%u) req=%llu len=%u err=%u\n",
+                where, seen[0], seen[1], seen[2], hc2_type_name(type), type,
+                (unsigned long long)req, len,
+                (type == LMUX_HC2_ERROR && len >= 4) ? lmux_get_le32(payload) : 0);
+    if (fd >= 0)
+        close(fd);
+    stop_pid(host); stop_pid(sup);
+    unlink(deploy_src);
+    unlink(carrier); unlink(control); unlink(structured);
+    unlink(console); unlink(file_sock); rmdir(storage); rmdir(dir);
     return rc;
 }
 
@@ -7336,13 +8305,41 @@ int main(int argc, char **argv)
         setenv("LMUX_SUP_IT_OUTER", "1", 1);
         return structured_worker_replacement_test() ? 1 : 0;
     }
+    if (getenv("LMUX_SUP_IT_ONLY_STRUCTURED_WORKER_FRESH")) {
+        setenv("LMUX_SUP_IT_OUTER", "1", 1);
+        return structured_worker_replacement_test() ? 1 : 0;
+    }
     if (getenv("LMUX_SUP_IT_ONLY_PRIVATE_EXEC")) {
         setenv("LMUX_SUP_IT_OUTER", "1", 1);
         return private_exec_basic_test() ? 1 : 0;
     }
+    if (getenv("LMUX_SUP_IT_ONLY_PRIVATE_EXEC_EPIPE")) {
+        setenv("LMUX_SUP_IT_OUTER", "1", 1);
+        return private_exec_stdin_epipe_test() ? 1 : 0;
+    }
     if (getenv("LMUX_SUP_IT_ONLY_STRUCTURED_CONTROL")) {
         setenv("LMUX_SUP_IT_OUTER", "1", 1);
         return structured_control_test() ? 1 : 0;
+    }
+    if (getenv("LMUX_SUP_IT_ONLY_STRUCTURED_CONCURRENT")) {
+        setenv("LMUX_SUP_IT_OUTER", "1", 1);
+        return structured_concurrent_exec_test() ? 1 : 0;
+    }
+    if (getenv("LMUX_SUP_IT_ONLY_STRUCTURED_MULTI_RECONNECT")) {
+        setenv("LMUX_SUP_IT_OUTER", "1", 1);
+        return structured_multi_reconnect_test() ? 1 : 0;
+    }
+    if (getenv("LMUX_SUP_IT_ONLY_STRUCTURED_MULTI_WORKER")) {
+        setenv("LMUX_SUP_IT_OUTER", "1", 1);
+        return structured_multi_worker_replacement_test() ? 1 : 0;
+    }
+    if (getenv("LMUX_SUP_IT_ONLY_STRUCTURED_SCHEDULER")) {
+        setenv("LMUX_SUP_IT_OUTER", "1", 1);
+        return structured_control_scheduler_test() ? 1 : 0;
+    }
+    if (getenv("LMUX_SUP_IT_ONLY_STRUCTURED_DEPLOY")) {
+        setenv("LMUX_SUP_IT_OUTER", "1", 1);
+        return structured_deploy_coexistence_test() ? 1 : 0;
     }
     if (getenv("LMUX_SUP_IT_ONLY_INSTALL_RESTART_SHORTCUT")) {
         setenv("LMUX_SUP_IT_OUTER", "1", 1);
@@ -7414,8 +8411,10 @@ int main(int argc, char **argv)
         outer_deploy_confirm_fault_test(OUTER_FAULT_BOOT_CONFIRM_REQ_BAD_CRC) ||
         private_exec_basic_test() ||
         structured_control_test() ||
+        structured_control_scheduler_test() ||
         structured_lmux_reconnect_test() ||
         structured_worker_replacement_test() ||
+        structured_deploy_coexistence_test() ||
         supervisor_install_restart_shortcut_test() ||
         host_first_startup_test() || integration_test())
         return 1;

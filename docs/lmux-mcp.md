@@ -37,18 +37,40 @@ Useful development overrides:
 ```sh
 build/host/lmux-mcp \
   --control /run/lmux/control-v2.sock \
-  --runtime /run/lmux/mcp
+  --runtime-dir "$XDG_RUNTIME_DIR/lmux/mcp"
 ```
 
-MCP protocol messages use stdio. Do not write human logs to stdout. Human
-observation uses the session journal.
+MCP protocol messages use the official Go SDK stdio transport. `lmux-mcp` is
+not an interactive CLI; running it in a terminal waits for MCP JSON-RPC messages
+on stdin. Do not write human logs to stdout. Human observation uses the session
+journal.
+
+Codex configuration is conceptually:
+
+```toml
+[mcp_servers.lmux]
+command = "/absolute/path/to/build/host/lmux-mcp"
+args = ["--runtime-dir", "/run/user/1000/lmux/mcp"]
+```
+
+When Codex supplies `XDG_RUNTIME_DIR`, the `--runtime-dir` argument can be
+omitted.
+
+The default structured-control endpoint remains:
+
+```text
+/run/lmux/control-v2.sock
+```
+
+This socket is owned by host `lmuxd`, not by `lmux-mcp`. `lmux-mcp` only needs
+permission to connect to it.
 
 ## Runtime Files
 
 Default layout:
 
 ```text
-/run/lmux/mcp/
+$XDG_RUNTIME_DIR/lmux/mcp/
   owner.lock
   current -> sessions/session-<id>
   sessions/
@@ -61,10 +83,14 @@ Default layout:
 `session.log` is JSON Lines and can be watched with:
 
 ```sh
-tail -F /run/lmux/mcp/current/session.log
+tail -F "$XDG_RUNTIME_DIR/lmux/mcp/current/session.log"
 ```
 
 The journal is not a control interface and is not the source of MCP cursors.
+
+If `XDG_RUNTIME_DIR` is not set, pass `--runtime-dir PATH` or set
+`LMUX_MCP_RUNTIME_DIR`. `lmux-mcp` does not fall back to `/run/lmux/mcp`, because
+that path is system-owned on normal hosts and would require sudo.
 
 ## Tools
 
