@@ -5,3 +5,5 @@
 /.build-number
 
 test_1MiB.bin
+
+/agent-scripts/
