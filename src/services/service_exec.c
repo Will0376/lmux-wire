@@ -129,6 +129,17 @@ static void exec_obj_reset(struct v2_exec_obj *e)
     e->err_fd = -1;
 }
 
+static void exec_close_stdin_side(struct v2_exec_obj *e)
+{
+    close_fd(&e->stdin_fd);
+    e->stdin_closed = 1;
+}
+
+static void exec_close_stdout_side(struct v2_exec_obj *e)
+{
+    close_fd(&e->stdout_fd);
+}
+
 static void exec_state_init_fds(struct v2_exec_service_state *st)
 {
     int i;
@@ -451,16 +462,17 @@ static int spawn_exec(struct v2_exec_obj *e, const char *cwd, char **argv)
     }
     close(in[0]);
     close(out[1]);
+    e->stdin_fd = in[1];
+    e->stdout_fd = out[0];
+    in[1] = out[0] = -1;
     close(err[1]);
     close(setup[1]);
     e->pid = pid;
     e->pgid = pid;
     (void)setpgid(pid, pid);
-    e->stdin_fd = in[1];
-    e->stdout_fd = out[0];
     e->stderr_fd = err[0];
     e->err_fd = setup[0];
-    in[1] = out[0] = err[0] = setup[0] = -1;
+    err[0] = setup[0] = -1;
     (void)set_nonblock_cloexec(e->stdin_fd);
     (void)set_nonblock_cloexec(e->stdout_fd);
     (void)set_nonblock_cloexec(e->stderr_fd);
@@ -496,7 +508,7 @@ static int handle_start(struct v2_service *s, const struct v2_exec_record *r)
         return queue_exec_error(s, 0, V2_EXEC_E_BAD_REQUEST);
     cwd_len = lmux_get_le16(r->payload);
     argc = r->payload[2];
-    if (r->payload[3] != 0 || argc == 0 || argc > V2_EXEC_ARG_MAX)
+    if (argc == 0 || argc > V2_EXEC_ARG_MAX)
         return queue_exec_error(s, 0, V2_EXEC_E_BAD_REQUEST);
     if (r->length < 4 + (size_t)argc * 2)
         return queue_exec_error(s, 0, V2_EXEC_E_BAD_REQUEST);
@@ -904,7 +916,7 @@ static void pump_child_output(struct v2_exec_obj *e, struct lmux2_conn *conn,
         if (r == 0) {
             *eof = 1;
             if (is_stdout)
-                close_fd(&e->stdout_fd);
+                exec_close_stdout_side(e);
             else
                 close_fd(&e->stderr_fd);
             if (stream_id)
@@ -915,7 +927,7 @@ static void pump_child_output(struct v2_exec_obj *e, struct lmux2_conn *conn,
             return;
         *eof = 1;
         if (is_stdout)
-            close_fd(&e->stdout_fd);
+            exec_close_stdout_side(e);
         else
             close_fd(&e->stderr_fd);
         if (stream_id)
@@ -941,8 +953,7 @@ static void pump_stdin_rx(struct v2_exec_obj *e, struct lmux2_conn *conn)
     if (st && st->state == LMUX2_STREAM_REMOTE_CLOSED &&
         lmux2_stream_rx_len(conn, e->stdin_stream_id) == 0 &&
         e->stdin_len == e->stdin_pos) {
-        close_fd(&e->stdin_fd);
-        e->stdin_closed = 1;
+        exec_close_stdin_side(e);
         e->stdin_stream_id = 0;
         (void)lmux2_close_stream(conn, st->id);
     }
@@ -959,15 +970,13 @@ static void write_child_stdin(struct v2_exec_obj *e)
         }
         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
             return;
-        close_fd(&e->stdin_fd);
-        e->stdin_closed = 1;
+        exec_close_stdin_side(e);
         return;
     }
     if (e->stdin_len == e->stdin_pos)
         e->stdin_len = e->stdin_pos = 0;
     if (e->close_stdin_requested && e->stdin_len == 0) {
-        close_fd(&e->stdin_fd);
-        e->stdin_closed = 1;
+        exec_close_stdin_side(e);
     }
 }
 
@@ -1014,8 +1023,7 @@ static void reap_child(struct v2_service *s, struct v2_exec_obj *e)
         if (e->status != V2_EXEC_STATUS_START_FAILED)
             e->status = V2_EXEC_STATUS_EXITED_DRAINING;
     }
-    close_fd(&e->stdin_fd);
-    e->stdin_closed = 1;
+    exec_close_stdin_side(e);
     if ((e->stdout_eof || e->stdout_fd < 0) &&
         (e->stderr_eof || e->stderr_fd < 0) &&
         e->status != V2_EXEC_STATUS_START_FAILED) {
@@ -1134,7 +1142,7 @@ void v2_exec_on_fd_event(struct v2_app *a, struct lmux2_conn *conn,
         if (fd_kind == V2_EXEC_FD_STDOUT)
         {
             e->stdout_eof = 1;
-            close_fd(&e->stdout_fd);
+            exec_close_stdout_side(e);
         }
         else if (fd_kind == V2_EXEC_FD_STDERR)
         {
@@ -1142,13 +1150,11 @@ void v2_exec_on_fd_event(struct v2_app *a, struct lmux2_conn *conn,
             close_fd(&e->stderr_fd);
         }
         else if (fd_kind == V2_EXEC_FD_STDIN) {
-            close_fd(&e->stdin_fd);
-            e->stdin_closed = 1;
+            exec_close_stdin_side(e);
         } else if (fd_kind == V2_EXEC_FD_ERR)
             check_start_pipe(s, e);
     } else if ((revents & POLLHUP) && fd_kind == V2_EXEC_FD_STDIN) {
-        close_fd(&e->stdin_fd);
-        e->stdin_closed = 1;
+        exec_close_stdin_side(e);
     }
     reap_child(s, e);
     maybe_done(s, e);

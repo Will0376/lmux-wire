@@ -24,16 +24,22 @@ func TestSDKToolDiscoveryAndCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]bool{
-		"lmux_status":         false,
-		"file_put":            false,
-		"file_get":            false,
-		"command_start":       false,
-		"command_status":      false,
-		"command_read":        false,
-		"command_write_stdin": false,
-		"command_close_stdin": false,
-		"command_signal":      false,
-		"command_release":     false,
+		"lmux_status":            false,
+		"file_put":               false,
+		"file_get":               false,
+		"command_start":          false,
+		"command_status":         false,
+		"command_read":           false,
+		"command_write_stdin":    false,
+		"command_close_stdin":    false,
+		"command_signal":         false,
+		"command_release":        false,
+		"debug_capabilities":     false,
+		"debug_start":            false,
+		"debug_status":           false,
+		"debug_diagnostics_read": false,
+		"debug_detach":           false,
+		"debug_stop":             false,
 	}
 	for _, tool := range tools.Tools {
 		if _, exists := want[tool.Name]; exists {
@@ -59,6 +65,23 @@ func TestSDKToolDiscoveryAndCall(t *testing.T) {
 	got, ok := res.StructuredContent.(map[string]any)
 	if !ok || got["released"] != true {
 		t.Fatalf("bad structured content: %#v", res.StructuredContent)
+	}
+}
+
+func TestGDBRemoteTimeoutValidation(t *testing.T) {
+	if err := validateGDBRemoteTimeoutSeconds(10); err != nil {
+		t.Fatalf("default timeout rejected: %v", err)
+	}
+	if err := validateGDBRemoteTimeoutSeconds(1); err != nil {
+		t.Fatalf("minimum timeout rejected: %v", err)
+	}
+	if err := validateGDBRemoteTimeoutSeconds(300); err != nil {
+		t.Fatalf("maximum timeout rejected: %v", err)
+	}
+	for _, bad := range []int{0, -1, 301} {
+		if err := validateGDBRemoteTimeoutSeconds(bad); err == nil {
+			t.Fatalf("timeout %d should be rejected", bad)
+		}
 	}
 }
 

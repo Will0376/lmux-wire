@@ -38,6 +38,7 @@ const (
 	TypeExecStderr     uint16 = 41
 	TypeExecState      uint16 = 42
 	TypeExecLost       uint16 = 43
+	TypeExecStdinReady uint16 = 44
 	TypeFilePutStart   uint16 = 60
 	TypeFileGetStart   uint16 = 61
 	TypeFileStarted    uint16 = 62
@@ -165,6 +166,10 @@ type Handler interface {
 	FileProgress(opID, bytes uint64)
 	FileDone(done FileDone)
 	FileError(err FileError)
+}
+
+type ExecStdinReadyHandler interface {
+	ExecStdinReady(ref uint64)
 }
 
 type Client struct {
@@ -362,6 +367,12 @@ func (c *Client) dispatch(fr Frame) {
 		if len(fr.Payload) >= 12 {
 			c.handler.ExecLost(binary.LittleEndian.Uint64(fr.Payload[:8]),
 				binary.LittleEndian.Uint32(fr.Payload[8:12]))
+		}
+	case TypeExecStdinReady:
+		if len(fr.Payload) >= 8 {
+			if h, ok := c.handler.(ExecStdinReadyHandler); ok {
+				h.ExecStdinReady(binary.LittleEndian.Uint64(fr.Payload[:8]))
+			}
 		}
 	case TypeFileProgress:
 		if len(fr.Payload) >= 16 {

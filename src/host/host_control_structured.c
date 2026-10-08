@@ -173,6 +173,15 @@ static int hc2_queue_exec_state_for_ref(struct v2_host *h, uint16_t frame_type,
                                                p, 32);
 }
 
+static int hc2_queue_exec_stdin_ready(struct v2_host *h,
+                                      struct v2_host_structured_exec *e)
+{
+    uint8_t p[8];
+    lmux_hc2_put_u64(p, e->ref);
+    return v2_host_structured_queue_exec_frame(h, LMUX_HC2_EXEC_STDIN_READY,
+                                               0, p, sizeof(p));
+}
+
 static int hc2_stream_drained(struct v2_app *a, uint64_t stream_id)
 {
     int st;
@@ -964,6 +973,7 @@ static void hc2_handle_exec_stdin(struct v2_host *h, const struct hc2_frame *fr)
     }
     data_len = fr->payload_len - 8;
     if (data_len > sizeof(e->stdin_buf) - e->stdin_len) {
+        e->stdin_backpressure = 1;
         hc2_queue_error(h, fr->request_id, LMUX_HC2_E_BUSY, "stdin backpressure");
         return;
     }
@@ -1446,7 +1456,7 @@ static void hc2_exec_read_stream(struct v2_app *a, struct v2_host *h,
     }
 }
 
-static void hc2_exec_pump_stdin_entry(struct v2_app *a,
+static void hc2_exec_pump_stdin_entry(struct v2_app *a, struct v2_host *h,
                                       struct v2_host_structured_exec *e)
 {
     if (!e->stdin_stream ||
@@ -1460,6 +1470,21 @@ static void hc2_exec_pump_stdin_entry(struct v2_app *a,
         if (!w)
             break;
         e->stdin_pos += w;
+    }
+    if (e->stdin_pos > 0) {
+        if (e->stdin_pos < e->stdin_len)
+            memmove(e->stdin_buf, e->stdin_buf + e->stdin_pos,
+                    e->stdin_len - e->stdin_pos);
+        e->stdin_len -= e->stdin_pos;
+        e->stdin_pos = 0;
+        if (e->stdin_backpressure &&
+            e->stdin_len < sizeof(e->stdin_buf))
+            e->stdin_ready_pending = 1;
+    }
+    if (e->stdin_ready_pending &&
+        hc2_queue_exec_stdin_ready(h, e) == 0) {
+        e->stdin_ready_pending = 0;
+        e->stdin_backpressure = 0;
     }
     if (e->stdin_close_requested && e->stdin_pos == e->stdin_len &&
         v2_runtime_stream_tx_len(a, e->stdin_stream) == 0 &&
@@ -1587,7 +1612,7 @@ static void hc2_exec_table_step(struct v2_app *a, struct v2_host *h)
                 &e->stdin_stream);
         hc2_exec_read_stream(a, h, e, e->stdout_stream, LMUX_HC2_EXEC_STDOUT);
         hc2_exec_read_stream(a, h, e, e->stderr_stream, LMUX_HC2_EXEC_STDERR);
-        hc2_exec_pump_stdin_entry(a, e);
+        hc2_exec_pump_stdin_entry(a, h, e);
         hc2_exec_queue_final_if_ready(a, h, e);
         if (!e->done && !e->final_pending && !e->status_pending &&
             !h->exec_active && v2_now_ms() >= e->next_status_ms)
@@ -1739,6 +1764,29 @@ short v2_host_structured_poll_events(const struct v2_host *h)
     return ev;
 }
 
+void v2_host_structured_flush_tx(struct v2_app *a, struct v2_host *h)
+{
+    if (h->structured_fd < 0)
+        return;
+    while (h->structured_tx_pos < h->structured_tx_len) {
+        ssize_t w = write(h->structured_fd,
+                          h->structured_tx + h->structured_tx_pos,
+                          h->structured_tx_len - h->structured_tx_pos);
+        if (w > 0) {
+            h->structured_tx_pos += (size_t)w;
+            continue;
+        }
+        if (w < 0 && errno == EINTR)
+            continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            break;
+        hc2_close_client_runtime(a, h);
+        return;
+    }
+    if (h->structured_tx_pos == h->structured_tx_len)
+        h->structured_tx_pos = h->structured_tx_len = 0;
+}
+
 void v2_host_structured_service(struct v2_app *a, struct v2_host *h,
                                 const struct v2_host_status *st, short revents)
 {
@@ -1779,25 +1827,8 @@ void v2_host_structured_service(struct v2_app *a, struct v2_host *h,
             hc2_consume_frame(h, &fr);
         }
     }
-    if (h->structured_fd >= 0 && (revents & POLLOUT)) {
-        while (h->structured_tx_pos < h->structured_tx_len) {
-            ssize_t w = write(h->structured_fd,
-                              h->structured_tx + h->structured_tx_pos,
-                              h->structured_tx_len - h->structured_tx_pos);
-            if (w > 0) {
-                h->structured_tx_pos += (size_t)w;
-                continue;
-            }
-            if (w < 0 && errno == EINTR)
-                continue;
-            if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-                break;
-            hc2_close_client_runtime(a, h);
-            return;
-        }
-        if (h->structured_tx_pos == h->structured_tx_len)
-            h->structured_tx_pos = h->structured_tx_len = 0;
-    }
+    if (h->structured_fd >= 0 && (revents & POLLOUT))
+        v2_host_structured_flush_tx(a, h);
     if (h->structured_fd >= 0 && (revents & (POLLHUP | POLLERR | POLLNVAL)))
         hc2_close_client_runtime(a, h);
 }

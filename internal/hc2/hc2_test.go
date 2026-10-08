@@ -86,3 +86,31 @@ func TestEncodeRequests(t *testing.T) {
 		t.Fatalf("oversized stdin accepted")
 	}
 }
+
+func TestDispatchExecOutputCopiesPayload(t *testing.T) {
+	h := &captureHandler{}
+	c := &Client{handler: h}
+	payload := make([]byte, 8+3)
+	binary.LittleEndian.PutUint64(payload[:8], 42)
+	copy(payload[8:], "AAA")
+	c.dispatch(Frame{Type: TypeExecStdout, Payload: payload})
+	copy(payload[8:], "BBB")
+	c.dispatch(Frame{Type: TypeExecStdout, Payload: payload})
+	if got := string(bytes.Join(h.outputs, nil)); got != "AAABBB" {
+		t.Fatalf("dispatch retained borrowed payload: got %q want AAABBB", got)
+	}
+}
+
+type captureHandler struct {
+	outputs [][]byte
+}
+
+func (h *captureHandler) ExecOutput(_ string, _ uint64, data []byte) {
+	h.outputs = append(h.outputs, data)
+}
+
+func (h *captureHandler) ExecState(ExecState)         {}
+func (h *captureHandler) ExecLost(uint64, uint32)     {}
+func (h *captureHandler) FileProgress(uint64, uint64) {}
+func (h *captureHandler) FileDone(FileDone)           {}
+func (h *captureHandler) FileError(FileError)         {}

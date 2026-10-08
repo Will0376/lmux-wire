@@ -107,7 +107,31 @@ command_write_stdin
 command_close_stdin
 command_signal
 command_release
+debug_capabilities
+debug_start
+debug_list
+debug_status
+debug_breakpoint_set
+debug_breakpoint_delete
+debug_continue
+debug_interrupt
+debug_step
+debug_wait
+debug_threads
+debug_select_thread
+debug_backtrace
+debug_evaluate
+debug_registers
+debug_memory_read
+debug_detach
+debug_stop
 ```
+
+`debug_interrupt` returns when host GDB accepts/sends the interrupt request over
+the remote protocol. It does not by itself prove the inferior stopped; use
+`debug_wait` or `debug_status` to observe the later `STOPPED` state. Capabilities
+report `interrupt_transport="gdb-rsp"` and
+`interrupt_stop_requires_wait=true`.
 
 `command_start` is argv-based. It does not imply a shell. Use:
 
@@ -116,6 +140,10 @@ command_release
 ```
 
 when shell behavior is wanted.
+
+Debug tools are documented in [debugging.md](debugging.md). They use a host GDB
+process plus a target `gdbserver stdio` structured EXEC and are separate from
+normal command sessions, while sharing the same target EXEC capacity.
 
 ## Retention
 

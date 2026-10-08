@@ -1805,6 +1805,7 @@ static size_t exec_read_output_stream(struct v2_app *a, struct v2_host *h,
             if (v2_host_structured_queue_exec_frame(h, type, 0, buf,
                                                     (uint32_t)(8 + n)) < 0)
                 break;
+            v2_host_structured_flush_tx(a, h);
             total += n;
         }
         return total;

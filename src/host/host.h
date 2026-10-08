@@ -112,6 +112,8 @@ struct v2_host_structured_exec {
     uint8_t stdin_buf[4096];
     size_t stdin_len;
     size_t stdin_pos;
+    int stdin_backpressure;
+    int stdin_ready_pending;
     int stdin_close_requested;
     int stdin_close_pending;
 };
@@ -403,6 +405,7 @@ int v2_host_structured_queue_exec_frame(struct v2_host *h, uint16_t type,
                                         const uint8_t *payload,
                                         uint32_t payload_len);
 int v2_host_structured_can_queue(struct v2_host *h, uint32_t payload_len);
+void v2_host_structured_flush_tx(struct v2_app *a, struct v2_host *h);
 void v2_host_structured_on_exec_clear(struct v2_host *h);
 void v2_host_structured_on_outer_down(struct v2_host *h);
 

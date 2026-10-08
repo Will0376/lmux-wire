@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	debugmgr "lmux/internal/debug"
+
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -52,9 +54,25 @@ func TestMCPProcessIntegration(t *testing.T) {
 	if !hasTool(tools, "lmux_status") {
 		t.Fatalf("tools/list missing lmux_status: %+v", tools.Tools)
 	}
+	if !hasTool(tools, "debug_capabilities") {
+		t.Fatalf("tools/list missing debug_capabilities: %+v", tools.Tools)
+	}
 	status := callTool(t, mcpSession, "lmux_status", map[string]any{})
 	if !strings.Contains(mustJSON(status), "__exec") {
 		t.Fatalf("status missing __exec: %v", status)
+	}
+	caps := callTool(t, mcpSession, "debug_capabilities", map[string]any{})
+	if caps["target_exec_capacity"] == nil || caps["self_debug_lmux_supported"] != false {
+		t.Fatalf("bad debug capabilities: %v", caps)
+	}
+	if caps["gdb_remote_timeout_seconds"] != float64(debugmgr.DefaultGDBRemoteTimeoutSeconds) {
+		t.Fatalf("debug capabilities missing remote timeout: %v", caps)
+	}
+	if caps["mi_async"] != true {
+		t.Fatalf("debug capabilities missing mi_async: %v", caps)
+	}
+	if caps["interrupt_transport"] != "gdb-rsp" || caps["interrupt_stop_requires_wait"] != true {
+		t.Fatalf("debug capabilities missing interrupt semantics: %v", caps)
 	}
 	start := callTool(t, mcpSession, "command_start", map[string]any{"argv": []string{"/bin/sh", "-c", "printf OUT; printf ERR >&2"}})
 	token, _ := start["command_token"].(string)

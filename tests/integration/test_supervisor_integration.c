@@ -6565,6 +6565,8 @@ static int structured_control_test(void)
     const char *argv2[] = {"/bin/cat"};
     const char *argv3[] = {"/bin/sh", "-c", "sleep 2; printf LATE"};
     const char *argv4[] = {"/bin/sh", "-c", "i=0; while [ $i -lt 5 ]; do printf X; i=$((i+1)); sleep 0.1; done"};
+    const char *argv5[] = {"/bin/sh", "-c", "printf A; read line; printf B"};
+    const char *argv6[] = {"/bin/sh", "-c", "dd of=/dev/null bs=1 count=1 2>/dev/null; printf CTRL; sleep 5"};
     char stdout_seen[64] = {0}, stderr_seen[64] = {0}, cat_seen[64] = {0};
     size_t cat_len = 0;
     int done = 0;
@@ -6586,7 +6588,6 @@ static int structured_control_test(void)
     snprintf(file_got, sizeof(file_got), "%s/structured-got.bin", dir);
     snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
     snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
-
     sup = spawn_supervisor_with_storage(carrier, NULL);
     if (sup <= 0)
         goto out;
@@ -6725,6 +6726,119 @@ static int structured_control_test(void)
     }
     if (cat_len != 4 || memcmp(cat_seen, "A\0B\n", 4) != 0)
         goto out;
+
+    where = "exec live one-byte stdout";
+    memset(stdout_seen, 0, sizeof(stdout_seen));
+    cat_len = 0;
+    if (hc2_exec_start(fd, 9, "", argv5, 3) < 0)
+        goto out;
+    ref = 0;
+    while (!ref || cat_len < 1) {
+        if (hc2_read_frame(fd, &type, &req, payload, &len, 3000) < 0)
+            goto out;
+        if (type == LMUX_HC2_EXEC_STARTED && len >= 32) {
+            ref = hc2_test_get_u64(payload);
+        } else if (type == LMUX_HC2_EXEC_STDOUT && len >= 8) {
+            if (cat_len + len - 8 > sizeof(stdout_seen))
+                goto out;
+            memcpy(stdout_seen + cat_len, payload + 8, len - 8);
+            cat_len += len - 8;
+        } else if (type == LMUX_HC2_EXEC_STATE && len >= 32 &&
+                   payload[16] == V2_EXEC_STATUS_DONE) {
+            goto out;
+        } else if (type == LMUX_HC2_ERROR && len >= 4 &&
+                   lmux_get_le32(payload) != LMUX_HC2_OK) {
+            goto out;
+        }
+    }
+    if (cat_len != 1 || stdout_seen[0] != 'A')
+        goto out;
+    hc2_test_put_u64(stdin_payload, ref);
+    memcpy(stdin_payload + 8, "go\n", 3);
+    if (hc2_send_frame(fd, LMUX_HC2_EXEC_STDIN_DATA, 10,
+                       stdin_payload, 11) < 0 ||
+        hc2_send_frame(fd, LMUX_HC2_EXEC_STDIN_CLOSE, 11,
+                       stdin_payload, 8) < 0)
+        goto out;
+    done = 0;
+    while (!done || cat_len < 2) {
+        if (hc2_read_frame(fd, &type, &req, payload, &len, 3000) < 0)
+            goto out;
+        if (type == LMUX_HC2_EXEC_STDOUT && len >= 8) {
+            if (cat_len + len - 8 > sizeof(stdout_seen))
+                goto out;
+            memcpy(stdout_seen + cat_len, payload + 8, len - 8);
+            cat_len += len - 8;
+        } else if (type == LMUX_HC2_EXEC_STATE && len >= 32 &&
+                   payload[16] == V2_EXEC_STATUS_DONE) {
+            done = 1;
+        } else if (type == LMUX_HC2_ERROR && len >= 4 &&
+                   lmux_get_le32(payload) != LMUX_HC2_OK) {
+            goto out;
+        }
+    }
+    if (cat_len != 2 || memcmp(stdout_seen, "AB", 2) != 0)
+        goto out;
+
+    where = "exec one-byte binary stdin";
+    memset(stdout_seen, 0, sizeof(stdout_seen));
+    cat_len = 0;
+    if (hc2_exec_start(fd, 12, "", argv6, 3) < 0)
+        goto out;
+    ref = 0;
+    while (!ref) {
+        if (hc2_read_frame(fd, &type, &req, payload, &len, 3000) < 0)
+            goto out;
+        if (type == LMUX_HC2_EXEC_STARTED && len >= 32) {
+            ref = hc2_test_get_u64(payload);
+        } else if (type == LMUX_HC2_EXEC_STATE && len >= 32 &&
+                   payload[16] == V2_EXEC_STATUS_DONE) {
+            goto out;
+        } else if (type == LMUX_HC2_ERROR && len >= 4 &&
+                   lmux_get_le32(payload) != LMUX_HC2_OK) {
+            goto out;
+        }
+    }
+    hc2_test_put_u64(stdin_payload, ref);
+    stdin_payload[8] = 0x03;
+    if (hc2_send_frame(fd, LMUX_HC2_EXEC_STDIN_DATA, 13,
+                       stdin_payload, 9) < 0)
+        goto out;
+    while (cat_len < 4) {
+        if (hc2_read_frame(fd, &type, &req, payload, &len, 3000) < 0)
+            goto out;
+        if (type == LMUX_HC2_EXEC_STDOUT && len >= 8) {
+            if (cat_len + len - 8 > sizeof(stdout_seen))
+                goto out;
+            memcpy(stdout_seen + cat_len, payload + 8, len - 8);
+            cat_len += len - 8;
+        } else if (type == LMUX_HC2_EXEC_STATE && len >= 32 &&
+                   payload[16] == V2_EXEC_STATUS_DONE) {
+            goto out;
+        } else if (type == LMUX_HC2_ERROR && len >= 4 &&
+                   lmux_get_le32(payload) != LMUX_HC2_OK) {
+            goto out;
+        }
+    }
+    if (cat_len != 4 || memcmp(stdout_seen, "CTRL", 4) != 0)
+        goto out;
+    hc2_test_put_u64(stdin_payload, ref);
+    lmux_put_le32(stdin_payload + 8, LMUX_HC2_SIG_TERM);
+    if (hc2_send_frame(fd, LMUX_HC2_EXEC_SIGNAL, 14,
+                       stdin_payload, 12) < 0)
+        goto out;
+    done = 0;
+    while (!done) {
+        if (hc2_read_frame(fd, &type, &req, payload, &len, 7000) < 0)
+            goto out;
+        if (type == LMUX_HC2_EXEC_STATE && len >= 32 &&
+            payload[16] == V2_EXEC_STATUS_DONE) {
+            done = 1;
+        } else if (type == LMUX_HC2_ERROR && len >= 4 &&
+                   lmux_get_le32(payload) != LMUX_HC2_OK) {
+            goto out;
+        }
+    }
 
     where = "structured file put/get";
     if (make_file(file_src, 1024 * 1024) < 0 ||
