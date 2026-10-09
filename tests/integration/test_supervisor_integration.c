@@ -862,6 +862,8 @@ static int hc2_exec_start(int fd, uint64_t req, const char *cwd,
     return hc2_send_frame(fd, LMUX_HC2_EXEC_START, req, p, (uint32_t)off);
 }
 
+static const char *hc2_type_name(uint16_t type);
+
 static int hc2_exec_start_ready_ref(int fd, uint64_t req, const char *cwd,
                                     const char **argv, uint16_t argc,
                                     uint64_t *ref_out)
@@ -871,18 +873,42 @@ static int hc2_exec_start_ready_ref(int fd, uint64_t req, const char *cwd,
     uint64_t got_req;
     uint32_t len;
     long long end = now_ms() + 7000;
+    uint16_t last_type = 0;
+    uint64_t last_req = 0;
+    uint32_t last_len = 0;
+    uint32_t last_err = 0;
     while (now_ms() < end) {
         int rem = (int)(end - now_ms());
-        if (hc2_exec_start(fd, req, cwd, argv, argc) < 0)
+        if (hc2_exec_start(fd, req, cwd, argv, argc) < 0) {
+            fprintf(stderr, "hc2_exec_start send failed req=%llu\n",
+                    (unsigned long long)req);
             return -1;
+        }
         for (;;) {
             int rr;
             rem = (int)(end - now_ms());
-            if (rem <= 0)
+            if (rem <= 0) {
+                fprintf(stderr,
+                        "hc2_exec_start timeout req=%llu last=%s(%u) last_req=%llu len=%u err=%u\n",
+                        (unsigned long long)req, hc2_type_name(last_type),
+                        last_type, (unsigned long long)last_req, last_len,
+                        last_err);
                 return -1;
+            }
             rr = hc2_read_frame(fd, &type, &got_req, payload, &len, rem);
-            if (rr < 0)
+            if (rr < 0) {
+                fprintf(stderr,
+                        "hc2_exec_start read failed req=%llu last=%s(%u) last_req=%llu len=%u err=%u\n",
+                        (unsigned long long)req, hc2_type_name(last_type),
+                        last_type, (unsigned long long)last_req, last_len,
+                        last_err);
                 return -1;
+            }
+            last_type = type;
+            last_req = got_req;
+            last_len = len;
+            if (type == LMUX_HC2_ERROR && len >= 4)
+                last_err = lmux_get_le32(payload);
             if (type == LMUX_HC2_ERROR && got_req == req &&
                 len >= 4 &&
                 (lmux_get_le32(payload) == LMUX_HC2_E_NOT_CONNECTED ||
@@ -890,8 +916,13 @@ static int hc2_exec_start_ready_ref(int fd, uint64_t req, const char *cwd,
                 usleep(20000);
                 break;
             }
-            if (type == LMUX_HC2_ERROR && got_req == req)
+            if (type == LMUX_HC2_ERROR && got_req == req) {
+                fprintf(stderr,
+                        "hc2_exec_start error req=%llu err=%u len=%u\n",
+                        (unsigned long long)req,
+                        len >= 4 ? lmux_get_le32(payload) : 0, len);
                 return -1;
+            }
             if (type == LMUX_HC2_EXEC_STARTED && got_req == req && len >= 32) {
                 if (ref_out)
                     *ref_out = hc2_test_get_u64(payload);
@@ -903,9 +934,17 @@ static int hc2_exec_start_ready_ref(int fd, uint64_t req, const char *cwd,
                 type == LMUX_HC2_EXEC_STATE ||
                 type == LMUX_HC2_EXEC_LOST)
                 continue;
+            fprintf(stderr,
+                    "hc2_exec_start unexpected req=%llu got=%s(%u) got_req=%llu len=%u\n",
+                    (unsigned long long)req, hc2_type_name(type), type,
+                    (unsigned long long)got_req, len);
             return -1;
         }
     }
+    fprintf(stderr,
+            "hc2_exec_start deadline req=%llu last=%s(%u) last_req=%llu len=%u err=%u\n",
+            (unsigned long long)req, hc2_type_name(last_type), last_type,
+            (unsigned long long)last_req, last_len, last_err);
     return -1;
 }
 
@@ -926,6 +965,7 @@ static int hc2_run_echo(int fd, uint64_t req, const char *text)
     char want[256];
     size_t seen_len = 0;
     int done = 0;
+    int released = 0;
     const char *argv[] = {"/bin/echo", text};
     if (snprintf(want, sizeof(want), "%s\n", text) <= 0 ||
         strlen(text) + 1 >= sizeof(want))
@@ -955,7 +995,22 @@ static int hc2_run_echo(int fd, uint64_t req, const char *text)
             return -1;
         }
     }
-    return strcmp(seen, want) == 0 ? 0 : -1;
+    if (strcmp(seen, want) != 0)
+        return -1;
+    hc2_test_put_u64(payload, ref);
+    if (hc2_send_frame(fd, LMUX_HC2_EXEC_RELEASE, req + 1000000,
+                       payload, 8) < 0)
+        return -1;
+    while (!released) {
+        if (hc2_read_frame(fd, &type, &got_req, payload, &len, 3000) < 0)
+            return -1;
+        if (type == LMUX_HC2_EXEC_STATE && got_req == req + 1000000)
+            released = 1;
+        else if (type == LMUX_HC2_ERROR && got_req == req + 1000000 &&
+                 len >= 4 && lmux_get_le32(payload) != LMUX_HC2_OK)
+            return -1;
+    }
+    return 0;
 }
 
 static int hc2_file_start(int fd, uint16_t type, uint64_t req,
@@ -8092,7 +8147,6 @@ static int lifecycle_recovery_loop_test(void)
     long shell_pid = -1, shell_pid_after = -1;
     int i = -1;
     const char *where = "setup";
-    const char *argv_true[] = {"/bin/true"};
 
     if (!mkdtemp(dir))
         return fail("mkdtemp lifecycle loop");
@@ -8137,7 +8191,6 @@ static int lifecycle_recovery_loop_test(void)
 
     for (i = 0; i < 20; i++) {
         char marker[64];
-        uint64_t fresh = 0;
         snprintf(marker, sizeof(marker), "LOOP_%02d", i);
         where = "loop echo";
         if (hc2_run_echo(fd, 3000 + (uint64_t)i, marker) < 0)
@@ -8209,9 +8262,8 @@ static int lifecycle_recovery_loop_test(void)
         }
         close(console_fd);
         console_fd = -1;
-        if (hc2_exec_start_ready_ref(fd, 4000 + (uint64_t)i, "",
-                                     argv_true, 1, &fresh) < 0 ||
-            !fresh)
+        snprintf(marker, sizeof(marker), "POST_%02d", i);
+        if (hc2_run_echo(fd, 4000 + (uint64_t)i, marker) < 0)
             goto out;
         if (wait_child_pid(sup, worker, 1000) != -1)
             goto out;

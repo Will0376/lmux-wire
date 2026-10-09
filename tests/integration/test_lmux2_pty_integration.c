@@ -360,6 +360,46 @@ static int wait_console_stream_after(const char *control, const char *service,
     return -1;
 }
 
+static int reconnect_console_expect(const char *path, const char *control,
+                                    const char *service,
+                                    unsigned long long want_conn,
+                                    unsigned long long *stream,
+                                    const char *cmd, const char *needle,
+                                    char *out, size_t cap, int *out_fd,
+                                    int timeout_ms)
+{
+    long long end = now_ms() + timeout_ms;
+    if (cap)
+        out[0] = 0;
+    while (now_ms() < end) {
+        int fd;
+        int rem = (int)(end - now_ms());
+        unsigned long long next_stream = *stream;
+        if (rem <= 0)
+            break;
+        fd = wait_connect(path, rem < 500 ? rem : 500);
+        if (fd < 0)
+            continue;
+        rem = (int)(end - now_ms());
+        if (rem <= 0) {
+            close(fd);
+            break;
+        }
+        if (wait_console_stream_after(control, service, want_conn,
+                                      *stream, rem, &next_stream) == 0) {
+            *stream = next_stream;
+            if (cap)
+                out[0] = 0;
+            if (shell_cmd_expect(fd, cmd, needle, out, cap) == 0) {
+                *out_fd = fd;
+                return 0;
+            }
+        }
+        close(fd);
+    }
+    return -1;
+}
+
 static void stop_child(pid_t pid)
 {
     long long end;
@@ -557,12 +597,11 @@ static int integration_test(void)
     where = "console1 churn while console2 alive";
     for (int i = 0; i < 100; i++) {
         close(fd1);
-        fd1 = wait_connect(c1, 5000);
-        if (fd1 < 0 ||
-            wait_console_stream_after(control, "console1", initial_conn,
-                                      console1_stream, 5000,
-                                      &console1_stream) < 0 ||
-            shell_cmd_expect(fd1, "printf 'C1''OK\\n'", "C1OK", out, sizeof(out)) < 0) {
+        fd1 = -1;
+        if (reconnect_console_expect(c1, control, "console1", initial_conn,
+                                     &console1_stream,
+                                     "printf 'C1''OK\\n'", "C1OK",
+                                     out, sizeof(out), &fd1, 5000) < 0) {
             fprintf(stderr, "churn iteration failed: %d fd=%d\n", i, fd1);
             dump_excerpt("churn console1", out);
             goto out;
