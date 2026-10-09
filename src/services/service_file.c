@@ -1,6 +1,7 @@
 #include "services.h"
 #include "lmux.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -31,6 +32,47 @@ static int lxf_make_tmp_for_final(const char *final, char *tmp, size_t cap)
                  (int)dir_len, final, base, (long)getpid(), (long)time(NULL)) >= (int)cap)
         return -1;
     return 0;
+}
+
+static void lxf_cleanup_tmp_for_final(const char *final)
+{
+    char dir[LXF_PATH_MAX], prefix[LXF_PATH_MAX], child[LXF_PATH_MAX * 2];
+    const char *slash = strrchr(final, '/');
+    const char *base;
+    size_t dir_len;
+    DIR *d;
+    struct dirent *de;
+
+    if (!slash || final[0] != '/')
+        return;
+    base = slash + 1;
+    if (!*base)
+        return;
+    dir_len = (size_t)(slash - final);
+    if (dir_len == 0)
+        dir_len = 1;
+    if (dir_len >= sizeof(dir))
+        return;
+    memcpy(dir, final, dir_len);
+    dir[dir_len] = 0;
+    if (snprintf(prefix, sizeof(prefix), ".%s.lmux-tmp-", base) >= (int)sizeof(prefix))
+        return;
+
+    d = opendir(dir);
+    if (!d)
+        return;
+    while ((de = readdir(d)) != NULL) {
+        if (strncmp(de->d_name, prefix, strlen(prefix)) != 0)
+            continue;
+        if (strcmp(dir, "/") == 0) {
+            if (snprintf(child, sizeof(child), "/%s", de->d_name) >= (int)sizeof(child))
+                continue;
+        } else if (snprintf(child, sizeof(child), "%s/%s", dir, de->d_name) >= (int)sizeof(child)) {
+            continue;
+        }
+        (void)unlink(child);
+    }
+    closedir(d);
 }
 
 void v2_file_session_reset(struct v2_file_session *fs)
@@ -115,6 +157,7 @@ static void file_handle_put_request(struct v2_app *a, struct v2_service *s,
         file_send_error(fs, errno == EACCES ? LXF_E_DENIED : LXF_E_IO, strerror(errno));
         return;
     }
+    lxf_cleanup_tmp_for_final(path);
     if (lxf_make_tmp_for_final(path, fs->tmp_path, sizeof(fs->tmp_path)) < 0) {
         file_send_error(fs, LXF_E_BADPATH, "bad destination path");
         return;

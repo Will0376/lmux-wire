@@ -456,6 +456,154 @@ static int count_temp_files(const char *dir)
     return n;
 }
 
+static int wait_temp_count(const char *dir, int want, int timeout_ms)
+{
+    long long end = now_ms() + timeout_ms;
+    int n = -1;
+    while (now_ms() < end) {
+        n = count_temp_files(dir);
+        if (n == want)
+            return 0;
+        usleep(20000);
+    }
+    fprintf(stderr, "temp count in %s got=%d want=%d\n", dir, n, want);
+    return -1;
+}
+
+static int write_file_data(const char *path, const uint8_t *data, size_t len)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return -1;
+    if (write_all(fd, data, len) < 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+static int file_equals_data(const char *path, const uint8_t *data, size_t len)
+{
+    uint8_t *got = NULL;
+    size_t got_len = 0;
+    int ok;
+    if (read_file_alloc(path, &got, &got_len) < 0)
+        return -1;
+    ok = got_len == len && memcmp(got, data, len) == 0;
+    free(got);
+    return ok ? 0 : -1;
+}
+
+static int wait_file_equals_data(const char *path, const uint8_t *data,
+                                 size_t len, int timeout_ms)
+{
+    long long end = now_ms() + timeout_ms;
+    while (now_ms() < end) {
+        if (file_equals_data(path, data, len) == 0)
+            return 0;
+        usleep(20000);
+    }
+    return -1;
+}
+
+static int expect_absent(const char *path)
+{
+    return access(path, F_OK) < 0 && errno == ENOENT ? 0 : -1;
+}
+
+static int put_partial_disconnect(const char *sock, const char *target,
+                                  const uint8_t *data, size_t total_len,
+                                  size_t send_len)
+{
+    int fd = wait_connect(sock, 5000);
+    uint8_t payload[LXF_MAX_PAYLOAD], reply[LXF_MAX_PAYLOAD], type;
+    uint32_t rlen;
+    if (fd < 0 || strlen(target) + 1 > sizeof(payload) - 16)
+        return -1;
+    if (send_len > LXF_MAX_PAYLOAD)
+        send_len = LXF_MAX_PAYLOAD;
+    lmux_put_le32(payload, 0644);
+    lmux_put_le64(payload + 4, (uint64_t)total_len);
+    lmux_put_le32(payload + 12, LXF_F_SIZE_KNOWN);
+    strcpy((char *)payload + 16, target);
+    if (send_record_frag(fd, LXF_T_PUT_REQUEST, payload,
+                         (uint32_t)(16 + strlen(target) + 1), 9) < 0 ||
+        recv_record(fd, &type, reply, &rlen) < 0 || type != LXF_T_OK ||
+        send_record_frag(fd, LXF_T_DATA, data, (uint32_t)send_len, 13) < 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+static int put_commit_disconnect_before_reply(const char *sock, const char *target,
+                                              const uint8_t *data, size_t len)
+{
+    int fd = wait_connect(sock, 5000);
+    uint8_t payload[LXF_MAX_PAYLOAD], reply[LXF_MAX_PAYLOAD], digest[32], type;
+    uint32_t rlen;
+    struct sha256_ctx sha;
+    size_t off = 0;
+    if (fd < 0 || strlen(target) + 1 > sizeof(payload) - 16)
+        return -1;
+    lmux_put_le32(payload, 0644);
+    lmux_put_le64(payload + 4, (uint64_t)len);
+    lmux_put_le32(payload + 12, LXF_F_SIZE_KNOWN);
+    strcpy((char *)payload + 16, target);
+    if (send_record_frag(fd, LXF_T_PUT_REQUEST, payload,
+                         (uint32_t)(16 + strlen(target) + 1), 17) < 0 ||
+        recv_record(fd, &type, reply, &rlen) < 0 || type != LXF_T_OK) {
+        close(fd);
+        return -1;
+    }
+    sha256_init(&sha);
+    while (off < len) {
+        size_t n = len - off;
+        if (n > LXF_MAX_PAYLOAD)
+            n = LXF_MAX_PAYLOAD;
+        sha256_update(&sha, data + off, n);
+        if (send_record_frag(fd, LXF_T_DATA, data + off, (uint32_t)n, 31) < 0) {
+            close(fd);
+            return -1;
+        }
+        off += n;
+    }
+    sha256_final(&sha, digest);
+    lmux_put_le64(payload, (uint64_t)len);
+    memcpy(payload + 8, digest, 32);
+    if (send_record_frag(fd, LXF_T_DONE, payload, 40, 19) < 0) {
+        close(fd);
+        return -1;
+    }
+    if (wait_file_equals_data(target, data, len, 5000) < 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+static int get_partial_disconnect(const char *sock, const char *target)
+{
+    int fd = wait_connect(sock, 5000);
+    uint8_t payload[LXF_MAX_PAYLOAD], got[LXF_MAX_PAYLOAD], type;
+    uint32_t len;
+    if (fd < 0 || strlen(target) + 1 > sizeof(payload))
+        return -1;
+    strcpy((char *)payload, target);
+    if (send_record_frag(fd, LXF_T_GET_REQUEST, payload,
+                         (uint32_t)(strlen(target) + 1), 11) < 0 ||
+        recv_record(fd, &type, got, &len) < 0 || type != LXF_T_OK ||
+        recv_record(fd, &type, got, &len) < 0 || type != LXF_T_DATA) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
 static void stop_child(pid_t pid)
 {
     long long end;
@@ -613,7 +761,8 @@ static int integration_test(void)
     char file_sock[160], file_bad_sock[160];
     char pty1[512], pty2[512], file_arg[320], file_dup[320], file_conflict[320];
     char target_zero[160], target_norm[160], target_large[160], target_10_put[160];
-    char target_bad[160], target_abort[160];
+    char target_bad[160], target_abort[160], target_abort_old[160], target_absent_abort[160];
+    char target_commit[160], target_get_abort[160], target_torture[160];
     char target_get0[160], target_get_large[160], target_10_get[160], target_reconnect[160], target_cli[160];
     char cli_src[160], cli_dst[160];
     pid_t target = -1, host = -1;
@@ -645,6 +794,11 @@ static int integration_test(void)
     snprintf(target_10_put, sizeof(target_10_put), "%s/put-10m.bin", dir);
     snprintf(target_bad, sizeof(target_bad), "%s/bad.bin", dir);
     snprintf(target_abort, sizeof(target_abort), "%s/abort.bin", dir);
+    snprintf(target_abort_old, sizeof(target_abort_old), "%s/abort-old.bin", dir);
+    snprintf(target_absent_abort, sizeof(target_absent_abort), "%s/abort-absent.bin", dir);
+    snprintf(target_commit, sizeof(target_commit), "%s/commit-lost-reply.bin", dir);
+    snprintf(target_get_abort, sizeof(target_get_abort), "%s/get-abort.bin", dir);
+    snprintf(target_torture, sizeof(target_torture), "%s/torture.bin", dir);
     snprintf(target_get0, sizeof(target_get0), "%s/get0.bin", dir);
     snprintf(target_get_large, sizeof(target_get_large), "%s/get-large.bin", dir);
     snprintf(target_10_get, sizeof(target_10_get), "%s/get-10m.bin", dir);
@@ -755,30 +909,44 @@ static int integration_test(void)
         goto out;
     free(got); got = NULL;
 
-    where = "mid PUT abort cleanup";
-    {
-        int fd = wait_connect(file_sock, 5000);
-        uint8_t payload[LXF_MAX_PAYLOAD], reply[LXF_MAX_PAYLOAD], type;
-        uint32_t rlen;
-        if (fd < 0)
-            goto out;
-        lmux_put_le32(payload, 0644);
-        lmux_put_le64(payload + 4, 70000);
-        lmux_put_le32(payload + 12, LXF_F_SIZE_KNOWN);
-        strcpy((char *)payload + 16, target_abort);
-        if (send_record_frag(fd, LXF_T_PUT_REQUEST, payload,
-                             (uint32_t)(16 + strlen(target_abort) + 1), 9) < 0 ||
-            recv_record(fd, &type, reply, &rlen) < 0 || type != LXF_T_OK ||
-            send_record_frag(fd, LXF_T_DATA, data, 4096, 13) < 0) {
-            close(fd);
-            goto out;
-        }
-        close(fd);
-    }
-    usleep(300000);
-    if (access(target_abort, F_OK) == 0 || count_temp_files(dir) != 0)
+    where = "mid PUT abort absent cleanup";
+    fill_pattern(data, 256 * 1024, 41);
+    if (put_partial_disconnect(file_sock, target_absent_abort, data, 256 * 1024, 4096) < 0 ||
+        wait_temp_count(dir, 0, 5000) < 0 ||
+        expect_absent(target_absent_abort) < 0)
         goto out;
-    if (put_data(file_sock, target_abort, (const uint8_t *)"next", 4, 0, 2) < 0)
+    if (put_data(file_sock, target_absent_abort, (const uint8_t *)"next", 4, 0, 2) < 0 ||
+        file_equals_data(target_absent_abort, (const uint8_t *)"next", 4) < 0)
+        goto out;
+
+    where = "mid PUT abort preserves old destination";
+    fill_pattern(data, 64 * 1024, 57);
+    if (write_file_data(target_abort_old, data, 12345) < 0)
+        goto out;
+    fill_pattern(data + 128 * 1024, 256 * 1024, 73);
+    if (put_partial_disconnect(file_sock, target_abort_old, data + 128 * 1024,
+                               256 * 1024, 8192) < 0 ||
+        wait_temp_count(dir, 0, 5000) < 0 ||
+        file_equals_data(target_abort_old, data, 12345) < 0)
+        goto out;
+    if (put_data(file_sock, target_abort_old, data + 128 * 1024,
+                 256 * 1024, 0, 23) < 0 ||
+        get_data(file_sock, target_abort_old, &got, &got_len, 7) < 0 ||
+        got_len != 256 * 1024 || memcmp(got, data + 128 * 1024, got_len) != 0)
+        goto out;
+    free(got); got = NULL;
+
+    where = "post commit lost success reply";
+    fill_pattern(data, 32 * 1024, 88);
+    if (write_file_data(target_commit, data, 4096) < 0)
+        goto out;
+    fill_pattern(data + 64 * 1024, 160 * 1024, 89);
+    if (put_commit_disconnect_before_reply(file_sock, target_commit,
+                                           data + 64 * 1024, 160 * 1024) < 0 ||
+        file_equals_data(target_commit, data + 64 * 1024, 160 * 1024) < 0 ||
+        put_data(file_sock, target_commit, data + 64 * 1024, 160 * 1024, 0, 29) < 0 ||
+        file_equals_data(target_commit, data + 64 * 1024, 160 * 1024) < 0 ||
+        wait_temp_count(dir, 0, 5000) < 0)
         goto out;
 
     where = "GET zero/large";
@@ -797,6 +965,17 @@ static int integration_test(void)
     }
     if (get_data(file_sock, target_get_large, &got, &got_len, 17) < 0 ||
         got_len != 70000 || memcmp(got, data, got_len) != 0)
+        goto out;
+    free(got); got = NULL;
+
+    where = "mid GET client abort cleanup";
+    fill_pattern(data, 96 * 1024, 141);
+    if (write_file_data(target_get_abort, data, 96 * 1024) < 0 ||
+        get_partial_disconnect(file_sock, target_get_abort) < 0 ||
+        wait_temp_count(dir, 0, 5000) < 0 ||
+        file_equals_data(target_get_abort, data, 96 * 1024) < 0 ||
+        get_data(file_sock, target_get_abort, &got, &got_len, 19) < 0 ||
+        got_len != 96 * 1024 || memcmp(got, data, got_len) != 0)
         goto out;
     free(got); got = NULL;
 
@@ -842,16 +1021,20 @@ static int integration_test(void)
         int fd = wait_connect(file_sock, 5000);
         uint8_t payload[LXF_MAX_PAYLOAD], reply[LXF_MAX_PAYLOAD], type;
         uint32_t rlen;
+        fill_pattern(data, 128 * 1024, 153);
+        if (write_file_data(target_reconnect, data, 32768) < 0)
+            goto out;
+        fill_pattern(data + 256 * 1024, 256 * 1024, 154);
         if (fd < 0)
             goto out;
         lmux_put_le32(payload, 0644);
-        lmux_put_le64(payload + 4, 70000);
+        lmux_put_le64(payload + 4, 256 * 1024);
         lmux_put_le32(payload + 12, LXF_F_SIZE_KNOWN);
         strcpy((char *)payload + 16, target_reconnect);
         if (send_record_frag(fd, LXF_T_PUT_REQUEST, payload,
                              (uint32_t)(16 + strlen(target_reconnect) + 1), 7) < 0 ||
             recv_record(fd, &type, reply, &rlen) < 0 || type != LXF_T_OK ||
-            send_record_frag(fd, LXF_T_DATA, data, 4096, 19) < 0) {
+            send_record_frag(fd, LXF_T_DATA, data + 256 * 1024, 4096, 19) < 0) {
             close(fd);
             goto out;
         }
@@ -860,8 +1043,8 @@ static int integration_test(void)
         close(fd);
         close(fd1); fd1 = -1;
     }
-    usleep(300000);
-    if (access(target_reconnect, F_OK) == 0 || count_temp_files(dir) != 0)
+    if (wait_temp_count(dir, 0, 5000) < 0 ||
+        file_equals_data(target_reconnect, data, 32768) < 0)
         goto out;
     host = spawn_host(carrier, control, pty1, pty2, gdb, file_arg, file_dup, file_conflict);
     if (host < 0)
@@ -869,10 +1052,28 @@ static int integration_test(void)
     fd1 = wait_connect(c1, 10000);
     if (fd1 < 0 || wait_path_exists(file_sock, 10000) < 0)
         goto out;
-    if (put_data(file_sock, target_reconnect, (const uint8_t *)"after", 5, 0, 3) < 0)
+    if (shell_cmd_expect(fd1, "printf 'F''ILECARRIER\\n'", "FILECARRIER") < 0 ||
+        put_data(file_sock, target_reconnect, (const uint8_t *)"after", 5, 0, 3) < 0 ||
+        file_equals_data(target_reconnect, (const uint8_t *)"after", 5) < 0)
         goto out;
     host_fd_base = count_fds(host);
     target_fd_base = count_fds(target);
+
+    where = "repeated local PUT abort torture";
+    for (int i = 0; i < 10; i++) {
+        fill_pattern(data, 32 * 1024, (unsigned)(170 + i));
+        if (write_file_data(target_torture, data, 8192 + (size_t)i) < 0)
+            goto out;
+        fill_pattern(data + 128 * 1024, 192 * 1024, (unsigned)(190 + i));
+        if (put_partial_disconnect(file_sock, target_torture, data + 128 * 1024,
+                                   192 * 1024, 2048 + (size_t)i) < 0 ||
+            wait_temp_count(dir, 0, 5000) < 0 ||
+            file_equals_data(target_torture, data, 8192 + (size_t)i) < 0)
+            goto out;
+        if (put_data(file_sock, target_torture, (const uint8_t *)"probe", 5, 0, 2) < 0 ||
+            file_equals_data(target_torture, (const uint8_t *)"probe", 5) < 0)
+            goto out;
+    }
 
     where = "fd/temp baseline";
     usleep(300000);
@@ -897,6 +1098,8 @@ out:
     unlink(target_zero); unlink(target_norm); unlink(target_large); unlink(target_10_put);
     unlink(target_bad); unlink(target_abort); unlink(target_get0); unlink(target_get_large);
     unlink(target_10_get); unlink(target_reconnect);
+    unlink(target_abort_old); unlink(target_absent_abort); unlink(target_commit);
+    unlink(target_get_abort); unlink(target_torture);
     unlink(target_cli); unlink(cli_src); unlink(cli_dst);
     rmdir(dir);
     return rc ? fail(where) : 0;

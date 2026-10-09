@@ -2831,6 +2831,45 @@ static void unlink_dir_files(const char *path)
     closedir(d);
 }
 
+static int count_lmux_temp_files(const char *path)
+{
+    DIR *d;
+    struct dirent *de;
+    int n = 0;
+    d = opendir(path);
+    if (!d)
+        return -1;
+    while ((de = readdir(d)) != NULL)
+        if (strstr(de->d_name, ".lmux-tmp-"))
+            n++;
+    closedir(d);
+    return n;
+}
+
+static int wait_lmux_temp_at_least(const char *path, int want, int timeout_ms)
+{
+    long long end = now_ms() + timeout_ms;
+    while (now_ms() < end) {
+        int n = count_lmux_temp_files(path);
+        if (n >= want)
+            return 0;
+        usleep(20000);
+    }
+    return -1;
+}
+
+static int wait_lmux_temp_count(const char *path, int want, int timeout_ms)
+{
+    long long end = now_ms() + timeout_ms;
+    while (now_ms() < end) {
+        int n = count_lmux_temp_files(path);
+        if (n == want)
+            return 0;
+        usleep(20000);
+    }
+    return -1;
+}
+
 static int wait_fd_count(pid_t pid, int want, int timeout_ms)
 {
     long long end = now_ms() + timeout_ms;
@@ -2919,6 +2958,24 @@ static int run_lmux_file(const char *op, const char *sock,
     if (pid < 0 || waitpid(pid, &st, 0) != pid)
         return -1;
     return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : -1;
+}
+
+static pid_t start_lmux_file(const char *op, const char *sock,
+                             const char *a, const char *b)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        int dn = open("/dev/null", O_WRONLY);
+        if (dn >= 0) {
+            dup2(dn, STDOUT_FILENO);
+            dup2(dn, STDERR_FILENO);
+            if (dn > STDERR_FILENO)
+                close(dn);
+        }
+        execl("build/host/lmux", "lmux", op, "--socket", sock, a, b, (char *)NULL);
+        _exit(127);
+    }
+    return pid;
 }
 
 static int run_lmux_boot_cli(const char *cmd, const char *control,
@@ -7122,6 +7179,119 @@ out:
     return rc;
 }
 
+static int file_worker_replacement_torture_test(void)
+{
+    char dir[] = "/tmp/lmux-file-worker-XXXXXX";
+    char carrier[160], control[160], console[160], file_sock[160];
+    char pty_arg[320], file_arg[240], old_src[160], new_src[160];
+    char target_path[160], got_path[160], out[8192];
+    pid_t sup = -1, host = -1, worker = -1, worker2 = -1, put_pid = -1;
+    int cfd = -1, rc = 1;
+    const char *where = "setup";
+
+    if (!mkdtemp(dir))
+        return fail("mkdtemp file worker");
+    snprintf(carrier, sizeof(carrier), "%s/carrier.sock", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(console, sizeof(console), "%s/console.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(old_src, sizeof(old_src), "%s/old.bin", dir);
+    snprintf(new_src, sizeof(new_src), "%s/new.bin", dir);
+    snprintf(target_path, sizeof(target_path), "%s/target.bin", dir);
+    snprintf(got_path, sizeof(got_path), "%s/got.bin", dir);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+
+    sup = spawn_supervisor_with_storage(carrier, NULL);
+    if (sup <= 0)
+        goto out;
+    host = spawn_host(carrier, control, pty_arg, file_arg);
+    if (host <= 0)
+        goto out;
+    where = "ready";
+    if (wait_ready_layers(control, getenv("LMUX_SUP_IT_OUTER") ? 1 : 0,
+                          15000, out, sizeof(out)) < 0)
+        goto out;
+    worker = wait_child_pid(sup, -1, 1000);
+    if (worker <= 0)
+        goto out;
+    cfd = wait_connect(console, 10000);
+    if (cfd < 0 ||
+        shell_cmd_expect(cfd, "printf 'F''ILEWORKER\\n'", "FILEWORKER",
+                         out, sizeof(out)) < 0)
+        goto out;
+
+    where = "initial file";
+    if (make_file(old_src, 64 * 1024) < 0 ||
+        make_file(new_src, 8 * 1024 * 1024) < 0 ||
+        run_lmux_file("put", file_sock, old_src, target_path) < 0 ||
+        files_equal(old_src, target_path) < 0)
+        goto out;
+
+    where = "kill worker mid put";
+    put_pid = start_lmux_file("put", file_sock, new_src, target_path);
+    if (put_pid <= 0 ||
+        wait_lmux_temp_at_least(dir, 1, 5000) < 0)
+        goto out;
+    kill(worker, SIGKILL);
+    worker2 = wait_child_pid(sup, worker, 15000);
+    if (worker2 <= 0 || wait_pid_gone(worker, 3000) < 0)
+        goto out;
+    {
+        long long end = now_ms() + 10000;
+        int st = 0, done = 0;
+        while (now_ms() < end) {
+            if (waitpid(put_pid, &st, WNOHANG) == put_pid) {
+                done = 1;
+                break;
+            }
+            usleep(20000);
+        }
+        if (!done)
+            goto out;
+        put_pid = -1;
+    }
+    if (files_equal(old_src, target_path) < 0)
+        goto out;
+
+    where = "fresh file after worker replacement";
+    if (wait_ready_layers(control, getenv("LMUX_SUP_IT_OUTER") ? 1 : 0,
+                          15000, out, sizeof(out)) < 0 ||
+        run_lmux_file("put", file_sock, new_src, target_path) < 0 ||
+        wait_lmux_temp_count(dir, 0, 5000) < 0 ||
+        run_lmux_file("get", file_sock, target_path, got_path) < 0 ||
+        files_equal(new_src, got_path) < 0)
+        goto out;
+    if (shell_cmd_expect(cfd, "printf 'F''ILEWORKER2\\n'", "FILEWORKER2",
+                         out, sizeof(out)) < 0) {
+        close(cfd);
+        cfd = wait_connect(console, 10000);
+        if (cfd < 0 ||
+            shell_cmd_expect(cfd, "printf 'F''ILEWORKER2\\n'", "FILEWORKER2",
+                             out, sizeof(out)) < 0)
+            goto out;
+    }
+
+    rc = 0;
+out:
+    if (rc)
+        fprintf(stderr, "file_worker_replacement where=%s worker=%ld worker2=%ld temp=%d\n",
+                where, (long)worker, (long)worker2, count_lmux_temp_files(dir));
+    if (put_pid > 0) {
+        kill(put_pid, SIGKILL);
+        (void)waitpid(put_pid, NULL, 0);
+    }
+    if (cfd >= 0)
+        close(cfd);
+    stop_pid(host);
+    stop_pid(sup);
+    unlink(carrier); unlink(control); unlink(console); unlink(file_sock);
+    unlink(old_src); unlink(new_src); unlink(target_path); unlink(got_path);
+    unlink_dir_files(dir);
+    rmdir(dir);
+    return rc ? fail(where) : 0;
+}
+
 static int marker_bad(const char *buf, const char *own, const char *a,
                       const char *b)
 {
@@ -8949,6 +9119,10 @@ int main(int argc, char **argv)
         setenv("LMUX_SUP_IT_OUTER", "1", 1);
         return structured_exec_lifecycle_repeat_test() ? 1 : 0;
     }
+    if (getenv("LMUX_SUP_IT_ONLY_FILE_WORKER")) {
+        setenv("LMUX_SUP_IT_OUTER", "1", 1);
+        return file_worker_replacement_torture_test() ? 1 : 0;
+    }
     if (getenv("LMUX_SUP_IT_ONLY_INSTALL_RESTART_SHORTCUT")) {
         setenv("LMUX_SUP_IT_OUTER", "1", 1);
         return supervisor_install_restart_shortcut_test() ? 1 : 0;
@@ -9022,6 +9196,7 @@ int main(int argc, char **argv)
         structured_control_scheduler_test() ||
         structured_lmux_reconnect_test() ||
         structured_worker_replacement_test() ||
+        file_worker_replacement_torture_test() ||
         lifecycle_recovery_loop_test() ||
         structured_exec_lifecycle_repeat_test() ||
         structured_deploy_coexistence_test() ||
