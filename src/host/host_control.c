@@ -1519,10 +1519,13 @@ static int exec_output_stream_drained(struct v2_app *a, uint64_t stream_id)
     if (!stream_id)
         return 0;
     st = v2_runtime_stream_state(a, stream_id);
-    return st == LMUX2_STREAM_REMOTE_CLOSED ||
+    if (st == LMUX2_STREAM_UNUSED)
+        return 1;
+    if (st == LMUX2_STREAM_REMOTE_CLOSED ||
         st == LMUX2_STREAM_TERMINAL ||
-        st == LMUX2_STREAM_RESET ||
-        st == LMUX2_STREAM_UNUSED;
+        st == LMUX2_STREAM_RESET)
+        return v2_runtime_stream_rx_len(a, stream_id) == 0;
+    return 0;
 }
 
 static int exec_attachment_drained(struct v2_app *a, const struct v2_host *h)

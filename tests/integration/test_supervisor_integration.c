@@ -9233,6 +9233,701 @@ out:
     return rc;
 }
 
+struct stream_proc {
+    pid_t pid;
+    int in_fd;
+    int out_fd;
+    int err_fd;
+};
+
+static void stream_proc_close(struct stream_proc *p)
+{
+    if (p->in_fd >= 0) { close(p->in_fd); p->in_fd = -1; }
+    if (p->out_fd >= 0) { close(p->out_fd); p->out_fd = -1; }
+    if (p->err_fd >= 0) { close(p->err_fd); p->err_fd = -1; }
+}
+
+static int spawn_lmux_stream_cli(const char *structured,
+                                 const char **target_argv, int target_argc,
+                                 struct stream_proc *p)
+{
+    int inpipe[2] = {-1, -1}, outpipe[2] = {-1, -1}, errpipe[2] = {-1, -1};
+    char **args;
+    int i;
+    memset(p, 0, sizeof(*p));
+    p->pid = -1;
+    p->in_fd = p->out_fd = p->err_fd = -1;
+    if (target_argc < 1 || pipe(inpipe) < 0 || pipe(outpipe) < 0 ||
+        pipe(errpipe) < 0)
+        goto fail;
+    args = calloc((size_t)target_argc + 6, sizeof(char *));
+    if (!args)
+        goto fail;
+    args[0] = "build/host/lmux";
+    args[1] = "stream";
+    args[2] = "--control";
+    args[3] = (char *)structured;
+    args[4] = "--";
+    for (i = 0; i < target_argc; i++)
+        args[5 + i] = (char *)target_argv[i];
+    p->pid = fork();
+    if (p->pid < 0) {
+        free(args);
+        goto fail;
+    }
+    if (p->pid == 0) {
+        dup2(inpipe[0], STDIN_FILENO);
+        dup2(outpipe[1], STDOUT_FILENO);
+        dup2(errpipe[1], STDERR_FILENO);
+        close(inpipe[0]); close(inpipe[1]);
+        close(outpipe[0]); close(outpipe[1]);
+        close(errpipe[0]); close(errpipe[1]);
+        execv("build/host/lmux", args);
+        _exit(127);
+    }
+    free(args);
+    close(inpipe[0]); inpipe[0] = -1;
+    close(outpipe[1]); outpipe[1] = -1;
+    close(errpipe[1]); errpipe[1] = -1;
+    p->in_fd = inpipe[1]; inpipe[1] = -1;
+    p->out_fd = outpipe[0]; outpipe[0] = -1;
+    p->err_fd = errpipe[0]; errpipe[0] = -1;
+    (void)test_set_nonblock(p->in_fd);
+    (void)test_set_nonblock(p->out_fd);
+    (void)test_set_nonblock(p->err_fd);
+    return 0;
+fail:
+    if (inpipe[0] >= 0) close(inpipe[0]);
+    if (inpipe[1] >= 0) close(inpipe[1]);
+    if (outpipe[0] >= 0) close(outpipe[0]);
+    if (outpipe[1] >= 0) close(outpipe[1]);
+    if (errpipe[0] >= 0) close(errpipe[0]);
+    if (errpipe[1] >= 0) close(errpipe[1]);
+    return -1;
+}
+
+static int run_lmux_stream_cli(const char *structured,
+                               const char **target_argv, int target_argc,
+                               const uint8_t *input, size_t input_len,
+                               uint8_t **outp, size_t *out_lenp,
+                               uint8_t **errp, size_t *err_lenp,
+                               int *exit_codep, int timeout_ms)
+{
+    struct stream_proc p;
+    uint8_t *out = NULL, *err = NULL;
+    size_t out_len = 0, out_cap = input_len + 2 * 1024 * 1024;
+    size_t err_len = 0, err_cap = 2 * 1024 * 1024;
+    size_t in_pos = 0;
+    int in_open = 1, out_open = 1, err_open = 1, status = 0;
+    const char *fail_reason = "unknown";
+    long long end = now_ms() + timeout_ms;
+    pid_t waited = 0;
+    memset(&p, 0, sizeof(p));
+    p.pid = -1;
+    p.in_fd = p.out_fd = p.err_fd = -1;
+    if (out_cap < 65536)
+        out_cap = 65536;
+    out = malloc(out_cap);
+    err = malloc(err_cap);
+    if (!out || !err ||
+        spawn_lmux_stream_cli(structured, target_argv, target_argc, &p) < 0) {
+        fail_reason = "alloc/spawn";
+        goto fail;
+    }
+    if (input_len == 0) {
+        close(p.in_fd);
+        p.in_fd = -1;
+        in_open = 0;
+    }
+    while ((out_open || err_open || waited == 0) && now_ms() < end) {
+        struct pollfd pfds[3];
+        int nfds = 0, in_idx = -1, out_idx = -1, err_idx = -1;
+        int rr;
+        if (in_open) {
+            in_idx = nfds;
+            pfds[nfds].fd = p.in_fd;
+            pfds[nfds].events = in_pos < input_len ? POLLOUT : 0;
+            pfds[nfds].revents = 0;
+            nfds++;
+        }
+        if (out_open) {
+            out_idx = nfds;
+            pfds[nfds].fd = p.out_fd;
+            pfds[nfds].events = POLLIN;
+            pfds[nfds].revents = 0;
+            nfds++;
+        }
+        if (err_open) {
+            err_idx = nfds;
+            pfds[nfds].fd = p.err_fd;
+            pfds[nfds].events = POLLIN;
+            pfds[nfds].revents = 0;
+            nfds++;
+        }
+        if (waited == 0) {
+            pid_t w = waitpid(p.pid, &status, WNOHANG);
+            if (w == p.pid)
+                waited = w;
+        }
+        rr = poll(pfds, nfds, 50);
+        if (rr < 0 && errno == EINTR)
+            continue;
+        if (rr < 0) {
+            fail_reason = "poll";
+            goto fail;
+        }
+        if (in_idx >= 0 && (pfds[in_idx].revents & POLLOUT)) {
+            if (in_pos < input_len) {
+                ssize_t w = write(p.in_fd, input + in_pos, input_len - in_pos);
+                if (w > 0)
+                    in_pos += (size_t)w;
+                else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                         errno != EINTR)
+                    { fail_reason = "stdin write"; goto fail; }
+            }
+            if (in_pos == input_len) {
+                close(p.in_fd);
+                p.in_fd = -1;
+                in_open = 0;
+            }
+        } else if (in_idx >= 0 && (pfds[in_idx].revents & (POLLHUP | POLLERR | POLLNVAL))) {
+            close(p.in_fd);
+            p.in_fd = -1;
+            in_open = 0;
+        }
+        if (out_idx >= 0 && (pfds[out_idx].revents & (POLLIN | POLLHUP))) {
+            for (;;) {
+                ssize_t r;
+                if (out_len == out_cap)
+                    { fail_reason = "stdout cap"; goto fail; }
+                r = read(p.out_fd, out + out_len, out_cap - out_len);
+                if (r > 0) {
+                    out_len += (size_t)r;
+                    continue;
+                }
+                if (r == 0) {
+                    close(p.out_fd);
+                    p.out_fd = -1;
+                    out_open = 0;
+                }
+                if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                    errno != EINTR)
+                    { fail_reason = "stdout read"; goto fail; }
+                break;
+            }
+        }
+        if (err_idx >= 0 && (pfds[err_idx].revents & (POLLIN | POLLHUP))) {
+            for (;;) {
+                ssize_t r;
+                if (err_len == err_cap)
+                    { fail_reason = "stderr cap"; goto fail; }
+                r = read(p.err_fd, err + err_len, err_cap - err_len);
+                if (r > 0) {
+                    err_len += (size_t)r;
+                    continue;
+                }
+                if (r == 0) {
+                    close(p.err_fd);
+                    p.err_fd = -1;
+                    err_open = 0;
+                }
+                if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                    errno != EINTR)
+                    { fail_reason = "stderr read"; goto fail; }
+                break;
+            }
+        }
+    }
+    if (waited == 0)
+        waited = waitpid(p.pid, &status, WNOHANG);
+    if (waited != p.pid) {
+        fail_reason = "timeout/wait";
+        goto fail;
+    }
+    stream_proc_close(&p);
+    *outp = out;
+    *out_lenp = out_len;
+    *errp = err;
+    *err_lenp = err_len;
+    *exit_codep = WIFEXITED(status) ? WEXITSTATUS(status) :
+        (WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1);
+    return 0;
+fail:
+    fprintf(stderr, "run_lmux_stream_cli fail reason=%s in_pos=%llu out_len=%llu err_len=%llu waited=%d\n",
+            fail_reason, (unsigned long long)in_pos,
+            (unsigned long long)out_len, (unsigned long long)err_len,
+            waited == p.pid);
+    if (err && err_len) {
+        size_t dump = err_len < 512 ? err_len : 512;
+        fprintf(stderr, "run_lmux_stream_cli child stderr: ");
+        fwrite(err + err_len - dump, 1, dump, stderr);
+        fprintf(stderr, "\n");
+    }
+    if (p.pid > 0) {
+        kill(p.pid, SIGKILL);
+        waitpid(p.pid, NULL, 0);
+    }
+    stream_proc_close(&p);
+    free(out);
+    free(err);
+    return -1;
+}
+
+static int stream_cli_basic_test(void)
+{
+    char dir[] = "/tmp/lmux-stream-it-XXXXXX";
+    char carrier[160], control[160], structured[160], console[160], file_sock[160];
+    char pty_arg[360], file_arg[240], out_status[32768], self[512], nbuf[32];
+    pid_t sup = -1, host = -1;
+    uint8_t *input = NULL, *out = NULL, *err = NULL;
+    size_t input_len = 256 * 1024, out_len = 0, err_len = 0, i;
+    int code = 0, rc = 1;
+    const char *where = "setup";
+    const char *cat_argv[] = {"/bin/cat"};
+    const char *tail_argv[] = {"/bin/sh", "-c", "cat >/dev/null; printf AFTER_EOF"};
+    const char *mark_argv[] = {"/bin/sh", "-c", "printf MARK; cat >/dev/null"};
+    const char *exit_argv[] = {"/bin/sh", "-c", "exit 37"};
+    const char *split_argv[3];
+    const char *slow_argv[4];
+    const char *output_argv[4];
+    const char *duplex_argv[4];
+
+    if (!mkdtemp(dir))
+        return fail("mkdtemp stream");
+    snprintf(carrier, sizeof(carrier), "%s/carrier.sock", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(structured, sizeof(structured), "%s/control-v2.sock", dir);
+    snprintf(console, sizeof(console), "%s/console.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+    if (!realpath("build/host/test_supervisor_integration", self))
+        goto out;
+    sup = spawn_supervisor_with_storage(carrier, NULL);
+    if (sup <= 0)
+        goto out;
+    host = spawn_host_structured(carrier, control, structured, pty_arg, file_arg);
+    if (host <= 0)
+        goto out;
+    where = "ready";
+    if (wait_ready_layers(control, getenv("LMUX_SUP_IT_OUTER") ? 1 : 0,
+                          15000, out_status, sizeof(out_status)) < 0 ||
+        wait_exec_service_ready(control, 15000, out_status, sizeof(out_status)) < 0)
+        goto out;
+
+    input = malloc(input_len);
+    if (!input)
+        goto out;
+    for (i = 0; i < input_len; i++)
+        input[i] = (uint8_t)((i * 131u + 17u) & 255u);
+    input[0] = 0x00;
+    input[1] = 0xff;
+    input[2] = 0x03;
+    input[3] = 0x0a;
+    input[4] = 0x0d;
+
+    where = "binary cat";
+    if (run_lmux_stream_cli(structured, cat_argv, 1, input, input_len,
+                            &out, &out_len, &err, &err_len, &code, 20000) < 0 ||
+        code != 0 || out_len != input_len || memcmp(out, input, input_len) != 0 ||
+        err_len != 0)
+        goto out;
+    free(out); out = NULL; free(err); err = NULL;
+
+    where = "eof tail";
+    if (run_lmux_stream_cli(structured, tail_argv, 3, (const uint8_t *)"abc", 3,
+                            &out, &out_len, &err, &err_len, &code, 10000) < 0 ||
+        code != 0 || out_len != 9 || memcmp(out, "AFTER_EOF", 9) != 0)
+        goto out;
+    free(out); out = NULL; free(err); err = NULL;
+
+    where = "output before stdin";
+    if (run_lmux_stream_cli(structured, mark_argv, 3, NULL, 0,
+                            &out, &out_len, &err, &err_len, &code, 10000) < 0 ||
+        code != 0 || out_len != 4 || memcmp(out, "MARK", 4) != 0)
+        goto out;
+    free(out); out = NULL; free(err); err = NULL;
+
+    where = "stderr separation";
+    split_argv[0] = self;
+    split_argv[1] = "--exec-helper";
+    split_argv[2] = "stream-split";
+    {
+        const uint8_t want_out[] = {0x00, 0xff, 0x03, 'O', 'U', 'T', '\n'};
+        const uint8_t want_err[] = {0x7f, 0x00, 0x03, 'E', 'R', 'R', '\n'};
+        if (run_lmux_stream_cli(structured, split_argv, 3, NULL, 0,
+                                &out, &out_len, &err, &err_len, &code, 10000) < 0 ||
+            code != 0 || out_len != sizeof(want_out) ||
+            err_len != sizeof(want_err) ||
+            memcmp(out, want_out, sizeof(want_out)) != 0 ||
+            memcmp(err, want_err, sizeof(want_err)) != 0)
+            goto out;
+    }
+    free(out); out = NULL; free(err); err = NULL;
+
+    where = "exit status";
+    if (run_lmux_stream_cli(structured, exit_argv, 3, NULL, 0,
+                            &out, &out_len, &err, &err_len, &code, 10000) < 0 ||
+        code != 37)
+        goto out;
+    free(out); out = NULL; free(err); err = NULL;
+
+    where = "slow stdin backpressure";
+    for (i = 0; i < input_len; i++)
+        input[i] = (uint8_t)(i & 255u);
+    snprintf(nbuf, sizeof(nbuf), "%llu", (unsigned long long)input_len);
+    slow_argv[0] = self;
+    slow_argv[1] = "--exec-helper";
+    slow_argv[2] = "stream-slow-stdin";
+    slow_argv[3] = nbuf;
+    if (run_lmux_stream_cli(structured, slow_argv, 4, input, input_len,
+                            &out, &out_len, &err, &err_len, &code, 30000) < 0 ||
+        code != 0 || out_len != 13 || memcmp(out, "SLOW_STDIN_OK", 13) != 0)
+        goto out;
+    free(out); out = NULL; free(err); err = NULL;
+
+    where = "stdout backpressure";
+    snprintf(nbuf, sizeof(nbuf), "%llu", (unsigned long long)(1024 * 1024));
+    output_argv[0] = self;
+    output_argv[1] = "--exec-helper";
+    output_argv[2] = "stream-output";
+    output_argv[3] = nbuf;
+    if (run_lmux_stream_cli(structured, output_argv, 4, NULL, 0,
+                            &out, &out_len, &err, &err_len, &code, 30000) < 0 ||
+        code != 0 || out_len != 1024 * 1024 || err_len != 0)
+        goto out;
+    for (i = 0; i < out_len; i++)
+        if (out[i] != (uint8_t)(i & 255u))
+            goto out;
+    free(out); out = NULL; free(err); err = NULL;
+
+    where = "full duplex";
+    snprintf(nbuf, sizeof(nbuf), "%llu", (unsigned long long)(128 * 1024));
+    duplex_argv[0] = self;
+    duplex_argv[1] = "--exec-helper";
+    duplex_argv[2] = "stream-full-duplex";
+    duplex_argv[3] = nbuf;
+    for (i = 0; i < 128 * 1024; i++)
+        input[i] = (uint8_t)(i & 255u);
+    if (run_lmux_stream_cli(structured, duplex_argv, 4, input, 128 * 1024,
+                            &out, &out_len, &err, &err_len, &code, 30000) < 0 ||
+        code != 0 || out_len != 128 * 1024 || err_len != 64 * 1024)
+        goto out;
+    for (i = 0; i < out_len; i++)
+        if (out[i] != (uint8_t)((i * 17u + 3u) & 255u))
+            goto out;
+    for (i = 0; i < err_len; i++)
+        if (err[i] != (uint8_t)((i * 31u + 7u) & 255u))
+            goto out;
+    free(out); out = NULL; free(err); err = NULL;
+
+    rc = 0;
+out:
+    if (rc)
+        fprintf(stderr, "stream_cli_basic where=%s code=%d out_len=%llu err_len=%llu\n",
+                where, code, (unsigned long long)out_len,
+                (unsigned long long)err_len);
+    if (rc && err && err_len) {
+        size_t cap = 256;
+        size_t dump = err_len < cap ? err_len : cap;
+        fprintf(stderr, "stream_cli_basic stderr head: ");
+        fwrite(err, 1, dump, stderr);
+        if (err_len > dump) {
+            fprintf(stderr, "\nstream_cli_basic stderr tail: ");
+            fwrite(err + err_len - dump, 1, dump, stderr);
+        }
+        fprintf(stderr, "\n");
+    }
+    free(input);
+    free(out);
+    free(err);
+    stop_pid(host); stop_pid(sup);
+    unlink(carrier); unlink(control); unlink(structured);
+    unlink(console); unlink(file_sock); rmdir(dir);
+    return rc;
+}
+
+static int wait_stream_proc_exit(struct stream_proc *p, int timeout_ms,
+                                 int *exit_codep)
+{
+    long long end = now_ms() + timeout_ms;
+    int status = 0;
+    while (now_ms() < end) {
+        pid_t w = waitpid(p->pid, &status, WNOHANG);
+        if (w == p->pid) {
+            if (exit_codep)
+                *exit_codep = WIFEXITED(status) ? WEXITSTATUS(status) :
+                    (WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1);
+            p->pid = -1;
+            return 0;
+        }
+        if (w < 0 && errno == ECHILD)
+            return -1;
+        usleep(20000);
+    }
+    return -1;
+}
+
+static int stream_cli_cleanup_test(void)
+{
+    char dir[] = "/tmp/lmux-stream-cleanup-XXXXXX";
+    char carrier[160], control[160], structured[160], console[160], file_sock[160];
+    char pty_arg[360], file_arg[240], out_status[32768], self[512];
+    pid_t sup = -1, host = -1, worker = -1, worker2 = -1;
+    struct stream_proc p;
+    uint8_t buf[4096];
+    uint8_t *out = NULL, *err = NULL;
+    size_t out_len = 0, err_len = 0;
+    int code = 0, rc = 1;
+    const char *where = "setup";
+    const char *output_loop_argv[3];
+    const char *cat_argv[] = {"/bin/cat"};
+    const char *sig_argv[] = {"/bin/sh", "-c",
+        "trap 'exit 42' INT TERM; while :; do sleep 1; done"};
+
+    memset(&p, 0, sizeof(p));
+    p.pid = -1;
+    p.in_fd = p.out_fd = p.err_fd = -1;
+    if (!mkdtemp(dir))
+        return fail("mkdtemp stream cleanup");
+    snprintf(carrier, sizeof(carrier), "%s/carrier.sock", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(structured, sizeof(structured), "%s/control-v2.sock", dir);
+    snprintf(console, sizeof(console), "%s/console.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+    if (!realpath("build/host/test_supervisor_integration", self))
+        goto out;
+    sup = spawn_supervisor_with_storage(carrier, NULL);
+    if (sup <= 0)
+        goto out;
+    worker = wait_child_pid(sup, -1, 10000);
+    if (worker <= 0)
+        goto out;
+    host = spawn_host_structured(carrier, control, structured, pty_arg, file_arg);
+    if (host <= 0 ||
+        wait_ready_layers(control, getenv("LMUX_SUP_IT_OUTER") ? 1 : 0,
+                          15000, out_status, sizeof(out_status)) < 0 ||
+        wait_exec_service_ready(control, 15000, out_status, sizeof(out_status)) < 0)
+        goto out;
+
+    where = "epipe cleanup";
+    output_loop_argv[0] = self;
+    output_loop_argv[1] = "--exec-helper";
+    output_loop_argv[2] = "stream-output-loop";
+    if (spawn_lmux_stream_cli(structured, output_loop_argv, 3, &p) < 0)
+        goto out;
+    code = -1;
+    close(p.in_fd); p.in_fd = -1;
+    close(p.out_fd); p.out_fd = -1;
+    if (wait_stream_proc_exit(&p, 20000, &code) < 0 || code == 0)
+        goto out;
+    stream_proc_close(&p);
+    if (run_lmux_stream_cli(structured, cat_argv, 1, (const uint8_t *)"OK", 2,
+                            &out, &out_len, &err, &err_len, &code, 10000) < 0 ||
+        code != 0 || out_len != 2 || memcmp(out, "OK", 2) != 0)
+        goto out;
+    free(out); out = NULL; free(err); err = NULL;
+
+    where = "sigint cleanup";
+    if (spawn_lmux_stream_cli(structured, sig_argv, 3, &p) < 0)
+        goto out;
+    code = -1;
+    close(p.in_fd); p.in_fd = -1;
+    usleep(500000);
+    kill(p.pid, SIGINT);
+    if (wait_stream_proc_exit(&p, 10000, &code) < 0)
+        goto out;
+    stream_proc_close(&p);
+    if (run_lmux_stream_cli(structured, cat_argv, 1, (const uint8_t *)"OK2", 3,
+                            &out, &out_len, &err, &err_len, &code, 10000) < 0 ||
+        code != 0 || out_len != 3 || memcmp(out, "OK2", 3) != 0)
+        goto out;
+    free(out); out = NULL; free(err); err = NULL;
+
+    where = "worker replacement cleanup";
+    if (spawn_lmux_stream_cli(structured, cat_argv, 1, &p) < 0)
+        goto out;
+    code = -1;
+    if (write_all(p.in_fd, "LIVE", 4) < 0 ||
+        read_exact_timeout(p.out_fd, buf, 4, 5000) < 0 ||
+        memcmp(buf, "LIVE", 4) != 0)
+        goto out;
+    kill(worker, SIGKILL);
+    worker2 = wait_child_pid(sup, worker, 15000);
+    if (worker2 <= 0 || worker2 == worker)
+        goto out;
+    worker = worker2;
+    worker2 = -1;
+    if (wait_stream_proc_exit(&p, 15000, &code) < 0 || code == 0)
+        goto out;
+    stream_proc_close(&p);
+    if (wait_ready_layers(control, getenv("LMUX_SUP_IT_OUTER") ? 1 : 0,
+                          15000, out_status, sizeof(out_status)) < 0 ||
+        wait_exec_service_ready(control, 15000, out_status, sizeof(out_status)) < 0)
+        goto out;
+    if (run_lmux_stream_cli(structured, cat_argv, 1, (const uint8_t *)"OK3", 3,
+                            &out, &out_len, &err, &err_len, &code, 10000) < 0 ||
+        code != 0 || out_len != 3 || memcmp(out, "OK3", 3) != 0)
+        goto out;
+
+    rc = 0;
+out:
+    if (rc)
+        fprintf(stderr, "stream_cli_cleanup where=%s code=%d worker=%ld\n",
+                where, code, (long)worker);
+    if (p.pid > 0) {
+        kill(p.pid, SIGKILL);
+        waitpid(p.pid, NULL, 0);
+    }
+    stream_proc_close(&p);
+    free(out);
+    free(err);
+    stop_pid(host); stop_pid(sup);
+    unlink(carrier); unlink(control); unlink(structured);
+    unlink(console); unlink(file_sock); rmdir(dir);
+    return rc;
+}
+
+static int stream_cli_reconnect_test(void)
+{
+    char dir[] = "/tmp/lmux-stream-reconnect-XXXXXX";
+    char carrier[160], control[160], structured[160], console[160], file_sock[160];
+    char pty_arg[360], file_arg[240], out_status[32768];
+    int host_pair[2] = {-1, -1};
+    int target_pair[2] = {-1, -1};
+    int arm[2] = {-1, -1};
+    int note[2] = {-1, -1};
+    pid_t proxy = -1, sup = -1, host = -1;
+    struct stream_proc p;
+    int console_fd = -1, code = -1, rc = 1;
+    char got[32];
+    long shell_pid = -1, shell_pid_after = -1;
+    const char *where = "setup";
+    const char *cat_argv[] = {"/bin/cat"};
+    const char *fault_cmd = "printf STREAM_RECONNECT_FAULT\\n\n";
+    struct saved_env outer_env = {0, NULL};
+
+    memset(&p, 0, sizeof(p));
+    p.pid = -1;
+    p.in_fd = p.out_fd = p.err_fd = -1;
+    if (!mkdtemp(dir))
+        return fail("mkdtemp stream reconnect");
+    snprintf(carrier, sizeof(carrier), "%s/proxy.sock", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(structured, sizeof(structured), "%s/control-v2.sock", dir);
+    snprintf(console, sizeof(console), "%s/console.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, host_pair) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, target_pair) < 0 ||
+        pipe(arm) < 0 || pipe(note) < 0)
+        goto out;
+    proxy = spawn_fault_proxy_fds(host_pair[0], target_pair[0],
+                                  OUTER_FAULT_BAD_CRC,
+                                  OUTER_FAULT_TARGET_TO_HOST,
+                                  arm[0], note[1]);
+    close(host_pair[0]); host_pair[0] = -1;
+    close(target_pair[0]); target_pair[0] = -1;
+    close(arm[0]); arm[0] = -1;
+    close(note[1]); note[1] = -1;
+    if (proxy < 0)
+        goto out;
+    sup = spawn_supervisor_fd(target_pair[1], 1);
+    close(target_pair[1]); target_pair[1] = -1;
+    if (sup < 0)
+        goto out;
+    if (save_env_var(&outer_env, "LMUX_SUP_IT_OUTER") < 0)
+        goto out;
+    setenv("LMUX_SUP_IT_OUTER", "1", 1);
+    host = spawn_host_fd_structured(host_pair[1], control, structured,
+                                    pty_arg, file_arg, 1);
+    restore_env_var("LMUX_SUP_IT_OUTER", &outer_env);
+    close(host_pair[1]); host_pair[1] = -1;
+    if (host < 0)
+        goto out;
+    where = "initial ready";
+    if (wait_ready_layers(control, 1, 15000, out_status, sizeof(out_status)) < 0 ||
+        wait_exec_service_ready(control, 15000, out_status, sizeof(out_status)) < 0)
+        goto out;
+    where = "spawn stream";
+    if (spawn_lmux_stream_cli(structured, cat_argv, 1, &p) < 0)
+        goto out;
+    where = "pre exchange";
+    if (write_all(p.in_fd, "BEFORE", 6) < 0 ||
+        read_exact_timeout(p.out_fd, (uint8_t *)got, 6, 5000) < 0 ||
+        memcmp(got, "BEFORE", 6) != 0)
+        goto out;
+
+    where = "trigger reconnect";
+    console_fd = wait_connect(console, 5000);
+    if (console_fd < 0)
+        goto out;
+    usleep(500000);
+    if (shell_cmd_expect(console_fd, "printf '%s%s:%s\\n' S PID \"$$\"",
+                         "SPID:", out_status, sizeof(out_status)) < 0)
+        goto out;
+    shell_pid = parse_pid_marker(out_status, "SPID:");
+    if (shell_pid <= 0 || write_all(arm[1], "A", 1) < 0 ||
+        write_all(console_fd, fault_cmd, strlen(fault_cmd)) < 0 ||
+        wait_fault_injected(note[0], 5000) < 0)
+        goto out;
+    close(console_fd); console_fd = -1;
+    where = "reconverge";
+    if (wait_ready_layers(control, 1, 15000, out_status, sizeof(out_status)) < 0 ||
+        wait_exec_service_ready(control, 15000, out_status, sizeof(out_status)) < 0)
+        goto out;
+    console_fd = wait_connect(console, 5000);
+    if (console_fd < 0)
+        goto out;
+    usleep(500000);
+    if (shell_cmd_expect(console_fd, "printf '%s%s:%s\\n' S PID2 \"$$\"",
+                         "SPID2:", out_status, sizeof(out_status)) < 0)
+        goto out;
+    shell_pid_after = parse_pid_marker(out_status, "SPID2:");
+    if (shell_pid_after != shell_pid)
+        goto out;
+    close(console_fd); console_fd = -1;
+
+    where = "post exchange and eof";
+    if (write_all(p.in_fd, "AFTER", 5) < 0)
+        goto out;
+    close(p.in_fd); p.in_fd = -1;
+    if (read_exact_timeout(p.out_fd, (uint8_t *)got, 5, 10000) < 0 ||
+        memcmp(got, "AFTER", 5) != 0 ||
+        wait_stream_proc_exit(&p, 15000, &code) < 0 ||
+        code != 0)
+        goto out;
+    rc = 0;
+out:
+    if (rc)
+        fprintf(stderr,
+                "stream_cli_reconnect where=%s code=%d shell=%ld after=%ld\n",
+                where, code, shell_pid, shell_pid_after);
+    if (p.pid > 0) {
+        kill(p.pid, SIGKILL);
+        waitpid(p.pid, NULL, 0);
+    }
+    stream_proc_close(&p);
+    if (console_fd >= 0)
+        close(console_fd);
+    if (host_pair[0] >= 0) close(host_pair[0]);
+    if (host_pair[1] >= 0) close(host_pair[1]);
+    if (target_pair[0] >= 0) close(target_pair[0]);
+    if (target_pair[1] >= 0) close(target_pair[1]);
+    if (arm[0] >= 0) close(arm[0]);
+    if (arm[1] >= 0) close(arm[1]);
+    if (note[0] >= 0) close(note[0]);
+    if (note[1] >= 0) close(note[1]);
+    stop_pid(host); stop_pid(sup); stop_pid(proxy);
+    unlink(carrier); unlink(control); unlink(structured);
+    unlink(console); unlink(file_sock); rmdir(dir);
+    return rc;
+}
+
 static char helper_marker_dir[512];
 static int helper_is_child;
 
@@ -9383,6 +10078,122 @@ static int exec_helper_stdin_delay(size_t total)
     return 0;
 }
 
+static int exec_helper_stream_split(void)
+{
+    const uint8_t out[] = {0x00, 0xff, 0x03, 'O', 'U', 'T', '\n'};
+    const uint8_t err[] = {0x7f, 0x00, 0x03, 'E', 'R', 'R', '\n'};
+    return write_all(STDOUT_FILENO, out, sizeof(out)) < 0 ||
+        write_all(STDERR_FILENO, err, sizeof(err)) < 0 ? 3 : 0;
+}
+
+static int exec_helper_stream_slow_stdin(size_t total)
+{
+    size_t got = 0;
+    while (got < total) {
+        uint8_t buf[37];
+        ssize_t r = read(STDIN_FILENO, buf, sizeof(buf));
+        if (r > 0) {
+            size_t i;
+            for (i = 0; i < (size_t)r; i++)
+                if (buf[i] != (uint8_t)((got + i) & 255))
+                    return 4;
+            got += (size_t)r;
+            usleep(1000);
+            continue;
+        }
+        if (r == 0)
+            break;
+        if (errno == EINTR)
+            continue;
+        return 5;
+    }
+    if (got != total) {
+        char msg[96];
+        int n = snprintf(msg, sizeof(msg), "GOT=%llu WANT=%llu\n",
+                         (unsigned long long)got,
+                         (unsigned long long)total);
+        if (n > 0)
+            (void)write(STDERR_FILENO, msg, (size_t)n);
+        return 6;
+    }
+    return write_all(STDOUT_FILENO, "SLOW_STDIN_OK", 13) < 0 ? 7 : 0;
+}
+
+static int exec_helper_stream_output(size_t total)
+{
+    uint8_t buf[4096];
+    size_t done = 0;
+    while (done < total) {
+        size_t i, n = total - done;
+        if (n > sizeof(buf))
+            n = sizeof(buf);
+        for (i = 0; i < n; i++)
+            buf[i] = (uint8_t)((done + i) & 255u);
+        if (write_all(STDOUT_FILENO, buf, n) < 0)
+            return 8;
+        done += n;
+    }
+    return 0;
+}
+
+static int exec_helper_stream_output_loop(void)
+{
+    uint8_t buf[4096];
+    size_t done = 0;
+    for (;;) {
+        size_t i;
+        for (i = 0; i < sizeof(buf); i++)
+            buf[i] = (uint8_t)((done + i) & 255u);
+        if (write_all(STDOUT_FILENO, buf, sizeof(buf)) < 0)
+            return 8;
+        done += sizeof(buf);
+    }
+}
+
+static int exec_helper_stream_full_duplex(size_t total)
+{
+    uint8_t in[257], out[257], err[113];
+    size_t got = 0, out_done = 0, err_done = 0;
+    while (got < total || out_done < total || err_done < total / 2) {
+        if (got < total) {
+            ssize_t r = read(STDIN_FILENO, in, sizeof(in));
+            if (r > 0) {
+                size_t i;
+                for (i = 0; i < (size_t)r; i++)
+                    if (in[i] != (uint8_t)((got + i) & 255u))
+                        return 9;
+                got += (size_t)r;
+            } else if (r == 0) {
+                if (got != total)
+                    return 10;
+            } else if (errno != EINTR) {
+                return 11;
+            }
+        }
+        if (out_done < total) {
+            size_t i, n = total - out_done;
+            if (n > sizeof(out))
+                n = sizeof(out);
+            for (i = 0; i < n; i++)
+                out[i] = (uint8_t)(((out_done + i) * 17u + 3u) & 255u);
+            if (write_all(STDOUT_FILENO, out, n) < 0)
+                return 12;
+            out_done += n;
+        }
+        if (err_done < total / 2) {
+            size_t i, n = total / 2 - err_done;
+            if (n > sizeof(err))
+                n = sizeof(err);
+            for (i = 0; i < n; i++)
+                err[i] = (uint8_t)(((err_done + i) * 31u + 7u) & 255u);
+            if (write_all(STDERR_FILENO, err, n) < 0)
+                return 13;
+            err_done += n;
+        }
+    }
+    return 0;
+}
+
 static int exec_helper_main(int argc, char **argv)
 {
     if (argc >= 4 && strcmp(argv[2], "pgsig") == 0)
@@ -9393,6 +10204,16 @@ static int exec_helper_main(int argc, char **argv)
         return exec_helper_stderr_bp();
     if (argc >= 4 && strcmp(argv[2], "stdin-delay") == 0)
         return exec_helper_stdin_delay((size_t)strtoull(argv[3], NULL, 10));
+    if (argc >= 3 && strcmp(argv[2], "stream-split") == 0)
+        return exec_helper_stream_split();
+    if (argc >= 4 && strcmp(argv[2], "stream-slow-stdin") == 0)
+        return exec_helper_stream_slow_stdin((size_t)strtoull(argv[3], NULL, 10));
+    if (argc >= 4 && strcmp(argv[2], "stream-output") == 0)
+        return exec_helper_stream_output((size_t)strtoull(argv[3], NULL, 10));
+    if (argc >= 3 && strcmp(argv[2], "stream-output-loop") == 0)
+        return exec_helper_stream_output_loop();
+    if (argc >= 4 && strcmp(argv[2], "stream-full-duplex") == 0)
+        return exec_helper_stream_full_duplex((size_t)strtoull(argv[3], NULL, 10));
     return 2;
 }
 
@@ -9444,6 +10265,23 @@ int main(int argc, char **argv)
     if (getenv("LMUX_SUP_IT_ONLY_STRUCTURED_DEPLOY")) {
         setenv("LMUX_SUP_IT_OUTER", "1", 1);
         return structured_deploy_coexistence_test() ? 1 : 0;
+    }
+    if (getenv("LMUX_SUP_IT_ONLY_STREAM_BASIC")) {
+        setenv("LMUX_SUP_IT_OUTER", "1", 1);
+        return stream_cli_basic_test() ? 1 : 0;
+    }
+    if (getenv("LMUX_SUP_IT_ONLY_STREAM_CLEANUP")) {
+        setenv("LMUX_SUP_IT_OUTER", "1", 1);
+        return stream_cli_cleanup_test() ? 1 : 0;
+    }
+    if (getenv("LMUX_SUP_IT_ONLY_STREAM_RECONNECT")) {
+        setenv("LMUX_SUP_IT_OUTER", "1", 1);
+        return stream_cli_reconnect_test() ? 1 : 0;
+    }
+    if (getenv("LMUX_SUP_IT_ONLY_STREAM_RECONNECT_THEN_INSTALL")) {
+        setenv("LMUX_SUP_IT_OUTER", "1", 1);
+        return stream_cli_reconnect_test() ||
+            supervisor_install_restart_shortcut_test() ? 1 : 0;
     }
     if (getenv("LMUX_SUP_IT_ONLY_LIFECYCLE_LOOP")) {
         setenv("LMUX_SUP_IT_OUTER", "1", 1);
@@ -9539,6 +10377,9 @@ int main(int argc, char **argv)
         lifecycle_recovery_loop_test() ||
         structured_exec_lifecycle_repeat_test() ||
         structured_deploy_coexistence_test() ||
+        stream_cli_basic_test() ||
+        stream_cli_cleanup_test() ||
+        stream_cli_reconnect_test() ||
         supervisor_install_restart_shortcut_test() ||
         host_first_startup_test() || integration_test())
         return 1;

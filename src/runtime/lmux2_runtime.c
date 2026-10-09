@@ -283,6 +283,13 @@ size_t v2_runtime_stream_write(struct v2_app *a, uint64_t stream_id,
     return lmux2_stream_write(&a->conn, stream_id, buf, len);
 }
 
+size_t v2_runtime_stream_rx_len(struct v2_app *a, uint64_t stream_id)
+{
+    if (!a)
+        return 0;
+    return lmux2_stream_rx_len(&a->conn, stream_id);
+}
+
 size_t v2_runtime_stream_tx_len(struct v2_app *a, uint64_t stream_id)
 {
     if (!a)

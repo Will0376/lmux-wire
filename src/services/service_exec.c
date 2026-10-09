@@ -795,9 +795,12 @@ static void detach_dead_streams(struct v2_exec_obj *e, struct lmux2_conn *conn)
     }
     if (e->stdin_stream_id) {
         st = lmux2_find_stream_const(conn, e->stdin_stream_id);
-        if (!st || st->state == LMUX2_STREAM_TERMINAL ||
-            st->state == LMUX2_STREAM_RESET ||
-            (st->state == LMUX2_STREAM_REMOTE_CLOSED && e->stdin_fd < 0))
+        if (!st || st->state == LMUX2_STREAM_RESET ||
+            ((st->state == LMUX2_STREAM_TERMINAL ||
+              st->state == LMUX2_STREAM_REMOTE_CLOSED) &&
+             e->stdin_fd < 0 &&
+             e->stdin_pos == e->stdin_len &&
+             lmux2_stream_rx_len(conn, e->stdin_stream_id) == 0))
             e->stdin_stream_id = 0;
     }
     if (e->stdout_stream_id) {
@@ -943,19 +946,22 @@ static void pump_stdin_rx(struct v2_exec_obj *e, struct lmux2_conn *conn)
         return;
     if (e->stdin_len == e->stdin_pos) {
         e->stdin_len = e->stdin_pos = 0;
-        if (e->stdin_stream_id)
+        if (e->stdin_stream_id) {
             e->stdin_len = lmux2_stream_read(conn, e->stdin_stream_id,
                                              e->stdin_buf,
                                              sizeof(e->stdin_buf));
+        }
     }
     st = e->stdin_stream_id ?
         lmux2_find_stream_const(conn, e->stdin_stream_id) : NULL;
-    if (st && st->state == LMUX2_STREAM_REMOTE_CLOSED &&
+    if (st && (st->state == LMUX2_STREAM_REMOTE_CLOSED ||
+               st->state == LMUX2_STREAM_TERMINAL) &&
         lmux2_stream_rx_len(conn, e->stdin_stream_id) == 0 &&
         e->stdin_len == e->stdin_pos) {
+        uint64_t stream_id = e->stdin_stream_id;
         exec_close_stdin_side(e);
         e->stdin_stream_id = 0;
-        (void)lmux2_close_stream(conn, st->id);
+        (void)lmux2_close_stream(conn, stream_id);
     }
 }
 

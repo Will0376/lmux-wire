@@ -218,6 +218,8 @@ lmux term
 lmux term 2
 lmux put ./local.bin /tmp/remote.bin
 lmux get /tmp/remote.bin ./local.bin
+tar -cf - DIR | lmux stream -- /bin/tar -xf - -C /tmp
+lmux stream -- /bin/dd if=/dev/device bs=65536 > image.bin
 ```
 
 `lmux term` uses local Ctrl-T commands:
@@ -233,6 +235,22 @@ Ctrl-T g        download file TARGET -> HOST
 `lmux put` and `lmux get` use `/run/lmux/file.sock` by default. Use
 `--remote-dir`, `--channel 1|2`, `--mode OCTAL`, `-S SOCKET`, and `-v` as shown
 by `lmux --help`.
+
+`lmux stream -- /absolute/program [ARGS...]` runs one foreground target process
+through the structured EXEC path and maps local stdin/stdout/stderr to the
+target process byte streams. It is binary-clean, forwards stdin EOF, keeps target
+stderr separate from stdout, and exits with the target exit status when the
+execution completes normally. The target program path must be absolute; LMUX
+does not perform target PATH lookup or interpret shell syntax. Use
+`lmux stream -- /bin/sh -c '...'` when a target shell is explicitly desired.
+
+`lmux stream` is not a PTY and does not provide terminal modes, prompts, window
+size, FILE hashes, atomic replacement, resume offsets, or background job
+handles. For interactive shells use `lmux term`; for verified file replacement
+use `lmux put` / `lmux get`. The command currently uses the single structured
+control client slot at `/run/lmux/control-v2.sock`, so another structured client
+such as `lmux-mcp` may make it fail with a clear BUSY/error instead of stealing
+ownership.
 
 The checked-in `lmux-start-target.sh` is a legacy raw-target wrapper. Current
 supervisor deployments should use `lmuxd --supervisor --outer ...` or an

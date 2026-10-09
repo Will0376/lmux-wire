@@ -188,10 +188,13 @@ static int hc2_stream_drained(struct v2_app *a, uint64_t stream_id)
     if (!stream_id)
         return 1;
     st = v2_runtime_stream_state(a, stream_id);
-    return st == LMUX2_STREAM_REMOTE_CLOSED ||
-        st == LMUX2_STREAM_TERMINAL ||
-        st == LMUX2_STREAM_RESET ||
-        st == LMUX2_STREAM_UNUSED;
+    if (st == LMUX2_STREAM_UNUSED)
+        return 1;
+    if (st == LMUX2_STREAM_RESET)
+        return v2_runtime_stream_rx_len(a, stream_id) == 0;
+    if (st == LMUX2_STREAM_REMOTE_CLOSED || st == LMUX2_STREAM_TERMINAL)
+        return v2_runtime_stream_rx_len(a, stream_id) == 0;
+    return 0;
 }
 
 static int hc2_abs_path_ok(const char *p)
@@ -977,6 +980,10 @@ static void hc2_handle_exec_stdin(struct v2_host *h, const struct hc2_frame *fr)
         hc2_queue_error(h, fr->request_id, LMUX_HC2_E_BUSY, "stdin backpressure");
         return;
     }
+    if (e->stdin_close_requested) {
+        hc2_queue_error(h, fr->request_id, LMUX_HC2_E_IO, "stdin closed");
+        return;
+    }
     memcpy(e->stdin_buf + e->stdin_len, fr->payload + 8, data_len);
     e->stdin_len += data_len;
     hc2_queue_error(h, fr->request_id, LMUX_HC2_OK, "ok");
@@ -1491,6 +1498,7 @@ static void hc2_exec_pump_stdin_entry(struct v2_app *a, struct v2_host *h,
         !e->stdin_close_pending) {
         (void)v2_runtime_close_stream(a, e->stdin_stream);
         e->stdin_close_pending = 1;
+        e->stdin_close_committed = 1;
     }
 }
 
@@ -1509,7 +1517,8 @@ static void hc2_exec_forget_dead_attachments(struct v2_app *a,
         st = v2_runtime_stream_state(a, e->stdin_stream);
         if (st == LMUX2_STREAM_RESET || st == LMUX2_STREAM_UNUSED) {
             e->stdin_stream = 0;
-            e->stdin_close_pending = 0;
+            if (!e->stdin_close_committed)
+                e->stdin_close_pending = 0;
         } else if (st == LMUX2_STREAM_TERMINAL) {
             e->stdin_stream = 0;
             if (e->stdin_pos < e->stdin_len)
@@ -1605,11 +1614,16 @@ static void hc2_exec_table_step(struct v2_app *a, struct v2_host *h)
             (void)v2_runtime_open_stream_token(a, s->id,
                 v2_exec_stream_token(e->exec_id, V2_EXEC_ROLE_STDERR),
                 &e->stderr_stream);
-        if ((e->stdin_close_requested || e->stdin_pos < e->stdin_len) &&
-            !e->stdin_stream && !e->stdin_close_pending)
-            (void)v2_runtime_open_stream_token(a, s->id,
-                v2_exec_stream_token(e->exec_id, V2_EXEC_ROLE_STDIN),
-                &e->stdin_stream);
+        if ((e->stdin_pos < e->stdin_len ||
+             (e->stdin_close_requested && !e->stdin_close_committed &&
+              !e->stdin_stream_opened)) &&
+            !e->stdin_stream && !e->stdin_close_pending &&
+            !e->stdin_stream_opened) {
+            if (v2_runtime_open_stream_token(a, s->id,
+                    v2_exec_stream_token(e->exec_id, V2_EXEC_ROLE_STDIN),
+                    &e->stdin_stream) == 0)
+                e->stdin_stream_opened = 1;
+        }
         hc2_exec_read_stream(a, h, e, e->stdout_stream, LMUX_HC2_EXEC_STDOUT);
         hc2_exec_read_stream(a, h, e, e->stderr_stream, LMUX_HC2_EXEC_STDERR);
         hc2_exec_pump_stdin_entry(a, h, e);
@@ -1795,6 +1809,7 @@ void v2_host_structured_service(struct v2_app *a, struct v2_host *h,
     if (revents & POLLIN) {
         for (;;) {
             ssize_t r;
+            int parsed;
             if (h->structured_rx_len == sizeof(h->structured_rx)) {
                 hc2_queue_error(h, 0, LMUX_HC2_E_PROTOCOL, "rx overflow");
                 break;
@@ -1803,6 +1818,20 @@ void v2_host_structured_service(struct v2_app *a, struct v2_host *h,
                      sizeof(h->structured_rx) - h->structured_rx_len);
             if (r > 0) {
                 h->structured_rx_len += (size_t)r;
+                do {
+                    struct hc2_frame fr;
+                    parsed = hc2_parse_frame(h, &fr);
+                    if (parsed < 0) {
+                        hc2_close_client_runtime(a, h);
+                        return;
+                    }
+                    if (parsed > 0) {
+                        hc2_handle_frame(a, h, st, &fr, 1);
+                        if (h->structured_fd < 0)
+                            return;
+                        hc2_consume_frame(h, &fr);
+                    }
+                } while (parsed > 0);
                 continue;
             }
             if (r < 0 && errno == EINTR)
@@ -1811,20 +1840,6 @@ void v2_host_structured_service(struct v2_app *a, struct v2_host *h,
                 break;
             hc2_close_client_runtime(a, h);
             return;
-        }
-        for (;;) {
-            struct hc2_frame fr;
-            int rc = hc2_parse_frame(h, &fr);
-            if (rc < 0) {
-                hc2_close_client_runtime(a, h);
-                return;
-            }
-            if (rc == 0)
-                break;
-            hc2_handle_frame(a, h, st, &fr, 1);
-            if (h->structured_fd < 0)
-                return;
-            hc2_consume_frame(h, &fr);
         }
     }
     if (h->structured_fd >= 0 && (revents & POLLOUT))
@@ -1938,6 +1953,8 @@ void v2_host_structured_on_outer_down(struct v2_host *h)
         e->stdin_stream = 0;
         e->stdout_stream = 0;
         e->stderr_stream = 0;
+        e->stdin_stream_opened = 0;
+        e->stdin_close_committed = 0;
         e->stdin_close_pending = 0;
         e->status_pending = 0;
     }

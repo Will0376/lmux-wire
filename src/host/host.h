@@ -114,8 +114,10 @@ struct v2_host_structured_exec {
     size_t stdin_pos;
     int stdin_backpressure;
     int stdin_ready_pending;
+    int stdin_stream_opened;
     int stdin_close_requested;
     int stdin_close_pending;
+    int stdin_close_committed;
 };
 
 enum v2_host_structured_control_kind {
@@ -300,6 +302,7 @@ size_t v2_runtime_stream_read(struct v2_app *a, uint64_t stream_id,
                               uint8_t *buf, size_t len);
 size_t v2_runtime_stream_write(struct v2_app *a, uint64_t stream_id,
                                const uint8_t *buf, size_t len);
+size_t v2_runtime_stream_rx_len(struct v2_app *a, uint64_t stream_id);
 size_t v2_runtime_stream_tx_len(struct v2_app *a, uint64_t stream_id);
 int v2_runtime_close_stream(struct v2_app *a, uint64_t stream_id);
 void v2_runtime_count_stream_open(struct v2_app *a);

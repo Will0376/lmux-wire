@@ -1,4 +1,6 @@
 #include "lxf.h"
+#include "host_control_structured.h"
+#include "services.h"
 #include "zeromux/zeromux.h"
 #include "version.h"
 
@@ -27,6 +29,7 @@ static char host_cwd[LXF_PATH_MAX] = ".";
 static volatile sig_atomic_t term_winch_pending;
 
 #define LMUX_DEFAULT_CONTROL_SOCKET "/run/lmux/control.sock"
+#define LMUX_DEFAULT_STRUCTURED_SOCKET "/run/lmux/control-v2.sock"
 
 struct transfer_config {
     const char *sock_path;
@@ -383,6 +386,7 @@ static void usage(FILE *f)
         "  lmux zeromux probe --tty DEVICE [serial options]\n"
         "  lmux zeromux send LOCAL_FILE TARGET_TEMP --tty DEVICE [serial options]\n"
         "  lmux term [-v|--verbose] [--remote-dir DIR] [--channel 1|2] [1|2|SOCKET]\n"
+        "  lmux stream [--control SOCKET] -- /absolute/target/program [ARGS...]\n"
         "  lmux exec SOCKET -- PROGRAM [ARGS...]\n"
         "  lmux put [OPTIONS] HOST_SRC [TARGET_DST]\n"
         "      upload file: HOST -> TARGET\n"
@@ -401,6 +405,8 @@ static void usage(FILE *f)
         "  lmux put ./lmuxd /tmp/lmuxd\n"
         "  lmux get log.log\n"
         "  lmux get /tmp/core.bin ./core.bin\n"
+        "  tar -cf - DIR | lmux stream -- /bin/tar -xf - -C /tmp\n"
+        "  lmux stream -- /bin/dd if=/dev/device bs=65536 > image.bin\n"
         "\n"
         "lmux term Ctrl-T commands:\n"
         "  Ctrl-T ?        help\n"
@@ -1630,6 +1636,807 @@ static int cmd_exec(int argc, char **argv)
     return 127;
 }
 
+#define STREAM_QUEUE_CAP 65536u
+#define STREAM_STDIN_CHUNK 1024u
+#define STREAM_START_TIMEOUT_MS 30000
+#define STREAM_CLEANUP_TIMEOUT_MS 5000
+
+struct stream_queue {
+    uint8_t data[STREAM_QUEUE_CAP];
+    size_t pos;
+    size_t len;
+};
+
+struct stream_frame {
+    uint16_t type;
+    uint16_t flags;
+    uint64_t req;
+    uint32_t len;
+    uint8_t payload[LMUX_HC2_MAX_PAYLOAD];
+};
+
+struct stream_client {
+    int fd;
+    uint64_t ref;
+    uint64_t next_req;
+    uint8_t tx[LMUX_HC2_TX_CAP];
+    size_t tx_pos;
+    size_t tx_len;
+    uint8_t rx[LMUX_HC2_RX_CAP];
+    size_t rx_len;
+    uint8_t stdin_pending[STREAM_STDIN_CHUNK];
+    size_t stdin_pending_len;
+    uint64_t stdin_req;
+    uint64_t stdin_req_ready_gen;
+    uint64_t close_req;
+    uint64_t release_req;
+    uint64_t ready_gen;
+    int stdin_blocked;
+    int stdin_open;
+    int stdin_eof;
+    int stdin_close_queued;
+    int stdin_closed_remote;
+    int done_seen;
+    int lost_seen;
+    int released;
+    int cleanup_requested;
+    int cleanup_signal_sent;
+    int cleanup_kill_sent;
+    long long cleanup_deadline;
+    int exit_code;
+    int term_signal;
+    int failure_rc;
+    int stdout_closed;
+    int stderr_closed;
+    struct stream_queue outq;
+    struct stream_queue errq;
+};
+
+static volatile sig_atomic_t stream_sigint_pending;
+static volatile sig_atomic_t stream_sigterm_pending;
+
+static void stream_signal_handler(int sig)
+{
+    if (sig == SIGINT)
+        stream_sigint_pending = 1;
+    else if (sig == SIGTERM)
+        stream_sigterm_pending = 1;
+}
+
+static int stream_set_nonblock(int fd, int *old_flags)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0)
+        return -1;
+    if (old_flags)
+        *old_flags = flags;
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
+        return -1;
+    return 0;
+}
+
+static void stream_restore_flags(int fd, int old_flags, int valid)
+{
+    if (valid)
+        (void)fcntl(fd, F_SETFL, old_flags);
+}
+
+static size_t stream_q_len(const struct stream_queue *q)
+{
+    return q->len - q->pos;
+}
+
+static size_t stream_q_space(struct stream_queue *q)
+{
+    if (q->pos && q->pos == q->len) {
+        q->pos = 0;
+        q->len = 0;
+    } else if (q->pos && q->len == sizeof(q->data)) {
+        memmove(q->data, q->data + q->pos, q->len - q->pos);
+        q->len -= q->pos;
+        q->pos = 0;
+    }
+    return sizeof(q->data) - q->len;
+}
+
+static int stream_q_append(struct stream_queue *q, const uint8_t *p, size_t n)
+{
+    if (stream_q_space(q) < n)
+        return -1;
+    memcpy(q->data + q->len, p, n);
+    q->len += n;
+    return 0;
+}
+
+static int stream_append_frame(uint8_t *out, size_t cap, size_t *off,
+                               uint16_t type, uint64_t req,
+                               const uint8_t *payload, uint32_t len)
+{
+    uint8_t *p;
+    if (len > LMUX_HC2_MAX_PAYLOAD || *off + LMUX_HC2_HEADER_LEN + len > cap)
+        return -1;
+    p = out + *off;
+    lmux_put_le32(p, LMUX_HC2_MAGIC);
+    lmux_put_le16(p + 4, LMUX_HC2_VERSION);
+    lmux_put_le16(p + 6, type);
+    lmux_put_le16(p + 8, 0);
+    lmux_put_le16(p + 10, 0);
+    lmux_put_le64(p + 12, req);
+    lmux_put_le32(p + 20, len);
+    if (len)
+        memcpy(p + LMUX_HC2_HEADER_LEN, payload, len);
+    *off += LMUX_HC2_HEADER_LEN + len;
+    return 0;
+}
+
+static int stream_queue_frame(struct stream_client *c, uint16_t type,
+                              uint64_t req, const uint8_t *payload,
+                              uint32_t len)
+{
+    size_t used, need = LMUX_HC2_HEADER_LEN + len;
+    if (len > LMUX_HC2_MAX_PAYLOAD || need > sizeof(c->tx))
+        return -1;
+    if (c->tx_pos) {
+        if (c->tx_pos < c->tx_len)
+            memmove(c->tx, c->tx + c->tx_pos, c->tx_len - c->tx_pos);
+        c->tx_len -= c->tx_pos;
+        c->tx_pos = 0;
+    }
+    used = c->tx_len - c->tx_pos;
+    if (sizeof(c->tx) - used < need)
+        return -1;
+    return stream_append_frame(c->tx, sizeof(c->tx), &c->tx_len,
+                               type, req, payload, len);
+}
+
+static int stream_flush_tx(struct stream_client *c)
+{
+    while (c->tx_pos < c->tx_len) {
+        ssize_t w = write(c->fd, c->tx + c->tx_pos, c->tx_len - c->tx_pos);
+        if (w > 0) {
+            c->tx_pos += (size_t)w;
+            continue;
+        }
+        if (w < 0 && errno == EINTR)
+            continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return 0;
+        return -1;
+    }
+    c->tx_pos = 0;
+    c->tx_len = 0;
+    return 0;
+}
+
+static int stream_read_frame_blocking(int fd, struct stream_frame *fr,
+                                      int timeout_ms)
+{
+    uint8_t hdr[LMUX_HC2_HEADER_LEN];
+    size_t got = 0;
+    uint32_t len;
+    long long end = (long long)time(NULL) * 1000 + timeout_ms;
+    while (got < sizeof(hdr)) {
+        struct pollfd pfd;
+        int rem = timeout_ms;
+        ssize_t r;
+        if (timeout_ms >= 0) {
+            long long now = (long long)time(NULL) * 1000;
+            rem = now >= end ? 0 : (int)(end - now);
+        }
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        if (poll(&pfd, 1, rem) <= 0)
+            return -1;
+        r = read(fd, hdr + got, sizeof(hdr) - got);
+        if (r > 0) {
+            got += (size_t)r;
+            continue;
+        }
+        if (r < 0 && errno == EINTR)
+            continue;
+        return -1;
+    }
+    if (lmux_get_le32(hdr) != LMUX_HC2_MAGIC ||
+        lmux_get_le16(hdr + 4) != LMUX_HC2_VERSION)
+        return -1;
+    len = lmux_get_le32(hdr + 20);
+    if (len > LMUX_HC2_MAX_PAYLOAD)
+        return -1;
+    fr->type = lmux_get_le16(hdr + 6);
+    fr->flags = lmux_get_le16(hdr + 8);
+    fr->req = lmux_get_le64(hdr + 12);
+    fr->len = len;
+    got = 0;
+    while (got < len) {
+        struct pollfd pfd;
+        int rem = timeout_ms;
+        ssize_t r;
+        if (timeout_ms >= 0) {
+            long long now = (long long)time(NULL) * 1000;
+            rem = now >= end ? 0 : (int)(end - now);
+        }
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        if (poll(&pfd, 1, rem) <= 0)
+            return -1;
+        r = read(fd, fr->payload + got, len - got);
+        if (r > 0) {
+            got += (size_t)r;
+            continue;
+        }
+        if (r < 0 && errno == EINTR)
+            continue;
+        return -1;
+    }
+    return 0;
+}
+
+static int stream_parse_one_frame(struct stream_client *c, struct stream_frame *fr)
+{
+    uint32_t len;
+    size_t n;
+    if (c->rx_len < LMUX_HC2_HEADER_LEN)
+        return 0;
+    if (lmux_get_le32(c->rx) != LMUX_HC2_MAGIC ||
+        lmux_get_le16(c->rx + 4) != LMUX_HC2_VERSION)
+        return -1;
+    len = lmux_get_le32(c->rx + 20);
+    if (len > LMUX_HC2_MAX_PAYLOAD)
+        return -1;
+    n = LMUX_HC2_HEADER_LEN + len;
+    if (c->rx_len < n)
+        return 0;
+    fr->type = lmux_get_le16(c->rx + 6);
+    fr->flags = lmux_get_le16(c->rx + 8);
+    fr->req = lmux_get_le64(c->rx + 12);
+    fr->len = len;
+    if (len)
+        memcpy(fr->payload, c->rx + LMUX_HC2_HEADER_LEN, len);
+    if (n < c->rx_len)
+        memmove(c->rx, c->rx + n, c->rx_len - n);
+    c->rx_len -= n;
+    return 1;
+}
+
+static int stream_read_hc2(struct stream_client *c)
+{
+    ssize_t r;
+    if (c->rx_len == sizeof(c->rx))
+        return -1;
+    do {
+        r = read(c->fd, c->rx + c->rx_len, sizeof(c->rx) - c->rx_len);
+    } while (r < 0 && errno == EINTR);
+    if (r > 0) {
+        c->rx_len += (size_t)r;
+        return 0;
+    }
+    if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        return 0;
+    return -1;
+}
+
+static uint32_t stream_error_code(const struct stream_frame *fr)
+{
+    if (fr->type != LMUX_HC2_ERROR || fr->len < 4)
+        return LMUX_HC2_E_PROTOCOL;
+    return lmux_get_le32(fr->payload);
+}
+
+static void stream_print_error_frame(const char *prefix, const struct stream_frame *fr)
+{
+    uint32_t code = stream_error_code(fr);
+    uint32_t n = fr->len >= 8 ? lmux_get_le32(fr->payload + 4) : 0;
+    fprintf(stderr, "%s: hc2 error %u", prefix, code);
+    if (n && n <= fr->len - 8)
+        fprintf(stderr, ": %.*s", (int)n, (const char *)fr->payload + 8);
+    fputc('\n', stderr);
+}
+
+static int stream_put_string(uint8_t *p, size_t cap, size_t *off,
+                             const char *s)
+{
+    size_t n = strlen(s);
+    if (n > UINT16_MAX || *off + 2 + n > cap)
+        return -1;
+    lmux_put_le16(p + *off, (uint16_t)n);
+    *off += 2;
+    memcpy(p + *off, s, n);
+    *off += n;
+    return 0;
+}
+
+static int stream_start_exec(struct stream_client *c, int argc, char **argv)
+{
+    uint8_t p[LMUX_HC2_MAX_PAYLOAD];
+    size_t off = 0, flen = 0;
+    uint16_t i;
+    struct stream_frame fr;
+    uint8_t frame[LMUX_HC2_HEADER_LEN + LMUX_HC2_MAX_PAYLOAD];
+
+    if (argc < 1 || argc > LMUX_HC2_MAX_ARGC || argv[0][0] != '/') {
+        fprintf(stderr, "lmux stream: PROGRAM must be an absolute path\n");
+        return -1;
+    }
+    if (stream_append_frame(frame, sizeof(frame), &flen,
+                            LMUX_HC2_CLIENT_HELLO, c->next_req++,
+                            NULL, 0) < 0 ||
+        full_write(c->fd, frame, flen) < 0 ||
+        stream_read_frame_blocking(c->fd, &fr, STREAM_START_TIMEOUT_MS) < 0 ||
+        fr.type != LMUX_HC2_SERVER_HELLO) {
+        fprintf(stderr, "lmux stream: structured control handshake failed\n");
+        return -1;
+    }
+    if (fr.len < 4 || !(lmux_get_le32(fr.payload) & LMUX_HC2_CAP_EXEC)) {
+        fprintf(stderr, "lmux stream: structured exec unsupported\n");
+        return -1;
+    }
+    if (stream_put_string(p, sizeof(p), &off, "") < 0 ||
+        off + 2 > sizeof(p))
+        return -1;
+    lmux_put_le16(p + off, (uint16_t)argc);
+    off += 2;
+    for (i = 0; i < (uint16_t)argc; i++)
+        if (stream_put_string(p, sizeof(p), &off, argv[i]) < 0) {
+            fprintf(stderr, "lmux stream: argv too large\n");
+            return -1;
+        }
+    flen = 0;
+    if (stream_append_frame(frame, sizeof(frame), &flen,
+                            LMUX_HC2_EXEC_START, c->next_req++,
+                            p, (uint32_t)off) < 0 ||
+        full_write(c->fd, frame, flen) < 0) {
+        fprintf(stderr, "lmux stream: start request failed\n");
+        return -1;
+    }
+    for (;;) {
+        if (stream_read_frame_blocking(c->fd, &fr, STREAM_START_TIMEOUT_MS) < 0) {
+            fprintf(stderr, "lmux stream: start timed out\n");
+            return -1;
+        }
+        if (fr.type == LMUX_HC2_ERROR) {
+            stream_print_error_frame("lmux stream: start failed", &fr);
+            return -1;
+        }
+        if (fr.type != LMUX_HC2_EXEC_STARTED || fr.len < 32)
+            continue;
+        c->ref = lmux_get_le64(fr.payload);
+        if (fr.payload[16] == V2_EXEC_STATUS_START_FAILED) {
+            fprintf(stderr, "lmux stream: target exec failed");
+            if (fr.payload[18] || fr.payload[19])
+                fprintf(stderr, ": errno=%u", lmux_get_le16(fr.payload + 18));
+            fputc('\n', stderr);
+            return -1;
+        }
+        return 0;
+    }
+}
+
+static int stream_queue_ref_frame(struct stream_client *c, uint16_t type,
+                                  uint64_t req)
+{
+    uint8_t p[8];
+    lmux_put_le64(p, c->ref);
+    return stream_queue_frame(c, type, req, p, sizeof(p));
+}
+
+static int stream_queue_signal(struct stream_client *c, uint8_t sig)
+{
+    uint8_t p[9];
+    lmux_put_le64(p, c->ref);
+    p[8] = sig;
+    return stream_queue_frame(c, LMUX_HC2_EXEC_SIGNAL, c->next_req++,
+                              p, sizeof(p));
+}
+
+static int stream_try_queue_stdin(struct stream_client *c)
+{
+    uint8_t p[8 + STREAM_STDIN_CHUNK];
+    uint64_t req;
+    if (!c->stdin_pending_len || c->stdin_req || c->stdin_blocked)
+        return 0;
+    lmux_put_le64(p, c->ref);
+    memcpy(p + 8, c->stdin_pending, c->stdin_pending_len);
+    req = c->next_req++;
+    if (stream_queue_frame(c, LMUX_HC2_EXEC_STDIN_DATA, req, p,
+                           (uint32_t)(8 + c->stdin_pending_len)) < 0)
+        return 0;
+    c->stdin_req = req;
+    c->stdin_req_ready_gen = c->ready_gen;
+    return 0;
+}
+
+static int stream_try_queue_close_stdin(struct stream_client *c)
+{
+    uint64_t req;
+    if (!c->stdin_eof || c->stdin_pending_len || c->stdin_req ||
+        c->stdin_close_queued || c->stdin_closed_remote)
+        return 0;
+    req = c->next_req++;
+    if (stream_queue_ref_frame(c, LMUX_HC2_EXEC_STDIN_CLOSE, req) < 0)
+        return 0;
+    c->close_req = req;
+    c->stdin_close_queued = 1;
+    return 0;
+}
+
+static int stream_queue_release(struct stream_client *c)
+{
+    uint64_t req;
+    if (c->release_req || c->released || !c->ref)
+        return 0;
+    req = c->next_req++;
+    if (stream_queue_ref_frame(c, LMUX_HC2_EXEC_RELEASE, req) < 0)
+        return 0;
+    c->release_req = req;
+    return 0;
+}
+
+static void stream_handle_state(struct stream_client *c,
+                                const struct stream_frame *fr)
+{
+    uint32_t flags;
+    uint8_t state;
+    if (fr->len < 32 || lmux_get_le64(fr->payload) != c->ref)
+        return;
+    state = fr->payload[16];
+    c->exit_code = (int)lmux_get_le32(fr->payload + 20);
+    c->term_signal = (int)lmux_get_le32(fr->payload + 24);
+    flags = lmux_get_le32(fr->payload + 28);
+    if (flags & 1u)
+        c->stdin_closed_remote = 1;
+    if (state == V2_EXEC_STATUS_DONE || state == V2_EXEC_STATUS_START_FAILED)
+        c->done_seen = 1;
+}
+
+static int stream_handle_frame(struct stream_client *c,
+                               const struct stream_frame *fr)
+{
+    uint32_t code;
+    if (fr->type == LMUX_HC2_EXEC_STDOUT && fr->len >= 8 &&
+        lmux_get_le64(fr->payload) == c->ref) {
+        if (c->stdout_closed)
+            return 0;
+        return stream_q_append(&c->outq, fr->payload + 8, fr->len - 8);
+    }
+    if (fr->type == LMUX_HC2_EXEC_STDERR && fr->len >= 8 &&
+        lmux_get_le64(fr->payload) == c->ref) {
+        if (c->stderr_closed)
+            return 0;
+        return stream_q_append(&c->errq, fr->payload + 8, fr->len - 8);
+    }
+    if (fr->type == LMUX_HC2_EXEC_STDIN_READY && fr->len >= 8 &&
+        lmux_get_le64(fr->payload) == c->ref) {
+        c->ready_gen++;
+        if (c->stdin_blocked && c->ready_gen != c->stdin_req_ready_gen)
+            c->stdin_blocked = 0;
+        return 0;
+    }
+    if (fr->type == LMUX_HC2_EXEC_STATE) {
+        if (fr->req == c->release_req && c->release_req) {
+            c->released = 1;
+            c->release_req = 0;
+        } else {
+            stream_handle_state(c, fr);
+        }
+        return 0;
+    }
+    if (fr->type == LMUX_HC2_EXEC_LOST && fr->len >= 12 &&
+        lmux_get_le64(fr->payload) == c->ref) {
+        fprintf(stderr, "lmux stream: target execution lost\n");
+        c->lost_seen = 1;
+        c->failure_rc = 1;
+        c->done_seen = 1;
+        return 0;
+    }
+    if (fr->type != LMUX_HC2_ERROR)
+        return 0;
+    code = stream_error_code(fr);
+    if (fr->req == c->stdin_req && c->stdin_req) {
+        if (code == LMUX_HC2_OK) {
+            c->stdin_req = 0;
+            c->stdin_pending_len = 0;
+            c->stdin_blocked = 0;
+            return 0;
+        }
+        if (code == LMUX_HC2_E_BUSY) {
+            c->stdin_req = 0;
+            if (c->ready_gen != c->stdin_req_ready_gen)
+                c->stdin_blocked = 0;
+            else
+                c->stdin_blocked = 1;
+            return 0;
+        }
+        stream_print_error_frame("lmux stream: stdin failed", fr);
+        c->failure_rc = 1;
+        c->cleanup_requested = 1;
+        return 0;
+    }
+    if (fr->req == c->close_req && c->close_req) {
+        if (code != LMUX_HC2_OK && code != LMUX_HC2_E_NOT_FOUND)
+            stream_print_error_frame("lmux stream: stdin close failed", fr);
+        c->close_req = 0;
+        return 0;
+    }
+    if (fr->req == c->release_req && c->release_req) {
+        c->released = 1;
+        c->release_req = 0;
+        return 0;
+    }
+    if (code != LMUX_HC2_OK)
+        stream_print_error_frame("lmux stream", fr);
+    return 0;
+}
+
+static int stream_write_queue(int fd, struct stream_queue *q)
+{
+    while (stream_q_len(q)) {
+        ssize_t w = write(fd, q->data + q->pos, q->len - q->pos);
+        if (w > 0) {
+            q->pos += (size_t)w;
+            if (q->pos == q->len)
+                q->pos = q->len = 0;
+            continue;
+        }
+        if (w < 0 && errno == EINTR)
+            continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return 0;
+        if (w < 0 && errno == EPIPE)
+            return 1;
+        return -1;
+    }
+    return 0;
+}
+
+static int stream_loop(struct stream_client *c)
+{
+    int stdin_flags = 0, stdout_flags = 0, stderr_flags = 0;
+    int stdin_flags_valid = 0, stdout_flags_valid = 0, stderr_flags_valid = 0;
+    c->stdin_open = 1;
+    c->next_req = c->next_req ? c->next_req : 10;
+    if (stream_set_nonblock(c->fd, NULL) < 0)
+        return 1;
+    stdin_flags_valid = stream_set_nonblock(STDIN_FILENO, &stdin_flags) == 0;
+    stdout_flags_valid = stream_set_nonblock(STDOUT_FILENO, &stdout_flags) == 0;
+    stderr_flags_valid = stream_set_nonblock(STDERR_FILENO, &stderr_flags) == 0;
+
+    for (;;) {
+        struct pollfd pfds[4];
+        int nfds = 0, hc2_idx = -1, in_idx = -1, out_idx = -1, err_idx = -1;
+        int timeout = -1;
+        int can_read_hc2 =
+            (c->stdout_closed || stream_q_space(&c->outq) >= STREAM_STDIN_CHUNK) &&
+            (c->stderr_closed || stream_q_space(&c->errq) >= STREAM_STDIN_CHUNK);
+        int rr, i;
+
+        if (stream_sigint_pending) {
+            stream_sigint_pending = 0;
+            c->cleanup_requested = 1;
+            if (!c->cleanup_signal_sent) {
+                (void)stream_queue_signal(c, LMUX_HC2_SIG_INT);
+                c->cleanup_signal_sent = 1;
+                c->cleanup_deadline = (long long)time(NULL) * 1000 +
+                    STREAM_CLEANUP_TIMEOUT_MS;
+            }
+        }
+        if (stream_sigterm_pending) {
+            stream_sigterm_pending = 0;
+            c->cleanup_requested = 1;
+            if (!c->cleanup_signal_sent) {
+                (void)stream_queue_signal(c, LMUX_HC2_SIG_TERM);
+                c->cleanup_signal_sent = 1;
+                c->cleanup_deadline = (long long)time(NULL) * 1000 +
+                    STREAM_CLEANUP_TIMEOUT_MS;
+            }
+        }
+        if (c->cleanup_requested && c->cleanup_signal_sent &&
+            !c->done_seen && !c->cleanup_kill_sent &&
+            (long long)time(NULL) * 1000 >= c->cleanup_deadline) {
+            (void)stream_queue_signal(c, LMUX_HC2_SIG_KILL);
+            c->cleanup_kill_sent = 1;
+            c->cleanup_deadline = (long long)time(NULL) * 1000 +
+                STREAM_CLEANUP_TIMEOUT_MS;
+        }
+
+        (void)stream_try_queue_stdin(c);
+        (void)stream_try_queue_close_stdin(c);
+        if (c->done_seen && !stream_q_len(&c->outq) && !stream_q_len(&c->errq))
+            (void)stream_queue_release(c);
+        if (c->released)
+            break;
+        if (c->cleanup_requested && c->cleanup_kill_sent && !c->done_seen &&
+            (long long)time(NULL) * 1000 >= c->cleanup_deadline) {
+            c->failure_rc = 1;
+            break;
+        }
+
+        hc2_idx = nfds;
+        pfds[nfds].fd = c->fd;
+        pfds[nfds].events = (c->tx_pos < c->tx_len ? POLLOUT : 0) |
+            (can_read_hc2 ? POLLIN : 0);
+        pfds[nfds].revents = 0;
+        nfds++;
+        if (c->stdin_open && !c->stdin_eof && !c->cleanup_requested &&
+            !c->stdin_pending_len && !c->stdin_req && !c->stdin_blocked &&
+            !c->stdin_closed_remote) {
+            in_idx = nfds;
+            pfds[nfds].fd = STDIN_FILENO;
+            pfds[nfds].events = POLLIN;
+            pfds[nfds].revents = 0;
+            nfds++;
+        }
+        if (!c->stdout_closed && stream_q_len(&c->outq)) {
+            out_idx = nfds;
+            pfds[nfds].fd = STDOUT_FILENO;
+            pfds[nfds].events = POLLOUT;
+            pfds[nfds].revents = 0;
+            nfds++;
+        }
+        if (!c->stderr_closed && stream_q_len(&c->errq)) {
+            err_idx = nfds;
+            pfds[nfds].fd = STDERR_FILENO;
+            pfds[nfds].events = POLLOUT;
+            pfds[nfds].revents = 0;
+            nfds++;
+        }
+        if (c->cleanup_requested && c->cleanup_signal_sent && !c->done_seen) {
+            long long now = (long long)time(NULL) * 1000;
+            timeout = c->cleanup_deadline > now ? (int)(c->cleanup_deadline - now) : 0;
+        }
+        rr = poll(pfds, nfds, timeout);
+        if (rr < 0 && errno == EINTR)
+            continue;
+        if (rr < 0) {
+            perror("lmux stream: poll");
+            c->failure_rc = 1;
+            break;
+        }
+        for (i = 0; i < nfds; i++) {
+            if (!pfds[i].revents)
+                continue;
+            if (i == hc2_idx) {
+                if ((pfds[i].revents & POLLOUT) && stream_flush_tx(c) < 0) {
+                    fprintf(stderr, "lmux stream: structured control write failed\n");
+                    c->failure_rc = 1;
+                    c->done_seen = 1;
+                }
+                if ((pfds[i].revents & POLLIN) && stream_read_hc2(c) < 0) {
+                    fprintf(stderr, "lmux stream: structured control closed\n");
+                    c->failure_rc = 1;
+                    c->done_seen = 1;
+                }
+                if (pfds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                    c->failure_rc = 1;
+                    c->done_seen = 1;
+                }
+            } else if (i == in_idx) {
+                uint8_t buf[STREAM_STDIN_CHUNK];
+                ssize_t r = read(STDIN_FILENO, buf, sizeof(buf));
+                if (r > 0) {
+                    memcpy(c->stdin_pending, buf, (size_t)r);
+                    c->stdin_pending_len = (size_t)r;
+                } else if (r == 0 || (r < 0 && errno != EINTR &&
+                           errno != EAGAIN && errno != EWOULDBLOCK)) {
+                    c->stdin_eof = 1;
+                    c->stdin_open = 0;
+                }
+            } else if (i == out_idx) {
+                int wr = stream_write_queue(STDOUT_FILENO, &c->outq);
+                if (wr) {
+                    c->cleanup_requested = 1;
+                    c->failure_rc = 1;
+                    c->stdout_closed = 1;
+                    c->outq.pos = c->outq.len = 0;
+                    if (!c->cleanup_signal_sent) {
+                        (void)stream_queue_signal(c, LMUX_HC2_SIG_TERM);
+                        c->cleanup_signal_sent = 1;
+                        c->cleanup_deadline = (long long)time(NULL) * 1000 +
+                            STREAM_CLEANUP_TIMEOUT_MS;
+                    }
+                }
+            } else if (i == err_idx) {
+                int wr = stream_write_queue(STDERR_FILENO, &c->errq);
+                if (wr) {
+                    c->cleanup_requested = 1;
+                    c->failure_rc = 1;
+                    c->stderr_closed = 1;
+                    c->errq.pos = c->errq.len = 0;
+                    if (!c->cleanup_signal_sent) {
+                        (void)stream_queue_signal(c, LMUX_HC2_SIG_TERM);
+                        c->cleanup_signal_sent = 1;
+                        c->cleanup_deadline = (long long)time(NULL) * 1000 +
+                            STREAM_CLEANUP_TIMEOUT_MS;
+                    }
+                }
+            }
+        }
+        for (;;) {
+            struct stream_frame fr;
+            int pr = stream_parse_one_frame(c, &fr);
+            if (pr < 0) {
+                fprintf(stderr, "lmux stream: bad structured frame\n");
+                c->failure_rc = 1;
+                c->done_seen = 1;
+                break;
+            }
+            if (!pr)
+                break;
+            if (stream_handle_frame(c, &fr) < 0) {
+                fprintf(stderr, "lmux stream: local output queue full\n");
+                c->failure_rc = 1;
+                c->cleanup_requested = 1;
+                break;
+            }
+        }
+    }
+
+    stream_restore_flags(STDIN_FILENO, stdin_flags, stdin_flags_valid);
+    stream_restore_flags(STDOUT_FILENO, stdout_flags, stdout_flags_valid);
+    stream_restore_flags(STDERR_FILENO, stderr_flags, stderr_flags_valid);
+    if (c->failure_rc)
+        return c->failure_rc;
+    if (c->lost_seen)
+        return 1;
+    if (c->term_signal)
+        return 128 + (c->term_signal & 127);
+    return c->exit_code & 255;
+}
+
+static int cmd_stream(int argc, char **argv)
+{
+    const char *control = LMUX_DEFAULT_STRUCTURED_SOCKET;
+    struct stream_client *c;
+    struct sigaction old_int, old_term, sa;
+    int rc;
+    while (argc > 0) {
+        if (strcmp(argv[0], "--control") == 0 && argc >= 2) {
+            control = argv[1];
+            argv += 2;
+            argc -= 2;
+        } else if (strcmp(argv[0], "--") == 0) {
+            argv++;
+            argc--;
+            break;
+        } else {
+            usage(stderr);
+            return 1;
+        }
+    }
+    if (argc < 1) {
+        usage(stderr);
+        return 1;
+    }
+    c = calloc(1, sizeof(*c));
+    if (!c) {
+        perror("calloc");
+        return 1;
+    }
+    c->fd = connect_unix(control);
+    if (c->fd < 0) {
+        free(c);
+        return 1;
+    }
+    c->next_req = 1;
+    if (stream_start_exec(c, argc, argv) < 0) {
+        close(c->fd);
+        free(c);
+        return 1;
+    }
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = stream_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, &old_int);
+    sigaction(SIGTERM, &sa, &old_term);
+    rc = stream_loop(c);
+    sigaction(SIGINT, &old_int, NULL);
+    sigaction(SIGTERM, &old_term, NULL);
+    close(c->fd);
+    free(c);
+    return rc;
+}
+
 static int cmd_status(int argc, char **argv)
 {
     const char *control = LMUX_DEFAULT_CONTROL_SOCKET;
@@ -1871,6 +2678,8 @@ int main(int argc, char **argv)
     }
     if (strcmp(argv[1], "exec") == 0)
         return cmd_exec(argc - 2, argv + 2);
+    if (strcmp(argv[1], "stream") == 0)
+        return cmd_stream(argc - 2, argv + 2);
     if (strcmp(argv[1], "put") == 0)
         return cmd_put(argc - 2, argv + 2);
     if (strcmp(argv[1], "get") == 0)
