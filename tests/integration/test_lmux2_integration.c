@@ -87,6 +87,12 @@ static int fd_has_hup(int fd, int timeout_ms)
     return (re & (POLLHUP | POLLERR | POLLNVAL)) != 0;
 }
 
+static int expect_no_readable(int fd, int timeout_ms)
+{
+    int re = wait_fd_event(fd, POLLIN | POLLHUP | POLLERR | POLLNVAL, timeout_ms);
+    return re == 0 ? 0 : -1;
+}
+
 static int write_all_timeout(int fd, const uint8_t *buf, size_t len, int timeout_ms)
 {
     size_t off = 0;
@@ -458,6 +464,78 @@ static int abandon_once(const char *path)
     return 0;
 }
 
+static int abandon_host_with_early_data(const char *host_sock, const char *target_sock)
+{
+    static const uint8_t stale[] = { 'O', 'L', 'D', 0x00, 0xff, 0x03 };
+    static const uint8_t fresh[] = { 'N', 'E', 'W', 0x00, 0x7f, 0xff };
+    uint8_t got[sizeof(fresh)];
+    int h = -1, h2 = -1, t = -1;
+    int rc = -1;
+
+    h = connect_unix_test(host_sock);
+    if (h < 0 || fd_has_hup(h, 200) ||
+        write_all_timeout(h, stale, sizeof(stale), 1000) < 0)
+        goto out;
+    close(h);
+    h = -1;
+    usleep(100000);
+
+    t = connect_unix_test(target_sock);
+    if (t < 0 || fd_has_hup(t, 200) || expect_no_readable(t, 200) < 0)
+        goto out;
+
+    h2 = connect_unix_test(host_sock);
+    if (h2 < 0 || write_all_timeout(h2, fresh, sizeof(fresh), 1000) < 0 ||
+        read_exact_timeout(t, got, sizeof(fresh), 3000) < 0 ||
+        memcmp(got, fresh, sizeof(fresh)) != 0)
+        goto out;
+    if (exchange_pair(h2, t, (const uint8_t *)"HF", 2,
+                      (const uint8_t *)"TH", 2) < 0)
+        goto out;
+    rc = 0;
+out:
+    if (h >= 0) close(h);
+    if (h2 >= 0) close(h2);
+    if (t >= 0) close(t);
+    return rc;
+}
+
+static int abandon_target_with_early_data(const char *host_sock, const char *target_sock)
+{
+    static const uint8_t stale[] = { 'o', 'l', 'd', 0x00, 0xff, 0x03 };
+    static const uint8_t fresh[] = { 'n', 'e', 'w', 0x00, 0x7f, 0xff };
+    uint8_t got[sizeof(fresh)];
+    int t = -1, t2 = -1, h = -1;
+    int rc = -1;
+
+    t = connect_unix_test(target_sock);
+    if (t < 0 || fd_has_hup(t, 200) ||
+        write_all_timeout(t, stale, sizeof(stale), 1000) < 0)
+        goto out;
+    close(t);
+    t = -1;
+    usleep(100000);
+
+    h = connect_unix_test(host_sock);
+    if (h < 0 || fd_has_hup(h, 200) || expect_no_readable(h, 200) < 0)
+        goto out;
+
+    t2 = connect_unix_test(target_sock);
+    if (t2 < 0 || write_all_timeout(t2, fresh, sizeof(fresh), 1000) < 0 ||
+        read_exact_timeout(h, got, sizeof(fresh), 3000) < 0 ||
+        memcmp(got, fresh, sizeof(fresh)) != 0)
+        goto out;
+    if (exchange_pair(h, t2, (const uint8_t *)"HT", 2,
+                      (const uint8_t *)"TF", 2) < 0)
+        goto out;
+    rc = 0;
+out:
+    if (t >= 0) close(t);
+    if (t2 >= 0) close(t2);
+    if (h >= 0) close(h);
+    return rc;
+}
+
 static int integration_test(void)
 {
     char dir[] = "/tmp/lmux2-it-XXXXXX";
@@ -526,6 +604,9 @@ static int integration_test(void)
     where = "next after abandoned host pending";
     if (do_host_first(host_sock, target_sock, early_h, sizeof(early_h)) < 0)
         goto out;
+    where = "abandoned host early data";
+    if (abandon_host_with_early_data(host_sock, target_sock) < 0)
+        goto out;
 
     where = "abandoned target pending";
     for (i = 0; i < 10; i++)
@@ -534,17 +615,30 @@ static int integration_test(void)
     where = "next after abandoned target pending";
     if (do_target_first(host_sock, target_sock, early_t, sizeof(early_t)) < 0)
         goto out;
+    where = "abandoned target early data";
+    if (abandon_target_with_early_data(host_sock, target_sock) < 0)
+        goto out;
 
-    where = "100 repeated sessions";
+    where = "rotating repeated sessions";
     for (i = 0; i < 100; i++) {
-        if ((i & 1) == 0) {
+        if ((i % 4) == 0) {
             if (do_host_first(host_sock, target_sock, early_h, sizeof(early_h)) < 0) {
                 fprintf(stderr, "repeated host-first iteration %d failed\n", i);
                 goto out;
             }
-        } else {
+        } else if ((i % 4) == 1) {
             if (do_target_first(host_sock, target_sock, early_t, sizeof(early_t)) < 0) {
                 fprintf(stderr, "repeated target-first iteration %d failed\n", i);
+                goto out;
+            }
+        } else if ((i % 4) == 2) {
+            if (abandon_host_with_early_data(host_sock, target_sock) < 0) {
+                fprintf(stderr, "repeated host abandon iteration %d failed\n", i);
+                goto out;
+            }
+        } else {
+            if (abandon_target_with_early_data(host_sock, target_sock) < 0) {
+                fprintf(stderr, "repeated target abandon iteration %d failed\n", i);
                 goto out;
             }
         }

@@ -201,6 +201,74 @@ static int shell_cmd_expect(int fd, const char *cmd, const char *needle,
            read_until(fd, needle, out, cap, 7000) < 0 ? -1 : 0;
 }
 
+static int read_exact_timeout(int fd, uint8_t *buf, size_t len, int timeout_ms)
+{
+    size_t off = 0;
+    long long end = now_ms() + timeout_ms;
+    while (off < len && now_ms() < end) {
+        int re = wait_fd_event(fd, POLLIN | POLLHUP | POLLERR | POLLNVAL, 100);
+        if (re & POLLIN) {
+            ssize_t r = read(fd, buf + off, len - off);
+            if (r > 0) {
+                off += (size_t)r;
+                continue;
+            }
+            if (r == 0)
+                return -1;
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (re & (POLLHUP | POLLERR | POLLNVAL))
+            return -1;
+    }
+    return off == len ? 0 : -1;
+}
+
+static int supervisor_unix_exchange(const char *host_sock, const char *target_sock,
+                                    int target_first, uint8_t tag)
+{
+    uint8_t h_msg[] = { 'H', tag, 0x00, 0xff, 0x03, 0x7f };
+    uint8_t t_msg[] = { 'T', tag, 0xff, 0x00, 0x7f, 0x03 };
+    uint8_t got[sizeof(h_msg)];
+    int h = -1, t = -1;
+    int rc = -1;
+
+    if (target_first) {
+        t = connect_unix_test(target_sock);
+        if (t < 0 || write_all(t, t_msg, sizeof(t_msg)) < 0)
+            goto out;
+        h = connect_unix_test(host_sock);
+        if (h < 0 ||
+            read_exact_timeout(h, got, sizeof(t_msg), 5000) < 0 ||
+            memcmp(got, t_msg, sizeof(t_msg)) != 0)
+            goto out;
+    } else {
+        h = connect_unix_test(host_sock);
+        if (h < 0 || write_all(h, h_msg, sizeof(h_msg)) < 0)
+            goto out;
+        t = connect_unix_test(target_sock);
+        if (t < 0 ||
+            read_exact_timeout(t, got, sizeof(h_msg), 5000) < 0 ||
+            memcmp(got, h_msg, sizeof(h_msg)) != 0)
+            goto out;
+    }
+    if (write_all(h, h_msg, sizeof(h_msg)) < 0 ||
+        read_exact_timeout(t, got, sizeof(h_msg), 5000) < 0 ||
+        memcmp(got, h_msg, sizeof(h_msg)) != 0 ||
+        write_all(t, t_msg, sizeof(t_msg)) < 0 ||
+        read_exact_timeout(h, got, sizeof(t_msg), 5000) < 0 ||
+        memcmp(got, t_msg, sizeof(t_msg)) != 0)
+        goto out;
+    rc = 0;
+out:
+    if (h >= 0)
+        close(h);
+    if (t >= 0)
+        close(t);
+    return rc;
+}
+
 static int read_status(const char *control, char *out, size_t cap)
 {
     int fd = connect_unix_test(control);
@@ -1688,6 +1756,41 @@ static pid_t spawn_host_structured(const char *carrier, const char *control,
                   "--carrier-connect", carrier, "--control", control,
                   "--structured-control", structured,
                   "--pty", pty1, "--file", file1, (char *)NULL);
+        }
+        _exit(127);
+    }
+    return pid;
+}
+
+static pid_t spawn_host_structured_unix(const char *carrier, const char *control,
+                                        const char *structured,
+                                        const char *pty1, const char *file1,
+                                        const char *unix1)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (getenv("LMUX_SUP_IT_OUTER")) {
+            if (getenv("LMUX2_IT_VERBOSE"))
+                execl("build/host/lmuxd", "lmuxd", "--role", "host",
+                      "--outer", "--carrier-connect", carrier, "--control", control,
+                      "--structured-control", structured,
+                      "--pty", pty1, "--file", file1, "--unix", unix1,
+                      "--verbose", (char *)NULL);
+            execl("build/host/lmuxd", "lmuxd", "--role", "host",
+                  "--outer", "--carrier-connect", carrier, "--control", control,
+                  "--structured-control", structured,
+                  "--pty", pty1, "--file", file1, "--unix", unix1, (char *)NULL);
+        } else {
+            if (getenv("LMUX2_IT_VERBOSE"))
+                execl("build/host/lmuxd", "lmuxd", "--role", "host",
+                      "--carrier-connect", carrier, "--control", control,
+                      "--structured-control", structured,
+                      "--pty", pty1, "--file", file1, "--unix", unix1,
+                      "--verbose", (char *)NULL);
+            execl("build/host/lmuxd", "lmuxd", "--role", "host",
+                  "--carrier-connect", carrier, "--control", control,
+                  "--structured-control", structured,
+                  "--pty", pty1, "--file", file1, "--unix", unix1, (char *)NULL);
         }
         _exit(127);
     }
@@ -8460,6 +8563,237 @@ out:
     return rc;
 }
 
+static int mixed_service_soak_test(void)
+{
+    char dir[] = "/tmp/lmux-mixed-soak-XXXXXX";
+    char carrier[160], control[160], structured[160], console[160], file_sock[160];
+    char unix_host[160], unix_target[160], pty_arg[320], file_arg[240], unix_arg[400];
+    char src[160], target_path[160], got_path[160], out[32768];
+    pid_t sup = -1, host = -1, worker = -1, worker2 = -1;
+    int fd = -1, console_fd = -1, uh = -1, ut = -1, rc = 1;
+    int host_fd_base = -1, host_fd_end = -1;
+    long shell_pid = -1, shell_pid_after = -1;
+    unsigned long long crc0 = 0, seq0 = 0, proto0 = 0, stream0 = 0, stale0 = 0, drops0 = 0;
+    unsigned long long crc1 = 0, seq1 = 0, proto1 = 0, stream1 = 0, stale1 = 0, drops1 = 0;
+    int i = -1;
+    const char *where = "setup";
+
+    if (!mkdtemp(dir))
+        return fail("mkdtemp mixed soak");
+    snprintf(carrier, sizeof(carrier), "%s/carrier.sock", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(structured, sizeof(structured), "%s/control-v2.sock", dir);
+    snprintf(console, sizeof(console), "%s/console.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(unix_host, sizeof(unix_host), "%s/rdv-host.sock", dir);
+    snprintf(unix_target, sizeof(unix_target), "%s/rdv-target.sock", dir);
+    snprintf(src, sizeof(src), "%s/src.bin", dir);
+    snprintf(target_path, sizeof(target_path), "%s/target.bin", dir);
+    snprintf(got_path, sizeof(got_path), "%s/got.bin", dir);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+    snprintf(unix_arg, sizeof(unix_arg), "rdv:%s:%s", unix_host, unix_target);
+
+    if (make_file(src, 4096) < 0)
+        goto out;
+    sup = spawn_supervisor_with_storage(carrier, NULL);
+    if (sup <= 0)
+        goto out;
+    worker = wait_child_pid(sup, -1, 10000);
+    if (worker <= 0)
+        goto out;
+    host = spawn_host_structured_unix(carrier, control, structured,
+                                      pty_arg, file_arg, unix_arg);
+    if (host <= 0)
+        goto out;
+    where = "initial ready";
+    if (wait_ready_layers(control, 1, 15000, out, sizeof(out)) < 0 ||
+        wait_exec_service_ready(control, 15000, out, sizeof(out)) < 0 ||
+        wait_path_exists(unix_host, 5000) < 0 ||
+        wait_path_exists(unix_target, 5000) < 0) {
+        dump_excerpt("mixed initial status", out);
+        goto out;
+    }
+    host_fd_base = count_fds(host);
+    if (read_status(control, out, sizeof(out)) < 0)
+        goto out;
+    crc0 = status_value(out, "crc_errors=");
+    seq0 = status_value(out, "seq_errors=");
+    proto0 = status_value(out, "protocol_errors=");
+    stream0 = status_value(out, "stream_errors=");
+    stale0 = status_value(out, "stale=");
+    drops0 = status_value(out, "pre_established_drops=");
+
+    fd = hc2_connect_hello_retry(structured, 5000);
+    console_fd = wait_connect(console, 10000);
+    if (fd < 0 || console_fd < 0)
+        goto out;
+    usleep(500000);
+    if (shell_cmd_expect(console_fd, "printf '%s%s:%s\\n' M PID \"$$\"",
+                         "MPID:", out, sizeof(out)) < 0)
+        goto out;
+    shell_pid = parse_pid_marker(out, "MPID:");
+    if (shell_pid <= 0)
+        goto out;
+    close(console_fd);
+    console_fd = -1;
+
+    for (i = 0; i < 12; i++) {
+        char marker[64];
+        snprintf(marker, sizeof(marker), "MIX_PRE_%02d", i);
+        where = "cycle pre operations";
+        if (hc2_run_echo(fd, 10000 + (uint64_t)i, marker) < 0 ||
+            supervisor_unix_exchange(unix_host, unix_target, i & 1, (uint8_t)i) < 0 ||
+            run_lmux_file("put", file_sock, src, target_path) < 0 ||
+            run_lmux_file("get", file_sock, target_path, got_path) < 0 ||
+            files_equal(src, got_path) < 0)
+            goto out;
+
+        where = "cycle live rendezvous";
+        uh = connect_unix_test(unix_host);
+        ut = connect_unix_test(unix_target);
+        if (uh < 0 || ut < 0 ||
+            write_all(uh, "LIVE", 4) < 0 ||
+            read_exact_timeout(ut, (uint8_t *)out, 4, 5000) < 0 ||
+            memcmp(out, "LIVE", 4) != 0)
+            goto out;
+
+        close(fd);
+        fd = -1;
+        if ((i % 3) == 0) {
+            where = "cycle carrier reconnect";
+            stop_pid(host);
+            host = -1;
+            if (wait_child_pid(sup, -1, 1000) != worker)
+                goto out;
+            host = spawn_host_structured_unix(carrier, control, structured,
+                                              pty_arg, file_arg, unix_arg);
+            if (host <= 0)
+                goto out;
+            host_fd_base = -1;
+        } else if ((i % 3) == 1) {
+            where = "cycle worker replacement";
+            kill(worker, SIGKILL);
+            worker2 = wait_child_pid(sup, worker, 15000);
+            if (worker2 <= 0 || worker2 == worker ||
+                wait_pid_gone(worker, 3000) < 0 ||
+                wait_pid_gone((pid_t)shell_pid, 3000) < 0)
+                goto out;
+            worker = worker2;
+            worker2 = -1;
+            shell_pid = -1;
+        } else {
+            where = "cycle outer peer restart";
+            stop_pid(sup);
+            sup = -1;
+            worker = -1;
+            if (shell_pid > 0 && wait_pid_gone((pid_t)shell_pid, 3000) < 0)
+                goto out;
+            shell_pid = -1;
+            sup = spawn_supervisor_with_storage(carrier, NULL);
+            if (sup <= 0)
+                goto out;
+            worker = wait_child_pid(sup, -1, 15000);
+            if (worker <= 0)
+                goto out;
+        }
+        close(uh); uh = -1;
+        close(ut); ut = -1;
+
+        where = "cycle reconcile";
+        if (wait_ready_layers(control, 1, 20000, out, sizeof(out)) < 0 ||
+            wait_exec_service_ready(control, 15000, out, sizeof(out)) < 0 ||
+            wait_path_exists(unix_host, 5000) < 0 ||
+            wait_path_exists(unix_target, 5000) < 0) {
+            dump_excerpt("mixed reconcile status", out);
+            goto out;
+        }
+        if (host_fd_base < 0)
+            host_fd_base = count_fds(host);
+        fd = hc2_connect_hello_retry(structured, 5000);
+        console_fd = wait_connect(console, 10000);
+        if (fd < 0 || console_fd < 0)
+            goto out;
+        usleep(500000);
+        if (shell_cmd_expect(console_fd, "printf '%s%s:%s\\n' M PID2 \"$$\"",
+                             "MPID2:", out, sizeof(out)) < 0)
+            goto out;
+        shell_pid_after = parse_pid_marker(out, "MPID2:");
+        if ((i % 3) == 0) {
+            if (shell_pid_after != shell_pid)
+                goto out;
+        } else {
+            if (shell_pid_after <= 0 || shell_pid_after == shell_pid)
+                goto out;
+            shell_pid = shell_pid_after;
+        }
+        close(console_fd);
+        console_fd = -1;
+
+        snprintf(marker, sizeof(marker), "MIX_POST_%02d", i);
+        where = "cycle post operations";
+        if (hc2_run_echo(fd, 11000 + (uint64_t)i, marker) < 0 ||
+            supervisor_unix_exchange(unix_host, unix_target, (i + 1) & 1,
+                                     (uint8_t)(i + 32)) < 0 ||
+            run_lmux_file("put", file_sock, src, target_path) < 0 ||
+            run_lmux_file("get", file_sock, target_path, got_path) < 0 ||
+            files_equal(src, got_path) < 0)
+            goto out;
+        if (read_status(control, out, sizeof(out)) == 0 &&
+            strstr(out, "pending_fd=yes")) {
+            dump_excerpt("mixed pending status", out);
+            goto out;
+        }
+    }
+
+    where = "counter sanity";
+    if (read_status(control, out, sizeof(out)) < 0)
+        goto out;
+    crc1 = status_value(out, "crc_errors=");
+    seq1 = status_value(out, "seq_errors=");
+    proto1 = status_value(out, "protocol_errors=");
+    stream1 = status_value(out, "stream_errors=");
+    stale1 = status_value(out, "stale=");
+    drops1 = status_value(out, "pre_established_drops=");
+    if (crc1 != crc0 || seq1 != seq0 || proto1 != proto0 ||
+        stream1 != stream0 || stale1 > stale0 + 12 || drops1 != drops0) {
+        dump_excerpt("mixed counter status", out);
+        goto out;
+    }
+    where = "fd leak check";
+    if (host > 0 && host_fd_base >= 0) {
+        host_fd_end = wait_fd_count(host, host_fd_base, 5000);
+        if (host_fd_end < 0 || host_fd_end > host_fd_base + 2) {
+            fprintf(stderr, "mixed soak host fds base=%d end=%d\n",
+                    host_fd_base, host_fd_end);
+            goto out;
+        }
+    }
+    rc = 0;
+out:
+    if (rc)
+        fprintf(stderr,
+                "mixed_service_soak where=%s cycle=%d shell=%ld after=%ld worker=%ld counters=%llu/%llu %llu/%llu %llu/%llu %llu/%llu %llu/%llu %llu/%llu\n",
+                where, i, shell_pid, shell_pid_after, (long)worker,
+                crc0, crc1, seq0, seq1, proto0, proto1, stream0, stream1,
+                stale0, stale1, drops0, drops1);
+    if (fd >= 0)
+        close(fd);
+    if (console_fd >= 0)
+        close(console_fd);
+    if (uh >= 0)
+        close(uh);
+    if (ut >= 0)
+        close(ut);
+    stop_pid(host);
+    stop_pid(sup);
+    unlink(carrier); unlink(control); unlink(structured);
+    unlink(console); unlink(file_sock); unlink(unix_host); unlink(unix_target);
+    unlink(src); unlink(target_path); unlink(got_path);
+    rmdir(dir);
+    return rc;
+}
+
 static int structured_exec_lifecycle_repeat_test(void)
 {
     char dir[] = "/tmp/lmux-exec-life-XXXXXX";
@@ -9123,6 +9457,10 @@ int main(int argc, char **argv)
         setenv("LMUX_SUP_IT_OUTER", "1", 1);
         return file_worker_replacement_torture_test() ? 1 : 0;
     }
+    if (getenv("LMUX_SUP_IT_ONLY_MIXED_SOAK")) {
+        setenv("LMUX_SUP_IT_OUTER", "1", 1);
+        return mixed_service_soak_test() ? 1 : 0;
+    }
     if (getenv("LMUX_SUP_IT_ONLY_INSTALL_RESTART_SHORTCUT")) {
         setenv("LMUX_SUP_IT_OUTER", "1", 1);
         return supervisor_install_restart_shortcut_test() ? 1 : 0;
@@ -9197,6 +9535,7 @@ int main(int argc, char **argv)
         structured_lmux_reconnect_test() ||
         structured_worker_replacement_test() ||
         file_worker_replacement_torture_test() ||
+        mixed_service_soak_test() ||
         lifecycle_recovery_loop_test() ||
         structured_exec_lifecycle_repeat_test() ||
         structured_deploy_coexistence_test() ||

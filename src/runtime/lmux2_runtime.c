@@ -1706,9 +1706,7 @@ static void run_loop(struct v2_app *a)
                     }
                 } else {
                     struct v2_service *s = &a->services[svc[i]];
-                    if ((pfds[i].revents & (POLLERR | POLLNVAL)) ||
-                        ((pfds[i].revents & POLLHUP) &&
-                         v2_socket_peer_closed(s->pending_fd)))
+                    if (pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL))
                         clear_pending(a, s);
                 }
             } else if (kind[i] == 4) {
