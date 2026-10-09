@@ -625,7 +625,11 @@ static int sender_failure_case(enum script_mode mode,
         } else {
             rc = 0;
         }
-    }
+    } else
+        fprintf(stderr, "sender_failure mode=%d expect=%s got=%s detail=%s last_error=%s phase=%s\n",
+                mode, lmux_zmx_sender_status_name(expect),
+                lmux_zmx_sender_status_name(res.status), res.detail,
+                lmux_zmx_error_name(s.last_error), s.last_phase);
 out:
     lmux_zmx_session_close(&s);
     if (fd >= 0)

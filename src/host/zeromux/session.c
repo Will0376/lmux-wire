@@ -424,56 +424,56 @@ int lmux_zmx_session_command(struct lmux_zmx_session *s, const char *command,
             s->last_error = LMUX_ZMX_IO_ERROR;
             return -1;
         }
+        if (pfd.revents & POLLIN) {
+            n = read(s->fd, rx + rx_len, sizeof(rx) - rx_len);
+            if (n > 0) {
+                size_t i;
+                rx_len += (size_t)n;
+                for (i = 0; i < rx_len; i++) {
+                    char ch = rx[i];
+                    if (ch == '\r')
+                        continue;
+                    line[line_len] = 0;
+                    if (!in_tx && line_contains_auth_prompt(line)) {
+                        s->last_error = LMUX_ZMX_AUTH_REQUIRED;
+                        return -1;
+                    }
+                    if (ch == '\n') {
+                        int r;
+                        line[line_len] = 0;
+                        r = process_line(s, res, line, begin, end_prefix, &in_tx);
+                        line_len = 0;
+                        if (r == 1) {
+                            s->last_error = LMUX_ZMX_OK;
+                            return 0;
+                        }
+                        if (r < 0)
+                            return -1;
+                    } else if (line_len + 1 < sizeof(line)) {
+                        line[line_len++] = ch;
+                    } else {
+                        s->last_error = LMUX_ZMX_PROTOCOL_ERROR;
+                        return -1;
+                    }
+                }
+                rx_len = 0;
+                continue;
+            }
+            if (n == 0) {
+                s->last_error = LMUX_ZMX_CARRIER_LOST;
+                return -1;
+            }
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                continue;
+            s->last_error = LMUX_ZMX_IO_ERROR;
+            return -1;
+        }
         if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
             s->last_error = LMUX_ZMX_CARRIER_LOST;
             return -1;
         }
-        if (!(pfd.revents & POLLIN))
-            continue;
-        n = read(s->fd, rx + rx_len, sizeof(rx) - rx_len);
-        if (n > 0) {
-            size_t i;
-            rx_len += (size_t)n;
-            for (i = 0; i < rx_len; i++) {
-                char ch = rx[i];
-                if (ch == '\r')
-                    continue;
-                line[line_len] = 0;
-                if (!in_tx && line_contains_auth_prompt(line)) {
-                    s->last_error = LMUX_ZMX_AUTH_REQUIRED;
-                    return -1;
-                }
-                if (ch == '\n') {
-                    int r;
-                    line[line_len] = 0;
-                    r = process_line(s, res, line, begin, end_prefix, &in_tx);
-                    line_len = 0;
-                    if (r == 1) {
-                        s->last_error = LMUX_ZMX_OK;
-                        return 0;
-                    }
-                    if (r < 0)
-                        return -1;
-                } else if (line_len + 1 < sizeof(line)) {
-                    line[line_len++] = ch;
-                } else {
-                    s->last_error = LMUX_ZMX_PROTOCOL_ERROR;
-                    return -1;
-                }
-            }
-            rx_len = 0;
-            continue;
-        }
-        if (n == 0) {
-            s->last_error = LMUX_ZMX_CARRIER_LOST;
-            return -1;
-        }
-        if (errno == EINTR)
-            continue;
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-            continue;
-        s->last_error = LMUX_ZMX_IO_ERROR;
-        return -1;
     }
 }
 
@@ -532,12 +532,18 @@ int lmux_zmx_session_stream_command(struct lmux_zmx_session *s,
             s->last_error = LMUX_ZMX_IO_ERROR;
             return -1;
         }
+        if ((pfd.revents & POLLIN) && stream_process_rx(&st) < 0) {
+            if ((pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) &&
+                s->last_error == LMUX_ZMX_IO_ERROR)
+                s->last_error = LMUX_ZMX_CARRIER_LOST;
+            return -1;
+        }
+        if (st.done)
+            continue;
         if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
             s->last_error = LMUX_ZMX_CARRIER_LOST;
             return -1;
         }
-        if ((pfd.revents & POLLIN) && stream_process_rx(&st) < 0)
-            return -1;
     }
     return 0;
 }
@@ -560,14 +566,20 @@ static int stream_wait(struct lmux_zmx_stream *st, int want_ready)
             st->session->last_error = LMUX_ZMX_IO_ERROR;
             return -1;
         }
+        if ((pfd.revents & POLLIN) && stream_process_rx(st) < 0) {
+            if ((pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) &&
+                st->session->last_error == LMUX_ZMX_IO_ERROR)
+                st->session->last_error = LMUX_ZMX_CARRIER_LOST;
+            return -1;
+        }
+        if (pfd.revents & POLLIN)
+            stream_progress(st);
+        if (st->done || (want_ready && st->ready_seen))
+            continue;
         if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
             st->session->last_error = LMUX_ZMX_CARRIER_LOST;
             return -1;
         }
-        if ((pfd.revents & POLLIN) && stream_process_rx(st) < 0)
-            return -1;
-        if (pfd.revents & POLLIN)
-            stream_progress(st);
     }
     return 0;
 }
