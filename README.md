@@ -34,6 +34,10 @@ LMUX is primarily a stable substrate for host CLI and MCP tooling. It is not
 trying to become an OTA framework, package manager, USB network stack, or
 kernel-side mux.
 
+New to LMUX? Start with the [hands-on quick start](docs/quickstart.md):
+connect a target, open a shell, transfer a file, run a byte stream, and watch
+it survive a physical USB reconnect.
+
 ## Target Baseline
 
 The current hardware baseline is the Hantek DSO2D15 class target:
