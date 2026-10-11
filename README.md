@@ -9,7 +9,9 @@ Current high-level shape:
 
 ```text
 HOST:
-lmux / lmuxd
+lmux / lmux-mcp
+    -> local control / service interfaces
+    -> lmuxd
     -> LMUX/2
     -> OUTER/1
     -> carrier
@@ -22,13 +24,15 @@ carrier
     -> services
 ```
 
-The implementation is intentionally small and event-driven: one process, one
-`poll()` loop, no threads. LMUX/2 is the active runtime wire protocol; there is
-no LMUX/1 fallback or autodetection.
+The target runtime is intentionally small and event-driven. A target deployment
+uses a supervisor process and a worker process; each `lmuxd` process uses one
+`poll()` loop and no helper threads. Host-side `lmux-mcp` is a separate Go
+process and is not part of that target daemon invariant. LMUX/2 is the active
+runtime wire protocol; there is no LMUX/1 fallback or autodetection.
 
-LMUX is primarily a stable substrate for host tooling and future MCP-style
-embedded target control. It is not trying to become an OTA framework, package
-manager, USB network stack, or kernel-side mux.
+LMUX is primarily a stable substrate for host CLI and MCP tooling. It is not
+trying to become an OTA framework, package manager, USB network stack, or
+kernel-side mux.
 
 ## Target Baseline
 
@@ -64,6 +68,7 @@ carrier
 != supervisor-worker link
 != LMUX session
 != service
+!= execution
 != stream
 != local endpoint
 != PTY process
@@ -115,7 +120,8 @@ The target supervisor owns:
 - persistent managed-worker state.
 
 The supervisor proxies LMUX bytes as opaque TRANSPORT payload. It does not parse
-LMUX streams, services, PTY data, FILE data, GDB traffic, or factory reports.
+LMUX streams, services, PTY data, FILE data, private EXEC data, or factory
+reports.
 
 The worker owns:
 
@@ -123,7 +129,8 @@ The worker owns:
 - service factories;
 - PTYs;
 - FILE;
-- Unix rendezvous sockets.
+- Unix rendezvous sockets;
+- private structured EXEC.
 
 This boundary keeps transport/lifecycle recovery separate from service-level
 protocols.
@@ -135,6 +142,7 @@ Built-in worker services:
 - `pty`
 - `unix-rendezvous`
 - `file`
+- private structured exec (`__exec`, internal)
 
 Default desired services in the host helper are:
 
@@ -142,6 +150,7 @@ Default desired services in the host helper are:
 - `console2`
 - `gdb`
 - `files`
+- `__exec` (internal)
 
 ### PTY
 
@@ -151,8 +160,12 @@ durable across stream detach/reconnect while the worker stays alive.
 
 ### Unix Rendezvous
 
-The Unix rendezvous service is a binary-clean byte bridge. It is used for
-things like GDB, but LMUX does not parse the application protocol.
+The Unix rendezvous service is a generic binary-clean byte bridge. The default
+`gdb` rendezvous socket remains available as a manual/legacy escape hatch, but
+the hardware-verified MCP GDB attach path does not depend on it. Current MCP
+debugging uses `lmux-mcp`, host GDB/MI, a private RSP bridge, and structured
+EXEC to run target `gdbserver` over stdio; `lmuxd` and rendezvous services do
+not parse GDB/MI/RSP.
 
 ### FILE
 
@@ -163,6 +176,14 @@ or transport interruption after the final rename boundary; it does not claim
 power-loss durability for the parent directory. Current FILE behavior is
 functional and tested; receive-window autotuning is intentionally not
 advertised as a current feature.
+
+### Structured EXEC
+
+The private structured EXEC service is an internal worker service used by
+`lmux stream`, `lmux-mcp` command tools, and MCP debugging. It starts direct
+target argv executions with byte-clean stdin/stdout/stderr and bounded target
+capacity. It is not a public background job-control API, and the legacy
+`lmux exec SOCKET -- PROGRAM` helper is only a local socket-to-child utility.
 
 ## Build
 
@@ -212,6 +233,10 @@ build/host/lmuxd \
   --file files:/run/lmux/file.sock \
   --verbose
 ```
+
+The internal `__exec` service is reconciled automatically by host `lmuxd` when
+the target advertises the exec factory; it is not configured with a separate
+startup flag.
 
 Basic commands:
 
@@ -344,30 +369,32 @@ experiment/tool; same-channel handoff, profiles, ZMODEM, relay integration, and
 automatic expansion are not active roadmap items. See
 [docs/zeromux.md](docs/zeromux.md) for details.
 
-## Current Tested Status
+## 1.0 Hardware-Verified Status
 
 Hardware-tested on Hantek DSO2D15:
 
-- OUTER/1 supervisor/worker topology;
-- explicit `HELLO_ACK` first-contact convergence, including target-first then
-  host-later startup;
-- LMUX/2 establishment and service reconciliation;
+- OUTER/1 plus LMUX/2 establishment and service reconciliation;
+- physical USB carrier reconnect;
 - PTY `console1` and `console2`;
-- multi-MiB FILE transfers;
-- live PTY progress during FILE traffic;
-- supervisor/worker restart and reconvergence;
-- managed worker upload, activate, confirm, and rollback;
-- supervisor executable replacement and restart;
-- acceptance scenarios with clean protocol and stream error counters.
+- FILE PUT/GET with SHA verification;
+- managed deploy and supervisor restart through an external lifecycle owner;
+- generic binary `lmux stream`;
+- `lmux stream` continuation across real USB disconnect/reconnect when the
+  worker survives;
+- MCP command execution;
+- MCP GDB attach, breakpoint, continue-to-hit, inspection, and detach.
 
-## Current Roadmap
+The stock Hantek `gdbserver` accepts remote Ctrl-C delivery inconsistently; see
+[docs/debugging.md](docs/debugging.md) for the debug interrupt limitation.
+
+## Post-1.0 Deferred Work
 
 1.0 freezes the supported public surface described in
 [docs/release-1.0.md](docs/release-1.0.md). Deferred directions are kept
 outside the 1.0 scope: UART relay, nested LMUX through a relay, bare-target
-relay bootstrap, richer host frontends, standalone richer MCP UX, Go host
-rewrite, automatic Zeromux expansion, advanced BOOT update workflow, supervisor
-self-update beyond the current BOOT management operations, and near-term FILE
+relay bootstrap, richer host/frontend/MCP UX, Go host rewrite, automatic
+Zeromux expansion, advanced BOOT update workflow, supervisor self-exec, A/B
+supervisor rollback, broader supervisor update policy, and near-term FILE
 window performance tuning.
 
 ## Development Verification
@@ -382,6 +409,7 @@ git diff --check
 make clean
 make host
 make selftest
+go test ./...
 make target
 make strip-target
 ```
@@ -402,6 +430,10 @@ dependencies remain subject to their respective licenses.
 - [docs/lmux2-wire.md](docs/lmux2-wire.md): LMUX/2 wire protocol.
 - [docs/outer1-wire.md](docs/outer1-wire.md): OUTER/1 physical wire protocol
   and BOOT framing.
+- [docs/debugging.md](docs/debugging.md): MCP/GDB integration and target
+  debugger limitations.
+- [docs/lmux-mcp.md](docs/lmux-mcp.md): MCP server, tools, runtime, and
+  structured-control integration.
 - [docs/zeromux.md](docs/zeromux.md): experimental bootstrap/install subsystem.
 - [docs/release-1.0.md](docs/release-1.0.md): supported 1.0 contract,
   limitations, and release gate.
