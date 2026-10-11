@@ -16,5 +16,6 @@ while [ ! -c "$CARRIER" ]; do
 done
 
 exec "$LMUXD" \
-    --role target \
+    --supervisor \
+    --outer \
     --carrier "$CARRIER"

@@ -1,7 +1,8 @@
-# P11 MCP Debugging
+# MCP Debugging
 
-P11 adds host-side agent debugging through `lmux-mcp` without changing OUTER/1,
-LMUX/2, LMS1, target supervisor protocol, or existing service wire formats.
+LMUX debugging is host-side agent debugging through `lmux-mcp` without changing
+OUTER/1, LMUX/2, LMS1, target supervisor protocol, or existing service wire
+formats.
 
 ## Architecture
 
@@ -106,13 +107,18 @@ debug_detach
 debug_stop
 ```
 
-`debug_start` supports:
+`debug_start` currently exposes:
 
 ```text
 mode = attach, pid = TARGET_PID
 mode = launch, program = TARGET_PATH, args = [...]
 symbols = HOST_PATH
 ```
+
+For LMUX Wire 1.0, the supported and hardware-verified target workflow is
+`mode=attach` against an already-running inferior. The `launch` mode remains
+exposed for compatibility with the MCP schema and software tests, but it is not
+the primary hardware-supported workflow for the Hantek target baseline.
 
 `debug_evaluate` uses normal GDB expression semantics and may not be
 side-effect-free.
@@ -137,7 +143,7 @@ LMUX transport failure. Historical gdbserver versions have had Ctrl-C/SIGIO
 handling fixes, so replacing or rebuilding the old vendor gdbserver is the
 preferred follow-up.
 
-`debug_memory_read` is read-only and bounded to 64 KiB per call. P11 does not
+`debug_memory_read` is read-only and bounded to 64 KiB per call. LMUX 1.0 does not
 implement memory writes, register writes, arbitrary CLI commands, multi-inferior
 GDB sessions, DAP, TUI, TCP forwarding, SSH, `socat`, target debugger logic, or
 RSP parsing in `lmuxd`.
@@ -155,7 +161,7 @@ socket, and frees capacity.
 
 ## Reconnect And Worker Replacement
 
-P11 does not promise transparent debugger survival across LMUX reconnect. If the
+LMUX 1.0 does not promise transparent debugger survival across LMUX reconnect. If the
 RSP byte stream cannot be proven continuous, the session becomes `LOST` and is
 cleaned up explicitly. Worker replacement loses the target gdbserver execution
 and therefore the debug session.
@@ -165,5 +171,5 @@ and therefore the debug session.
 Do not debug the target LMUX supervisor or worker through the LMUX transport
 they are carrying. Stopping those processes can deadlock the debug connection
 because RSP bytes travel through that same stack. Current public host APIs do not
-reliably identify those target PIDs, so P11 documents the restriction rather
+reliably identify those target PIDs, so LMUX documents the restriction rather
 than pretending to enforce it through unreliable PID guessing.

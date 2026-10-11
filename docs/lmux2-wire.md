@@ -300,6 +300,10 @@ existing OK/DATA/DONE records with size and SHA256 behavior unchanged. Physical
 LMUX reconnect aborts any active file stream/session; the durable `file` service
 remains coherent and the host opens a fresh stream after reconciliation.
 
+This is an atomic replacement contract across process or transport interruption.
+It is not a power-loss durability promise for the destination parent directory;
+the FILE service does not currently fsync the parent directory after rename.
+
 `LXF_T_CWD_REQUEST` is still an LXF application message, not LMUX/2 transport.
 For compatibility, the current target adapter maps CLI console context 1/2 to
 PTY services `console1`/`console2` and reports `/proc/<shell-pid>/cwd` when

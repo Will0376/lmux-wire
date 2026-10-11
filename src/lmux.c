@@ -385,6 +385,7 @@ static void usage(FILE *f)
         "  lmux boot supervisor-restart SHA256 [--control SOCKET]\n"
         "  lmux zeromux probe --tty DEVICE [serial options]\n"
         "  lmux zeromux send LOCAL_FILE TARGET_TEMP --tty DEVICE [serial options]\n"
+        "  lmux zeromux install FILE --tty DEVICE --install-dir TARGET_DIR --lmux-carrier TARGET_CARRIER [serial options]\n"
         "  lmux term [-v|--verbose] [--remote-dir DIR] [--channel 1|2] [1|2|SOCKET]\n"
         "  lmux stream [--control SOCKET] -- /absolute/target/program [ARGS...]\n"
         "  lmux exec SOCKET -- PROGRAM [ARGS...]\n"

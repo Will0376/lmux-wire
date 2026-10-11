@@ -96,6 +96,9 @@ func fakeDebugGDB() {
 					fmt.Fprintln(os.Stderr, "HOST_GDB_EXIT_AFTER_RSP_CLOSE")
 					return
 				}
+			} else {
+				fmt.Printf(`%s^error,msg="RSP_DIAL_FAILED: %v"`+"\n", tok, err)
+				continue
 			}
 			if delay := os.Getenv("LMUX_DEBUG_FAKE_GDB_TARGET_SELECT_DELAY_MS"); delay != "" {
 				if d, err := time.ParseDuration(delay + "ms"); err == nil {

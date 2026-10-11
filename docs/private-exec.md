@@ -1,8 +1,9 @@
 # Private Exec Architecture
 
-P7 defines a private target execution primitive for future host-side MCP work.
-This is a design document only. It does not add a public CLI command, wire
-opcodes, service implementation, tests, or deployment behavior.
+This historical architecture note describes the private target execution
+primitive used by HC2, `lmux stream`, and `lmux-mcp`. It is not the public 1.0
+contract by itself; see `host-control.md`, `lmux-mcp.md`, and
+`release-1.0.md` for the frozen supported surface.
 
 ## Goals
 

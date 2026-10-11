@@ -1517,16 +1517,23 @@ static void hc2_exec_forget_dead_attachments(struct v2_app *a,
         st = v2_runtime_stream_state(a, e->stdin_stream);
         if (st == LMUX2_STREAM_RESET || st == LMUX2_STREAM_UNUSED) {
             e->stdin_stream = 0;
-            if (!e->stdin_close_committed)
+            if (!e->stdin_close_committed) {
                 e->stdin_close_pending = 0;
+                e->stdin_stream_opened = 0;
+            }
         } else if (st == LMUX2_STREAM_TERMINAL) {
             e->stdin_stream = 0;
-            if (e->stdin_pos < e->stdin_len)
+            if (e->stdin_pos < e->stdin_len) {
                 e->stdin_close_pending = 0;
-            else if (e->stdin_close_requested)
+                e->stdin_stream_opened = 0;
+            } else if (e->stdin_close_requested && !e->stdin_close_committed) {
+                e->stdin_close_pending = 0;
+                e->stdin_stream_opened = 0;
+            } else if (e->stdin_close_requested) {
                 e->stdin_close_pending = 1;
-            else
+            } else {
                 e->stdin_close_pending = 0;
+            }
         }
     }
     if (e->stdout_stream) {
@@ -1806,7 +1813,7 @@ void v2_host_structured_service(struct v2_app *a, struct v2_host *h,
 {
     if (h->structured_fd < 0)
         return;
-    if (revents & POLLIN) {
+    if (revents & (POLLIN | POLLHUP)) {
         for (;;) {
             ssize_t r;
             int parsed;
@@ -1838,14 +1845,52 @@ void v2_host_structured_service(struct v2_app *a, struct v2_host *h,
                 continue;
             if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
                 break;
-            hc2_close_client_runtime(a, h);
-            return;
+            if (r == 0 || (revents & POLLIN)) {
+                hc2_close_client_runtime(a, h);
+                return;
+            }
+            break;
         }
     }
     if (h->structured_fd >= 0 && (revents & POLLOUT))
         v2_host_structured_flush_tx(a, h);
-    if (h->structured_fd >= 0 && (revents & (POLLHUP | POLLERR | POLLNVAL)))
+    if (h->structured_fd >= 0 && (revents & (POLLERR | POLLNVAL)))
         hc2_close_client_runtime(a, h);
+}
+
+static void hc2_fail_inflight_on_remote_down(struct v2_host *h)
+{
+    struct v2_host_structured_exec *e;
+    uint64_t req = h->structured_control_op.request_id;
+    switch (h->structured_control_op.kind) {
+    case V2_HC2_CTL_START:
+        e = hc2_exec_by_ref(h, h->structured_control_op.ref);
+        if (!e || e->exec_id)
+            break;
+        hc2_exec_free(NULL, e);
+        if (h->structured_fd >= 0 && h->structured_ready && req)
+            hc2_queue_error(h, req, LMUX_HC2_E_TARGET_LOST, "remote reset");
+        break;
+    case V2_HC2_CTL_STATUS:
+        e = hc2_exec_by_ref(h, h->structured_control_op.ref);
+        if (e && req == e->req_id) {
+            e->status_pending = 0;
+            break;
+        }
+        if (h->structured_fd >= 0 && h->structured_ready && req)
+            hc2_queue_error(h, req, LMUX_HC2_E_TARGET_LOST, "remote reset");
+        break;
+    case V2_HC2_CTL_ATTACH:
+    case V2_HC2_CTL_RELEASE:
+        if (h->structured_fd >= 0 && h->structured_ready && req)
+            hc2_queue_error(h, req, LMUX_HC2_E_TARGET_LOST, "remote reset");
+        break;
+    case V2_HC2_CTL_SIGNAL:
+    case V2_HC2_CTL_INFO:
+    case V2_HC2_CTL_NONE:
+    default:
+        break;
+    }
 }
 
 void v2_host_structured_tick(struct v2_app *a, struct v2_host *h,
@@ -1914,6 +1959,7 @@ static void hc2_retire_exec_lmux_attachment(struct v2_host *h)
 {
     if (!h->exec_structured)
         return;
+    hc2_fail_inflight_on_remote_down(h);
     h->exec_active = 0;
     h->exec_phase = 0;
     h->exec_status_pending = 0;

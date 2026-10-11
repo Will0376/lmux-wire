@@ -575,6 +575,13 @@ func (s *Session) startFailure(stage string, err error) error {
 
 func (s *Session) targetSelectFailure(err error, before rspSocketSnapshot) error {
 	after := s.socketSnapshot("after")
+	if strings.Contains(err.Error(), "remote closed") {
+		s.mu.Lock()
+		if s.acceptSucceeded && s.rspLocalClose == "" {
+			s.rspLocalClose = "RSP_LOCAL_CLOSED: gdb unix socket closed"
+		}
+		s.mu.Unlock()
+	}
 	first := s.currentFailure()
 	if first != nil {
 		return fmt.Errorf("%w target_select_error=%q raw_target_select=%q accept=%s socket_before={%s} socket_after={%s} local_rsp_close=%q target_gdbserver_stderr=%q host_gdb_mi_stream=%q",
@@ -1029,12 +1036,7 @@ func (s *Session) Continue(ctx context.Context) (map[string]any, error) {
 	if _, err := s.gdb.Command(ctx, "-exec-continue"); err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
-	state := s.State
-	s.mu.Unlock()
-	if state != "STOPPED" && state != "EXITED" && state != "ERROR" && state != "LOST" {
-		s.setState("RUNNING", "")
-	}
+	s.setRunningIfActive()
 	if s.mgr.journal != nil {
 		s.mgr.journal("DEBUG_RUNNING", map[string]any{"debug": s.Token})
 	}
@@ -1059,12 +1061,7 @@ func (s *Session) Step(ctx context.Context, kind string) (map[string]any, error)
 	if _, err := s.gdb.Command(ctx, cmd); err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
-	state := s.State
-	s.mu.Unlock()
-	if state != "STOPPED" && state != "EXITED" && state != "ERROR" && state != "LOST" {
-		s.setState("RUNNING", "")
-	}
+	s.setRunningIfActive()
 	return s.Status(), nil
 }
 
@@ -1246,9 +1243,17 @@ func (s *Session) acceptLoop() {
 				return
 			default:
 			}
+			localClosed := isLocalSocketClosed(err)
+			if localClosed {
+				s.mu.Lock()
+				if s.rspLocalClose == "" {
+					s.rspLocalClose = "RSP_LOCAL_CLOSED: gdb unix socket closed"
+				}
+				s.mu.Unlock()
+			}
 			if s.stateIs("CONNECTING") {
 				s.mu.Lock()
-				if isLocalSocketClosed(err) {
+				if localClosed {
 					s.rspLocalClose = "RSP_LOCAL_CLOSED: gdb unix socket closed"
 				} else {
 					s.rspLocalClose = fmt.Sprintf("RSP_LOCAL_READ_FAILED: %v", err)
@@ -1256,7 +1261,7 @@ func (s *Session) acceptLoop() {
 				s.mu.Unlock()
 				return
 			}
-			if isLocalSocketClosed(err) {
+			if localClosed {
 				s.fail("LOST", errors.New("RSP_LOCAL_CLOSED: gdb unix socket closed"))
 			} else {
 				s.fail("LOST", fmt.Errorf("RSP_LOCAL_READ_FAILED: %w", err))
@@ -1714,6 +1719,20 @@ func (s *Session) setState(state, reason string) {
 	if reason != "" {
 		s.StopReason = reason
 	}
+	old := s.wait
+	s.wait = make(chan struct{})
+	s.mu.Unlock()
+	close(old)
+}
+
+func (s *Session) setRunningIfActive() {
+	s.mu.Lock()
+	switch s.State {
+	case "STOPPED", "EXITED", "ERROR", "LOST", "DETACHED":
+		s.mu.Unlock()
+		return
+	}
+	s.State = "RUNNING"
 	old := s.wait
 	s.wait = make(chan struct{})
 	s.mu.Unlock()

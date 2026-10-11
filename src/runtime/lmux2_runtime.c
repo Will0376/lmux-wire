@@ -1752,13 +1752,14 @@ static void run_loop(struct v2_app *a)
                 if (pfds[i].revents & POLLIN)
                     v2_host_control_accept(&a->host);
             } else if (kind[i] == 7) {
-                if (pfds[i].revents & POLLIN) {
+                if (pfds[i].revents & (POLLIN | POLLHUP)) {
                     struct v2_host_status st;
                     fill_target_service_status(a);
                     fill_host_status(a, &st);
                     v2_host_control_service(a, &a->host, &st);
                 }
-                if (pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL))
+                if (a->host.control_fd >= 0 &&
+                    (pfds[i].revents & (POLLERR | POLLNVAL)))
                     v2_host_control_on_hup(&a->host);
             } else if (kind[i] == 8) {
                 if (pfds[i].revents & POLLIN)

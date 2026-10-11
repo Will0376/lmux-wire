@@ -209,24 +209,26 @@ static int count_active_execs(struct v2_service *s)
 
 static void gc_completed(struct v2_service *s)
 {
-    int i, victim = -1, completed = 0;
-    unsigned long long oldest = 0;
-    for (i = 0; i < V2_EXEC_MAX_SLOTS; i++) {
-        struct v2_exec_obj *e = &s->exec.execs[i];
-        if (!e->used || (e->status != V2_EXEC_STATUS_DONE &&
-                         e->status != V2_EXEC_STATUS_START_FAILED))
-            continue;
-        completed++;
-        if (!e->control_stream_id && !e->stdin_stream_id &&
-            !e->stdout_stream_id && !e->stderr_stream_id &&
-            (victim < 0 || e->completed_seq < oldest)) {
-            victim = i;
-            oldest = e->completed_seq;
+    for (;;) {
+        int i, victim = -1, completed = 0;
+        unsigned long long oldest = 0;
+        for (i = 0; i < V2_EXEC_MAX_SLOTS; i++) {
+            struct v2_exec_obj *e = &s->exec.execs[i];
+            if (!e->used || (e->status != V2_EXEC_STATUS_DONE &&
+                             e->status != V2_EXEC_STATUS_START_FAILED))
+                continue;
+            completed++;
+            if (!e->control_stream_id && !e->stdin_stream_id &&
+                !e->stdout_stream_id && !e->stderr_stream_id &&
+                (victim < 0 || e->completed_seq < oldest)) {
+                victim = i;
+                oldest = e->completed_seq;
+            }
         }
+        if (completed <= V2_EXEC_MAX_COMPLETED || victim < 0)
+            return;
+        exec_obj_reset(&s->exec.execs[victim]);
     }
-    if (completed <= V2_EXEC_MAX_COMPLETED || victim < 0)
-        return;
-    exec_obj_reset(&s->exec.execs[victim]);
 }
 
 static int evict_one_completed(struct v2_service *s)
@@ -986,6 +988,51 @@ static void write_child_stdin(struct v2_exec_obj *e)
     }
 }
 
+static void finish_reaped_child(struct v2_service *s, struct v2_exec_obj *e,
+                                int status, int was_starting)
+{
+    e->child_reaped = 1;
+    if (was_starting && e->err_fd >= 0) {
+        struct child_error ce;
+        ssize_t rr;
+        do {
+            rr = read(e->err_fd, &ce, sizeof(ce));
+        } while (rr < 0 && errno == EINTR);
+        if (rr == (ssize_t)sizeof(ce)) {
+            close_fd(&e->err_fd);
+            e->start_failure = (enum v2_exec_start_failure)ce.stage;
+            e->start_errno = (int)ce.errnum;
+            e->status = V2_EXEC_STATUS_START_FAILED;
+            e->completed_seq = ++s->exec.next_completed_seq;
+            e->start_reply_pending = 1;
+            (void)queue_pending_start_reply(s, e);
+            exec_close_stdin_side(e);
+            return;
+        }
+        close_fd(&e->err_fd);
+    }
+    if (WIFEXITED(status)) {
+        e->exit_code = WEXITSTATUS(status);
+        if (e->status != V2_EXEC_STATUS_START_FAILED)
+            e->status = V2_EXEC_STATUS_EXITED_DRAINING;
+    } else if (WIFSIGNALED(status)) {
+        e->term_signal = WTERMSIG(status);
+        if (e->status != V2_EXEC_STATUS_START_FAILED)
+            e->status = V2_EXEC_STATUS_EXITED_DRAINING;
+    }
+    if (was_starting && e->status != V2_EXEC_STATUS_START_FAILED) {
+        e->start_reply_pending = 1;
+        (void)queue_pending_start_reply(s, e);
+    }
+    exec_close_stdin_side(e);
+    if ((e->stdout_eof || e->stdout_fd < 0) &&
+        (e->stderr_eof || e->stderr_fd < 0) &&
+        e->status != V2_EXEC_STATUS_START_FAILED) {
+        e->status = V2_EXEC_STATUS_DONE;
+        e->completed_seq = ++s->exec.next_completed_seq;
+    }
+}
+
 static void check_start_pipe(struct v2_service *s, struct v2_exec_obj *e)
 {
     struct child_error ce;
@@ -1006,6 +1053,15 @@ static void check_start_pipe(struct v2_service *s, struct v2_exec_obj *e)
         e->start_reply_pending = 1;
         (void)queue_pending_start_reply(s, e);
     } else if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+        int status;
+        pid_t wr;
+        if (errno == EINTR)
+            return;
+        wr = e->pid > 0 ? waitpid(e->pid, &status, WNOHANG) : 0;
+        if (wr == e->pid) {
+            finish_reaped_child(s, e, status, 1);
+            return;
+        }
         return;
     }
 }
@@ -1014,28 +1070,14 @@ static void reap_child(struct v2_service *s, struct v2_exec_obj *e)
 {
     int status;
     pid_t r;
+    int was_starting;
     if (!e->used || e->child_reaped || e->pid <= 0)
         return;
     r = waitpid(e->pid, &status, WNOHANG);
     if (r <= 0)
         return;
-    e->child_reaped = 1;
-    if (WIFEXITED(status)) {
-        e->exit_code = WEXITSTATUS(status);
-        if (e->status != V2_EXEC_STATUS_START_FAILED)
-            e->status = V2_EXEC_STATUS_EXITED_DRAINING;
-    } else if (WIFSIGNALED(status)) {
-        e->term_signal = WTERMSIG(status);
-        if (e->status != V2_EXEC_STATUS_START_FAILED)
-            e->status = V2_EXEC_STATUS_EXITED_DRAINING;
-    }
-    exec_close_stdin_side(e);
-    if ((e->stdout_eof || e->stdout_fd < 0) &&
-        (e->stderr_eof || e->stderr_fd < 0) &&
-        e->status != V2_EXEC_STATUS_START_FAILED) {
-        e->status = V2_EXEC_STATUS_DONE;
-        e->completed_seq = ++s->exec.next_completed_seq;
-    }
+    was_starting = e->status == V2_EXEC_STATUS_STARTING;
+    finish_reaped_child(s, e, status, was_starting);
 }
 
 static void maybe_done(struct v2_service *s, struct v2_exec_obj *e)

@@ -250,6 +250,8 @@ func (p *Process) readStdout(r io.Reader) {
 					}
 					p.closeWith(p.annotateError("GDB_EXITED", io.EOF))
 				}
+			} else if errors.Is(err, os.ErrClosed) || strings.Contains(err.Error(), "file already closed") {
+				p.closeWith(p.annotateError("GDB_EXITED", err))
 			} else {
 				p.closeWith(p.annotateError("GDB_MI_READ_FAILED", err))
 			}

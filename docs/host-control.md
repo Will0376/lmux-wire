@@ -33,7 +33,7 @@ for host-created sockets under `/run/lmux`. This keeps a normal-user
 `lmux-mcp` process able to connect when host `lmuxd` intentionally runs as
 root. Do not make the structured socket a TCP listener.
 
-P10a supports one active structured client at a time. A second structured client
+LMUX 1.0 supports one active structured client at a time. A second structured client
 connection is closed immediately. Legacy control clients remain separate and
 continue to use the legacy socket.
 
@@ -96,7 +96,7 @@ SERVER_HELLO
   string build_version
 ```
 
-Current P10a capabilities:
+Current capabilities:
 
 ```text
 STATUS
@@ -205,7 +205,7 @@ The value is worker-local, nonpersistent, and owned by the worker exec service.
 
 ## Exec Operations
 
-P10a structured exec operations are:
+Structured exec operations are:
 
 ```text
 EXEC_START

@@ -354,15 +354,23 @@ static int exec_request_test(const char *control, const char *req,
     int fd = connect_unix_test(control);
     size_t len = 0;
     long long end = now_ms() + 20000;
-    if (fd < 0 || cap == 0)
+    int last_re = 0, last_errno = 0, saw_eof = 0;
+    if (fd < 0 || cap == 0) {
+        fprintf(stderr, "exec_request_test setup failed fd=%d cap=%zu errno=%d req=%.80s",
+                fd, cap, errno, req);
         return -1;
+    }
     out[0] = 0;
     if (write_all(fd, req, strlen(req)) < 0) {
+        fprintf(stderr, "exec_request_test write failed errno=%d req=%.80s",
+                errno, req);
         close(fd);
         return -1;
     }
     while (now_ms() < end && len + 1 < cap) {
         int re = wait_fd_event(fd, POLLIN | POLLHUP | POLLERR | POLLNVAL, 100);
+        if (re)
+            last_re = re;
         if (re & POLLIN) {
             ssize_t r = read(fd, out + len, cap - len - 1);
             if (r > 0) {
@@ -372,14 +380,20 @@ static int exec_request_test(const char *control, const char *req,
                     break;
                 continue;
             }
-            if (r == 0)
+            if (r == 0) {
+                saw_eof = 1;
                 break;
+            }
+            last_errno = errno;
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
                 continue;
+            fprintf(stderr, "exec_request_test read failed errno=%d re=0x%x req=%.80s",
+                    errno, re, req);
             close(fd);
             return -1;
         }
         if (re & (POLLHUP | POLLERR | POLLNVAL)) {
+            int retry = 0;
             for (;;) {
                 ssize_t r = read(fd, out + len, cap - len - 1);
                 if (r > 0) {
@@ -392,12 +406,26 @@ static int exec_request_test(const char *control, const char *req,
                 }
                 if (r < 0 && errno == EINTR)
                     continue;
+                if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    last_errno = errno;
+                    retry = 1;
+                    break;
+                }
+                if (r == 0)
+                    saw_eof = 1;
+                else if (r < 0)
+                    last_errno = errno;
                 break;
             }
+            if (retry)
+                continue;
             break;
         }
     }
     close(fd);
+    if (!len)
+        fprintf(stderr, "exec_request_test empty response re=0x%x errno=%d eof=%d req=%.80s",
+                last_re, last_errno, saw_eof, req);
     return len ? 0 : -1;
 }
 
@@ -530,7 +558,7 @@ static int hc2_read_frame_limit(int fd, uint16_t *type, uint64_t *req,
         int rem = (int)(end - now_ms());
         int re = wait_fd_event(fd, POLLIN | POLLHUP | POLLERR | POLLNVAL,
                                rem < 100 ? rem : 100);
-        if (re & POLLIN) {
+        if (re & (POLLIN | POLLHUP)) {
             ssize_t r = read(fd, rd->buf + rd->have, want);
             if (r > 0) {
                 rd->have += (size_t)r;
@@ -545,7 +573,7 @@ static int hc2_read_frame_limit(int fd, uint16_t *type, uint64_t *req,
             hc2_reader_reset_fd(fd);
             return HC2_READ_IO;
         }
-        if (re & (POLLHUP | POLLERR | POLLNVAL)) {
+        if (re & (POLLERR | POLLNVAL)) {
             hc2_reader_reset_fd(fd);
             return HC2_READ_EOF;
         }
@@ -5807,10 +5835,13 @@ static int outer_fault_recovery_test(enum outer_fault_kind kind,
         goto out;
     rc = 0;
 out:
-    if (rc != 0)
+    if (rc != 0) {
         fprintf(stderr, "outer_fault kind=%s(%d) dir=%s(%d) where=%s\n",
                 outer_fault_kind_name(kind), kind,
                 outer_fault_dir_name(dir), dir, where);
+        if (read_status(control, out, sizeof(out)) == 0)
+            dump_excerpt("outer fault final status", out);
+    }
     if (cfd >= 0)
         close(cfd);
     if (sfd >= 0)
@@ -6421,6 +6452,7 @@ static int private_exec_basic_test(void)
         !strstr(out, "OK EXEC") ||
         !strstr(out, "STATUS state=START_FAILED") ||
         !strstr(out, "fail=5") ||
+        !strstr(out, "errno=2") ||
         !strstr(out, "\nDONE\n")) {
         dump_excerpt("private exec failure", out);
         goto out;
@@ -8549,9 +8581,12 @@ static int lifecycle_recovery_loop_test(void)
     }
     rc = 0;
 out:
-    if (rc)
+    if (rc) {
         fprintf(stderr, "lifecycle_recovery_loop where=%s cycle=%d shell=%ld after=%ld worker=%ld\n",
                 where, i, shell_pid, shell_pid_after, (long)worker);
+        if (read_status(control, out, sizeof(out)) == 0)
+            dump_excerpt("lifecycle recovery final status", out);
+    }
     if (fd >= 0)
         close(fd);
     if (console_fd >= 0)
@@ -10310,6 +10345,11 @@ int main(int argc, char **argv)
     if (getenv("LMUX_SUP_IT_ONLY_OUTER_UPLOAD_FAULT_ADJACENT")) {
         setenv("LMUX_SUP_IT_OUTER", "1", 1);
         return outer_upload_fault_test(OUTER_FAULT_BOOT_BAD_OFFSET) ? 1 : 0;
+    }
+    if (getenv("LMUX_SUP_IT_ONLY_OUTER_FAULT_SEQ_H2T")) {
+        setenv("LMUX_SUP_IT_OUTER", "1", 1);
+        return outer_fault_recovery_test(OUTER_FAULT_SEQ_GAP,
+                                         OUTER_FAULT_HOST_TO_TARGET) ? 1 : 0;
     }
     if (getenv("LMUX_SUP_IT_ONLY_OUTER_FIRST_CONTACT_LOST_ACK")) {
         setenv("LMUX_SUP_IT_OUTER", "1", 1);

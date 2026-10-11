@@ -158,9 +158,11 @@ things like GDB, but LMUX does not parse the application protocol.
 
 The FILE service uses LXF over LMUX for PUT and GET. Transfers include SHA
 verification, and target-side replacement uses temporary files, fsync, and
-atomic replacement where applicable. Current FILE behavior is functional and
-tested; receive-window autotuning is intentionally not advertised as a current
-feature.
+atomic replacement where applicable. This protects replacement across process
+or transport interruption after the final rename boundary; it does not claim
+power-loss durability for the parent directory. Current FILE behavior is
+functional and tested; receive-window autotuning is intentionally not
+advertised as a current feature.
 
 ## Build
 
@@ -203,6 +205,7 @@ build/host/lmuxd \
   --outer \
   --carrier /dev/ttyACM0 \
   --control /run/lmux/control.sock \
+  --structured-control /run/lmux/control-v2.sock \
   --pty console1:/run/lmux/console1.sock:/bin/sh \
   --pty console2:/run/lmux/console2.sock:/bin/sh \
   --unix gdb:/run/lmux/gdb.sock:/tmp/lmux-gdb.sock \
@@ -252,9 +255,9 @@ control client slot at `/run/lmux/control-v2.sock`, so another structured client
 such as `lmux-mcp` may make it fail with a clear BUSY/error instead of stealing
 ownership.
 
-The checked-in `lmux-start-target.sh` is a legacy raw-target wrapper. Current
-supervisor deployments should use `lmuxd --supervisor --outer ...` or an
-equivalent target init/launcher entry.
+The checked-in `lmux-start-target.sh` starts the target supervisor in OUTER/1
+mode using `LMUXD` and `LMUX_CARRIER` overrides. It is a simple BusyBox-friendly
+launcher, not a persistence policy.
 
 ## Managed Deployment
 
@@ -359,23 +362,13 @@ Hardware-tested on Hantek DSO2D15:
 
 ## Current Roadmap
 
-Near-term work is intentionally narrow:
-
-1. Keep transport and lifecycle behavior stable.
-2. Add a private exec service for programmatic use.
-3. Build a host-side MCP frontend over LMUX services.
-
-The private exec service is not a public CLI feature yet. Its process/session
-lifecycle, output retrieval, and control semantics still need design.
-
-The MCP-facing goal is practical embedded control over the existing substrate:
-file upload/download, command execution, command/session handles, long-running
-command output retrieval, and signal/control handling.
-
-Cancelled or deferred directions are not part of the active roadmap: UART
-relay, nested LMUX through a relay, bare-target relay bootstrap, generic
-tunneling framework, automatic Zeromux expansion, and near-term FILE window
-performance tuning.
+1.0 freezes the supported public surface described in
+[docs/release-1.0.md](docs/release-1.0.md). Deferred directions are kept
+outside the 1.0 scope: UART relay, nested LMUX through a relay, bare-target
+relay bootstrap, richer host frontends, standalone richer MCP UX, Go host
+rewrite, automatic Zeromux expansion, advanced BOOT update workflow, supervisor
+self-update beyond the current BOOT management operations, and near-term FILE
+window performance tuning.
 
 ## Development Verification
 
@@ -395,9 +388,20 @@ make strip-target
 
 For README-only changes, `git diff --check` is normally sufficient.
 
+## License
+
+LMUX Wire is licensed under the Mozilla Public License 2.0. See
+[LICENSE](LICENSE).
+
+Unless otherwise noted, project-authored source code in this repository is
+covered by the Mozilla Public License 2.0. Third-party components and
+dependencies remain subject to their respective licenses.
+
 ## Documents
 
 - [docs/lmux2-wire.md](docs/lmux2-wire.md): LMUX/2 wire protocol.
 - [docs/outer1-wire.md](docs/outer1-wire.md): OUTER/1 physical wire protocol
   and BOOT framing.
 - [docs/zeromux.md](docs/zeromux.md): experimental bootstrap/install subsystem.
+- [docs/release-1.0.md](docs/release-1.0.md): supported 1.0 contract,
+  limitations, and release gate.

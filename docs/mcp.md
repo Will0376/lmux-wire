@@ -1,8 +1,9 @@
 # Host-Side MCP Architecture
 
-This document describes the host-side MCP frontend for LMUX Wire. P10b
-implements the v1 frontend as a standalone host process. It does not add target
-wire changes, a public `lmux exec` command, or a target-side runtime.
+This architecture note describes the host-side MCP frontend for LMUX Wire. The
+current frontend is a standalone host process. It does not add target wire
+changes, a public `lmux exec` command, or a target-side runtime. The frozen
+1.0 tool surface is documented in `lmux-mcp.md` and `release-1.0.md`.
 
 ## Goals
 

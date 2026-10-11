@@ -111,6 +111,7 @@ debug_capabilities
 debug_start
 debug_list
 debug_status
+debug_diagnostics_read
 debug_breakpoint_set
 debug_breakpoint_delete
 debug_continue
