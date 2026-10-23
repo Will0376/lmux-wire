@@ -99,6 +99,61 @@ static int write_all(int fd, const void *buf, size_t len)
     return 0;
 }
 
+static int write_text_file(const char *path, const char *text, mode_t mode)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    int rc;
+    if (fd < 0)
+        return -1;
+    rc = write_all(fd, text, strlen(text));
+    if (close(fd) < 0)
+        rc = -1;
+    return rc;
+}
+
+static int write_fifo_when_reader(const char *path, const char *text,
+                                  int timeout_ms)
+{
+    long long end = now_ms() + timeout_ms;
+    while (now_ms() < end) {
+        int fd = open(path, O_WRONLY | O_NONBLOCK);
+        if (fd >= 0) {
+            int rc = write_all(fd, text, strlen(text));
+            close(fd);
+            return rc;
+        }
+        if (errno != ENXIO && errno != EINTR)
+            return -1;
+        usleep(10000);
+    }
+    return -1;
+}
+
+static int file_equals(const char *path, const char *want)
+{
+    char buf[64];
+    int fd = open(path, O_RDONLY);
+    ssize_t n;
+    if (fd < 0)
+        return -1;
+    n = read(fd, buf, sizeof(buf));
+    close(fd);
+    return n == (ssize_t)strlen(want) &&
+           memcmp(buf, want, (size_t)n) == 0 ? 0 : -1;
+}
+
+static int substring_count(const char *buf, const char *needle)
+{
+    int count = 0;
+    size_t n = strlen(needle);
+    const char *p = buf;
+    while ((p = strstr(p, needle)) != NULL) {
+        count++;
+        p += n;
+    }
+    return count;
+}
+
 static int read_until(int fd, const char *needle, char *out, size_t cap, int timeout_ms)
 {
     size_t len = 0;
@@ -111,6 +166,44 @@ static int read_until(int fd, const char *needle, char *out, size_t cap, int tim
             ssize_t r;
             if (len + 1 >= cap)
                 return -1;
+            r = read(fd, out + len, cap - len - 1);
+            if (r > 0) {
+                len += (size_t)r;
+                out[len] = 0;
+                if (strstr(out, needle))
+                    return 0;
+            } else if (r == 0) {
+                return -1;
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                return -1;
+            }
+        }
+        if (re & (POLLHUP | POLLERR | POLLNVAL))
+            return -1;
+    }
+    return -1;
+}
+
+static int read_until_rolling(int fd, const char *needle, char *out, size_t cap,
+                              int timeout_ms)
+{
+    size_t len = 0;
+    size_t overlap = strlen(needle);
+    long long end = now_ms() + timeout_ms;
+    if (cap < 2)
+        return -1;
+    if (overlap >= cap)
+        overlap = cap - 1;
+    out[0] = 0;
+    while (now_ms() < end) {
+        int re = wait_fd_event(fd, POLLIN | POLLHUP | POLLERR | POLLNVAL, 100);
+        if (re & POLLIN) {
+            ssize_t r;
+            if (len + 1 >= cap) {
+                memmove(out, out + len - overlap, overlap);
+                len = overlap;
+                out[len] = 0;
+            }
             r = read(fd, out + len, cap - len - 1);
             if (r > 0) {
                 len += (size_t)r;
@@ -297,8 +390,8 @@ static int status_u64_after(const char *buf, const char *key, unsigned long long
     return errno == 0 && endp != p ? 0 : -1;
 }
 
-static int status_service_last_stream(const char *buf, const char *service,
-                                      unsigned long long *out)
+static int status_service_u64(const char *buf, const char *service,
+                              const char *key, unsigned long long *out)
 {
     const char *p = strstr(buf, "\nservices:\n");
     const char *end;
@@ -312,12 +405,39 @@ static int status_service_last_stream(const char *buf, const char *service,
         p += 3;
         if (strncmp(p, service, n) == 0 && p[n] == ' ') {
             const char *eol = strchr(p, '\n');
-            const char *k = strstr(p, "last_stream=");
+            const char *k = strstr(p, key);
             if (!k || (eol && k > eol))
                 return -1;
-            return status_u64_after(k, "last_stream=", out);
+            return status_u64_after(k, key, out);
         }
     }
+    return -1;
+}
+
+static int status_service_last_stream(const char *buf, const char *service,
+                                      unsigned long long *out)
+{
+    return status_service_u64(buf, service, "last_stream=", out);
+}
+
+static int wait_console_detached(const char *control,
+                                 unsigned long long stream, int timeout_ms)
+{
+    char buf[16384], id[64], terminal[96], last[16384];
+    long long end = now_ms() + timeout_ms;
+    last[0] = 0;
+    snprintf(id, sizeof(id), "  id=%llu state=", stream);
+    snprintf(terminal, sizeof(terminal), "  id=%llu state=TERMINAL ", stream);
+    while (now_ms() < end) {
+        if (read_status_snapshot(control, buf, sizeof(buf), 1000) == 0) {
+            const char *streams = strstr(buf, "\nstreams:\n");
+            if (streams && (!strstr(streams, id) || strstr(streams, terminal)))
+                return 0;
+            snprintf(last, sizeof(last), "%s", buf);
+        }
+        usleep(10000);
+    }
+    fprintf(stderr, "stream %llu did not detach:\n%s\n", stream, last);
     return -1;
 }
 
@@ -471,14 +591,20 @@ static int integration_test(void)
 {
     char dir[] = "/tmp/lmux2-pty-it-XXXXXX";
     char carrier[160], c1[160], c2[160], c1_bad[160], control[160];
+    char shell1[160], shell2[160], partial_flag[160], detached_fifo[160], detached_done[160];
+    char boundary_fifo[160], boundary_started[160], builtin_release[160];
+    char overflow_started[160], overflow_done[160], raw_file[160];
+    char shell_script[512];
     char arg1[512], arg1_dup[512], arg1_conflict[512], arg2[512];
     pid_t target = -1, host = -1;
     int fd1 = -1, fd2 = -1, rc = 1;
     int host_fd_base = -1, target_fd_base = -1;
     unsigned long long initial_conn = 0;
     unsigned long long console1_stream = 0;
+    unsigned long long console2_stream = 0;
     long pid1 = -1, pid1_after = -1, pid2 = -1, pid1_respawn = -1;
-    char out[8192], status[16384];
+    char out[65536], status[16384], cmd[1024];
+    int have_busybox;
     const char *where = "setup";
 
     if (!mkdtemp(dir))
@@ -488,10 +614,30 @@ static int integration_test(void)
     snprintf(c2, sizeof(c2), "%s/console2.sock", dir);
     snprintf(c1_bad, sizeof(c1_bad), "%s/console1-bad.sock", dir);
     snprintf(control, sizeof(control), "%s/control.sock", dir);
-    snprintf(arg1, sizeof(arg1), "console1:%s:/bin/sh", c1);
-    snprintf(arg1_dup, sizeof(arg1_dup), "console1:%s:/bin/sh", c1);
+    snprintf(shell1, sizeof(shell1), "%s/test-shell", dir);
+    snprintf(shell2, sizeof(shell2), "%s/test-shell-busybox", dir);
+    snprintf(partial_flag, sizeof(partial_flag), "%s/partial-ran", dir);
+    snprintf(detached_fifo, sizeof(detached_fifo), "%s/detached.fifo", dir);
+    snprintf(detached_done, sizeof(detached_done), "%s/detached.done", dir);
+    snprintf(boundary_fifo, sizeof(boundary_fifo), "%s/boundary.fifo", dir);
+    snprintf(boundary_started, sizeof(boundary_started), "%s/boundary.started", dir);
+    snprintf(builtin_release, sizeof(builtin_release), "%s/builtin.release", dir);
+    snprintf(overflow_started, sizeof(overflow_started), "%s/overflow.started", dir);
+    snprintf(overflow_done, sizeof(overflow_done), "%s/overflow.done", dir);
+    snprintf(raw_file, sizeof(raw_file), "%s/raw.bytes", dir);
+    have_busybox = access("/usr/bin/busybox", X_OK) == 0;
+    snprintf(shell_script, sizeof(shell_script),
+             "#!/bin/sh\nPS1='LMUX_TEST_PROMPT> '\nexport PS1\nexec %s sh -i\n",
+             have_busybox ? "/usr/bin/busybox" : "/bin/sh");
+    if (write_text_file(shell1, shell_script, 0700) < 0 ||
+        write_text_file(shell2, shell_script, 0700) < 0 ||
+        mkfifo(detached_fifo, 0600) < 0 ||
+        mkfifo(boundary_fifo, 0600) < 0)
+        goto out;
+    snprintf(arg1, sizeof(arg1), "console1:%s:%s", c1, shell1);
+    snprintf(arg1_dup, sizeof(arg1_dup), "console1:%s:%s", c1, shell1);
     snprintf(arg1_conflict, sizeof(arg1_conflict), "console1:%s:/bin/false", c1_bad);
-    snprintf(arg2, sizeof(arg2), "console2:%s:/bin/sh", c2);
+    snprintf(arg2, sizeof(arg2), "console2:%s:%s", c2, shell2);
 
     host = spawn_host(carrier, control, arg1, arg1_dup, arg1_conflict, arg2);
     if (host < 0)
@@ -521,6 +667,13 @@ static int integration_test(void)
     if (access(c1_bad, F_OK) == 0)
         goto out;
 
+    where = "first attach shows idle prompt";
+    if (read_until_rolling(fd1, "LMUX_TEST_PROMPT> ",
+                           out, sizeof(out), 5000) < 0) {
+        dump_excerpt("first prompt", out);
+        goto out;
+    }
+
     where = "initial shell pid/state";
     if (shell_cmd_expect(fd1, "echo LMUX2_READY", "LMUX2_READY", out, sizeof(out)) < 0) {
         dump_excerpt("initial console1 ready", out);
@@ -538,6 +691,197 @@ static int integration_test(void)
         wait_console_stream_after(control, "console1", initial_conn, 0, 5000,
                                   &console1_stream) < 0)
         goto out;
+
+    where = "partial command is reset on attach";
+    snprintf(cmd, sizeof(cmd), "printf UX_PARTIAL_EXECUTED > %s", partial_flag);
+    if (write_all(fd1, cmd, strlen(cmd)) < 0 ||
+        read_until(fd1, "UX_PARTIAL_EXECUTED", out, sizeof(out), 5000) < 0 ||
+        access(partial_flag, F_OK) == 0) {
+        dump_excerpt("partial before detach", out);
+        goto out;
+    }
+    close(fd1);
+    fd1 = -1;
+    if (wait_console_detached(control, console1_stream, 5000) < 0 ||
+        access(partial_flag, F_OK) == 0) {
+        fprintf(stderr, "partial: detach or premature execution\n");
+        goto out;
+    }
+    if ((fd1 = wait_connect(c1, 5000)) < 0 ||
+        wait_console_stream_after(control, "console1", initial_conn,
+                                  console1_stream, 5000,
+                                  &console1_stream) < 0 ||
+        read_until(fd1, "LMUX_TEST_PROMPT> ", out, sizeof(out), 5000) < 0 ||
+        strstr(out, "UX_PARTIAL_EXECUTED") != NULL ||
+        access(partial_flag, F_OK) == 0 ||
+        write_all(fd1, "\n", 1) < 0 ||
+        read_until(fd1, "LMUX_TEST_PROMPT> ", out, sizeof(out), 5000) < 0 ||
+        access(partial_flag, F_OK) == 0) {
+        dump_excerpt("partial reset", out);
+        goto out;
+    }
+
+    where = "new command after reset executes once";
+    if (shell_cmd_expect(fd1, "printf 'AFTER_''RESET_ONCE\\n'",
+                         "AFTER_RESET_ONCE\r\nLMUX_TEST_PROMPT> ",
+                         out, sizeof(out)) < 0 ||
+        substring_count(out, "AFTER_RESET_ONCE\r\n") != 1)
+        goto out;
+
+    where = "completed command is not replayed";
+    close(fd1);
+    fd1 = -1;
+    if (wait_console_detached(control, console1_stream, 5000) < 0 ||
+        (fd1 = wait_connect(c1, 5000)) < 0 ||
+        wait_console_stream_after(control, "console1", initial_conn,
+                                  console1_stream, 5000,
+                                  &console1_stream) < 0 ||
+        write_all(fd1, "printf 'CURRENT_''LINE_ONLY\\n'\n",
+                  strlen("printf 'CURRENT_''LINE_ONLY\\n'\n")) < 0 ||
+        read_until(fd1, "\r\nCURRENT_LINE_ONLY\r\nLMUX_TEST_PROMPT> ",
+                   out, sizeof(out), 5000) < 0 ||
+        strstr(out, "LMUX2_READY") != NULL ||
+        strstr(out, "LMUX_TEST_PROMPT> ") == NULL)
+        goto out;
+
+    where = "detached transcript is not replayed";
+    snprintf(cmd, sizeof(cmd),
+             "read UX_DETACHED_VALUE < %s; printf '%%s\\n' \"$UX_DETACHED_VALUE\"; : > %s\n",
+             detached_fifo, detached_done);
+    if (write_all(fd1, cmd, strlen(cmd)) < 0 ||
+        read_until(fd1, "UX_DETACHED_VALUE", out, sizeof(out), 5000) < 0)
+        goto out;
+    close(fd1);
+    fd1 = -1;
+    if (wait_console_detached(control, console1_stream, 5000) < 0 ||
+        write_fifo_when_reader(detached_fifo, "DETACHED_OUTPUT_TOKEN\n", 5000) < 0 ||
+        wait_path_exists(detached_done, 5000) < 0 ||
+        (fd1 = wait_connect(c1, 5000)) < 0 ||
+        wait_console_stream_after(control, "console1", initial_conn,
+                                  console1_stream, 5000,
+                                  &console1_stream) < 0 ||
+        shell_cmd_expect(fd1, "printf 'DETACHED_CURRENT\\n'",
+                         "DETACHED_CURRENT", out, sizeof(out)) < 0 ||
+        strstr(out, "DETACHED_OUTPUT_TOKEN") != NULL)
+        goto out;
+
+    where = "active builtin survives attach and live output is exact";
+    snprintf(cmd, sizeof(cmd),
+             ": > %s; read UX_BOUNDARY_VALUE < %s; printf '%%s\\n' \"$UX_BOUNDARY_VALUE\"; "
+             "printf '%%s_END\\n' \"$UX_BOUNDARY_VALUE\"\n",
+             boundary_started, boundary_fifo);
+    if (write_all(fd1, cmd, strlen(cmd)) < 0 ||
+        wait_path_exists(boundary_started, 5000) < 0)
+        goto out;
+    close(fd1);
+    fd1 = -1;
+    if (wait_console_detached(control, console1_stream, 5000) < 0 ||
+        (fd1 = wait_connect(c1, 5000)) < 0 ||
+        write_fifo_when_reader(boundary_fifo, "BOUNDARY_OUTPUT_TOKEN\n", 5000) < 0 ||
+        wait_console_stream_after(control, "console1", initial_conn,
+                                  console1_stream, 5000,
+                                  &console1_stream) < 0 ||
+        read_until(fd1, "BOUNDARY_OUTPUT_TOKEN_END", out, sizeof(out), 5000) < 0 ||
+        substring_count(out, "BOUNDARY_OUTPUT_TOKEN\r\n") != 1) {
+        dump_excerpt("builtin attach boundary", out);
+        goto out;
+    }
+
+    where = "running shell builtin is not interrupted by attach";
+    snprintf(cmd, sizeof(cmd),
+             "printf 'BUILTIN_STARTED\\n'; "
+             "while [ ! -e %s ]; do :; done; printf 'BUILTIN_SURVIVED\\n'\n",
+             builtin_release);
+    if (write_all(fd1, cmd, strlen(cmd)) < 0 ||
+        read_until(fd1, "BUILTIN_STARTED\r\n", out, sizeof(out), 5000) < 0)
+        goto out;
+    close(fd1);
+    fd1 = -1;
+    if (wait_console_detached(control, console1_stream, 5000) < 0 ||
+        (fd1 = wait_connect(c1, 5000)) < 0 ||
+        wait_console_stream_after(control, "console1", initial_conn,
+                                  console1_stream, 5000,
+                                  &console1_stream) < 0 ||
+        write_text_file(builtin_release, "go\n", 0600) < 0 ||
+        read_until(fd1, "BUILTIN_SURVIVED\r\nLMUX_TEST_PROMPT> ",
+                   out, sizeof(out), 5000) < 0)
+        goto out;
+
+    where = "bounded detached output does not become scrollback";
+    snprintf(cmd, sizeof(cmd),
+             ": > %s; read UX_OVERFLOW_GO < %s; printf PTY_HISTORY_HEAD; "
+             "dd if=/dev/zero bs=20000 count=1 2>/dev/null | tr '\\000' X; "
+             "printf PTY_HISTORY_TAIL\\n; : > %s\n",
+             overflow_started, boundary_fifo, overflow_done);
+    if (write_all(fd1, cmd, strlen(cmd)) < 0 ||
+        wait_path_exists(overflow_started, 5000) < 0)
+        goto out;
+    close(fd1);
+    fd1 = -1;
+    if (wait_console_detached(control, console1_stream, 5000) < 0) {
+        fprintf(stderr, "overflow: stream did not detach\n");
+        goto out;
+    }
+    if (write_fifo_when_reader(boundary_fifo, "go\n", 5000) < 0) {
+        fprintf(stderr, "overflow: producer did not unblock\n");
+        goto out;
+    }
+    if (wait_path_exists(overflow_done, 10000) < 0) {
+        fprintf(stderr, "overflow: producer did not finish\n");
+        fd1 = wait_connect(c1, 2000);
+        if (fd1 >= 0) {
+            if (read_until(fd1, "PTY_HISTORY_TAIL", out, sizeof(out), 5000) < 0)
+                dump_excerpt("overflow stalled replay", out);
+            else
+                fprintf(stderr, "overflow: attaching released producer flag=%s len=%zu\n",
+                        access(overflow_done, F_OK) == 0 ? "yes" : "no",
+                        strlen(out));
+        }
+        goto out;
+    }
+    fd1 = wait_connect(c1, 5000);
+    if (fd1 < 0) {
+        fprintf(stderr, "overflow: reconnect failed\n");
+        goto out;
+    }
+    if (wait_console_stream_after(control, "console1", initial_conn,
+                                  console1_stream, 5000,
+                                  &console1_stream) < 0) {
+        fprintf(stderr, "overflow: stream did not reattach\n");
+        goto out;
+    }
+    if (shell_cmd_expect(fd1, "printf 'OVERFLOW_CURRENT\\n'",
+                         "OVERFLOW_CURRENT", out, sizeof(out)) < 0 ||
+        strstr(out, "PTY_HISTORY_HEAD") != NULL ||
+        strstr(out, "PTY_HISTORY_TAIL") != NULL || strlen(out) > 4096) {
+        fprintf(stderr, "overflow: replayed transcript head=%s tail=%s len=%zu\n",
+                strstr(out, "PTY_HISTORY_HEAD") ? "yes" : "no",
+                strstr(out, "PTY_HISTORY_TAIL") ? "yes" : "no", strlen(out));
+        goto out;
+    }
+
+    where = "ansi raw mode receives no attach input";
+    snprintf(cmd, sizeof(cmd),
+             "stty raw -echo; printf '\\033[2J\\033[2;1HRAW_MODE_TOKEN\\033[?25h'; "
+             "dd bs=1 count=3 of=%s 2>/dev/null; stty sane; "
+             "printf '\\r\\nRAW_MODE_DONE\\r\\n'\n", raw_file);
+    if (write_all(fd1, cmd, strlen(cmd)) < 0 ||
+        read_until(fd1, "\033[2J\033[2;1HRAW_MODE_TOKEN\033[?25h",
+                   out, sizeof(out), 5000) < 0)
+        goto out;
+    close(fd1);
+    fd1 = -1;
+    if (wait_console_detached(control, console1_stream, 5000) < 0 ||
+        (fd1 = wait_connect(c1, 5000)) < 0 ||
+        wait_console_stream_after(control, "console1", initial_conn,
+                                  console1_stream, 5000,
+                                  &console1_stream) < 0 ||
+        write_all(fd1, "abc", 3) < 0 ||
+        read_until(fd1, "RAW_MODE_DONE", out, sizeof(out), 5000) < 0 ||
+        strstr(out, "RAW_MODE_TOKEN") != NULL ||
+        file_equals(raw_file, "abc") < 0)
+        goto out;
+
     where = "detach preserves shell";
     close(fd1);
     fd1 = wait_connect(c1, 5000);
@@ -575,13 +919,49 @@ static int integration_test(void)
 
     where = "console2 listener";
     fd2 = wait_connect(c2, 10000);
-    if (fd2 < 0)
+    if (fd2 < 0 ||
+        wait_console_stream_after(control, "console2", initial_conn, 0, 5000,
+                                  &console2_stream) < 0)
         goto out;
     if (shell_cmd_expect(fd2, "printf 'P''ID2:%s\\n' \"$$\"", "PID2:", out, sizeof(out)) < 0)
         goto out;
     pid2 = parse_pid_marker(out, "PID2:");
     if (pid2 <= 0 || pid2 == pid1)
         goto out;
+
+    where = "continuous producer starts";
+    if (write_all(fd1, "yes PTY_SPAM\n", strlen("yes PTY_SPAM\n")) < 0)
+        goto out;
+    if (read_until(fd1, "\r\nPTY_SPAM\r\n", out, sizeof(out), 5000) < 0) {
+        dump_excerpt("continuous producer start", out);
+        goto out;
+    }
+    close(fd1);
+    fd1 = -1;
+    where = "continuous producer detaches";
+    if (wait_console_detached(control, console1_stream, 5000) < 0)
+        goto out;
+    where = "detached continuous output preserves poll fairness";
+    if (shell_cmd_expect(fd2, "printf 'PTY_FAIRNESS_OK\\n'",
+                         "PTY_FAIRNESS_OK", out, sizeof(out)) < 0) {
+        dump_excerpt("console2 fairness", out);
+        goto out;
+    }
+    where = "continuous producer reattaches";
+    if ((fd1 = wait_connect(c1, 5000)) < 0 ||
+        wait_console_stream_after(control, "console1", initial_conn,
+                                  console1_stream, 5000,
+                                  &console1_stream) < 0 ||
+        read_until(fd1, "PTY_SPAM\r\n", out, sizeof(out), 5000) < 0 ||
+        write_all(fd1, "\003", 1) < 0)
+        goto out;
+    where = "continuous producer interrupt reaches prompt";
+    if (read_until_rolling(fd1, "LMUX_TEST_PROMPT> ",
+                           out, sizeof(out), 5000) < 0) {
+        dump_excerpt("continuous producer interrupt", out);
+        goto out;
+    }
+
     host_fd_base = count_fds(host);
     target_fd_base = count_fds(target);
 
@@ -596,17 +976,36 @@ static int integration_test(void)
 
     where = "console1 churn while console2 alive";
     for (int i = 0; i < 100; i++) {
+        char churn_cmd[96], churn_marker[48], churn_done[96], previous_marker[48];
+        snprintf(churn_marker, sizeof(churn_marker), "C1OK_%03d", i);
+        snprintf(churn_done, sizeof(churn_done),
+                 "%s\r\nLMUX_TEST_PROMPT> ", churn_marker);
+        if (i > 0)
+            snprintf(previous_marker, sizeof(previous_marker),
+                     "C1OK_%03d", i - 1);
+        snprintf(churn_cmd, sizeof(churn_cmd),
+                 "printf 'C1OK_''%03d\\n'", i);
         close(fd1);
         fd1 = -1;
         if (reconnect_console_expect(c1, control, "console1", initial_conn,
                                      &console1_stream,
-                                     "printf 'C1''OK\\n'", "C1OK",
+                                     churn_cmd, churn_done,
                                      out, sizeof(out), &fd1, 5000) < 0) {
             fprintf(stderr, "churn iteration failed: %d fd=%d\n", i, fd1);
             dump_excerpt("churn console1", out);
             goto out;
         }
+        if ((i > 0 && strstr(out, previous_marker) != NULL) ||
+            strlen(out) > 1024) {
+            fprintf(stderr, "churn replayed old transcript at iteration %d\n", i);
+            dump_excerpt("churn transcript", out);
+            goto out;
+        }
     }
+    if (shell_cmd_expect(fd1, "printf 'P''ID1CHURN:%s\\n' \"$$\"",
+                         "PID1CHURN:", out, sizeof(out)) < 0 ||
+        parse_pid_marker(out, "PID1CHURN:") != pid1)
+        goto out;
     if (shell_cmd_expect(fd2, "printf 'C2''OK:%s\\n' \"$$\"", "C2OK:", out, sizeof(out)) < 0 ||
         parse_pid_marker(out, "C2OK:") != pid2)
         goto out;
@@ -747,6 +1146,8 @@ out:
     stop_child(host);
     stop_child(target);
     unlink(carrier); unlink(c1); unlink(c2); unlink(c1_bad); unlink(control);
+    unlink(shell1); unlink(shell2); unlink(partial_flag); unlink(detached_fifo); unlink(detached_done);
+    unlink(boundary_fifo); unlink(boundary_started); unlink(overflow_started); unlink(overflow_done); unlink(raw_file);
     rmdir(dir);
     return rc ? fail(where) : 0;
 }

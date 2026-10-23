@@ -100,6 +100,11 @@ Implemented tools:
 lmux_status
 file_put
 file_get
+file_put_start
+file_get_start
+file_operation_status
+file_operation_wait
+file_operation_cancel
 command_start
 command_status
 command_read
@@ -127,6 +132,57 @@ debug_memory_read
 debug_detach
 debug_stop
 ```
+
+`debug_memory_read` accepts an optional `format`:
+
+- omitted or `base64`: the compatible `{base64, bytes}` response;
+- `hex`: `{address, hex, bytes}` with a 16-byte-per-line address/hex/ASCII dump;
+- `both`: `{address, hex, base64, bytes}`.
+
+The `address` in formatted responses is the actual starting address resolved by
+GDB, not merely the caller's expression. Reads remain bounded to 64 KiB, which
+also bounds the expanded `hex` and `both` responses. Formatting is performed
+inside `lmux-mcp`; no shell or external dump utility is used.
+
+`file_put` and `file_get` keep their convenient wait-for-completion behavior
+for short transfers. They accept an optional caller-generated `request_token`;
+when omitted, MCP creates an internal token for compatibility. For a transfer
+that may outlive an MCP tool deadline, choose a unique token before the call and
+pass it to `file_put_start` or `file_get_start`:
+
+```json
+{"local_source":"/host/image.bin","target_destination":"/tmp/image.bin","request_token":"agent-job-42-image"}
+```
+
+The asynchronous START tools require this token. Retain the token even if the
+whole tool response is lost. Recover with
+`file_operation_status(request_token=...)`, which finds both RUNNING and
+retained terminal operations, then use the returned opaque decimal
+`operation_id` for WAIT or CANCEL. Repeating START with the same token and
+identical parameters returns the same operation; different parameters are an
+explicit conflict. `file_operation_cancel` returns `CANCELLED` only after
+the host daemon has closed and released the active FILE stream. If the cancel
+request itself loses its HC2 connection, its result is deliberately reported as
+unknown; query status after reconnect instead of repeating the transfer.
+
+`file_operation_wait` defaults to 15 seconds, is capped at 20 seconds, and
+shortens itself when the MCP request context exposes an earlier deadline. It
+reserves 1.5 seconds for the final HC2 status round trip and MCP response. A
+local wait expiry returns `RUNNING` with `wait_timed_out=true`; MCP cancellation
+remains a cancellation and never cancels the daemon-owned FILE operation.
+
+FILE operation IDs are decimal strings in MCP JSON. The synchronous `file_put`
+and `file_get` results retain the deprecated `file_op_id` compatibility field,
+but it too is a string and is identical to the canonical `operation_id`.
+Callers must not coerce either field to a JavaScript `Number`; pass the string
+unchanged to STATUS, WAIT, or CANCEL.
+
+Idempotency records share the bounded eight-operation daemon history. After
+eviction or daemon restart, token lookup returns `UNKNOWN` with
+`outcome_ambiguous=true`. This is not evidence that START did not execute and
+must not trigger an automatic retry. The namespace is the random current MCP
+session ID, so recovery survives HC2 reconnect but not `lmux-mcp` process/session
+replacement.
 
 `debug_interrupt` returns when host GDB accepts/sends the interrupt request over
 the remote protocol. It does not by itself prove the inferior stopped; use

@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 static int split_unix_arg(const char *arg, char *name, char *host_path, char *target_path)
@@ -259,13 +260,25 @@ static int desired_matches_service(const struct v2_desired *d, const struct v2_h
 
 void v2_host_init(struct v2_host *h)
 {
+    uint64_t file_id_seed = 0;
+    int random_fd;
     memset(h, 0, sizeof(*h));
     h->control_listen_fd = -1;
     h->control_fd = -1;
     h->structured_listen_fd = -1;
     h->structured_fd = -1;
     h->structured_next_ref = 1;
-    h->structured_next_file_op_id = 1;
+    random_fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (random_fd >= 0) {
+        if (read(random_fd, &file_id_seed, sizeof(file_id_seed)) !=
+            (ssize_t)sizeof(file_id_seed))
+            file_id_seed = 0;
+        close(random_fd);
+    }
+    if (!file_id_seed)
+        file_id_seed = ((uint64_t)(uint32_t)getpid() << 32) ^
+            (uint64_t)time(NULL) ^ 0x46494c45u;
+    h->structured_next_file_op_id = file_id_seed ? file_id_seed : 1;
     h->structured_file_fd = -1;
     h->next_req_id = 0;
     h->boot_next_request_id = 1;

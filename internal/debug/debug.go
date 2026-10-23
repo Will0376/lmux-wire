@@ -49,6 +49,13 @@ type Config struct {
 	CommandActiveFunc       func() int
 }
 
+// MemoryReadResult is the raw result of one bounded GDB/MI memory read.  The
+// MCP presentation layer decides how to represent Data to its caller.
+type MemoryReadResult struct {
+	Address string
+	Data    []byte
+}
+
 type Manager struct {
 	cfg     Config
 	hc      HC2
@@ -209,6 +216,21 @@ func NewManager(cfg Config, hc HC2, journal JournalFunc) *Manager {
 		cfg.MaxSessions = cfg.TargetExecCap
 	}
 	return &Manager{cfg: cfg, hc: hc, journal: journal, sessions: map[string]*Session{}, byRef: map[uint64]*Session{}}
+}
+
+// SetHC replaces the transport after the local structured-control client
+// reconnects. Sessions remain host-owned and may reattach through the new HC2
+// connection.
+func (m *Manager) SetHC(hc HC2) {
+	m.mu.Lock()
+	m.hc = hc
+	m.mu.Unlock()
+}
+
+func (m *Manager) hcClient() HC2 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.hc
 }
 
 func (m *Manager) Capabilities() map[string]any {
@@ -378,7 +400,7 @@ func (s *Session) start(ctx context.Context) error {
 	}
 	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	fr, err := s.mgr.hc.Request(cctx, hc2.TypeExecStart, p)
+	fr, err := s.mgr.hcClient().Request(cctx, hc2.TypeExecStart, p)
 	if err != nil {
 		var hc2Err *hc2.Error
 		if errors.As(err, &hc2Err) && hc2Err.Code == hc2.ErrNotFound {
@@ -1126,25 +1148,28 @@ func (s *Session) Registers(ctx context.Context) (map[string]any, error) {
 	return map[string]any{"raw": rec.Results}, nil
 }
 
-func (s *Session) MemoryRead(ctx context.Context, expr string, length int) (map[string]any, error) {
+func (s *Session) MemoryRead(ctx context.Context, expr string, length int) (MemoryReadResult, error) {
 	if length <= 0 || length > MaxMemoryRead {
-		return nil, errors.New("INVALID_ARGUMENT: length out of range")
+		return MemoryReadResult{}, errors.New("INVALID_ARGUMENT: length out of range")
 	}
 	rec, err := s.gdb.Command(ctx, fmt.Sprintf("-data-read-memory-bytes %s %d", miQuote(expr), length))
 	if err != nil {
-		return nil, err
+		return MemoryReadResult{}, err
 	}
 	v, _ := rec.Result("memory")
-	var hexData string
+	var address, hexData string
 	if len(v.List) > 0 {
 		for _, kv := range v.List[0].Tuple {
-			if kv.Key == "contents" {
+			switch kv.Key {
+			case "begin":
+				address = kv.Value.StringValue()
+			case "contents":
 				hexData = kv.Value.StringValue()
 			}
 		}
 	}
 	b, _ := hex.DecodeString(hexData)
-	return map[string]any{"base64": base64.StdEncoding.EncodeToString(b), "bytes": len(b)}, nil
+	return MemoryReadResult{Address: address, Data: b}, nil
 }
 
 func (s *Session) Wait(ctx context.Context, timeout time.Duration) map[string]any {
@@ -1304,7 +1329,7 @@ func (s *Session) writeTargetStdin() {
 		}
 		readyGen := s.stdinReadyGeneration()
 		cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		_, err := s.mgr.hc.Request(cctx, hc2.TypeExecStdinData, mustStdinPayload(s.ExecRef, chunk))
+		_, err := s.mgr.hcClient().Request(cctx, hc2.TypeExecStdinData, mustStdinPayload(s.ExecRef, chunk))
 		cancel()
 		if err == nil {
 			s.addTargetTx(len(chunk))
@@ -1858,7 +1883,7 @@ func (s *Session) cleanupAttachInferior(ctx context.Context, gdb *gdbmi.Process,
 
 func (s *Session) requestExecStdinClose(ctx context.Context, ref uint64) bool {
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	_, err := s.mgr.hc.Request(cctx, hc2.TypeExecStdinClose, hc2.U64Payload(ref))
+	_, err := s.mgr.hcClient().Request(cctx, hc2.TypeExecStdinClose, hc2.U64Payload(ref))
 	cancel()
 	return err == nil
 }
@@ -1881,11 +1906,11 @@ func (s *Session) waitExecDone(ctx context.Context, d time.Duration) bool {
 
 func (s *Session) forceTerminateExec(ctx context.Context, ref uint64) {
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	_, _ = s.mgr.hc.Request(cctx, hc2.TypeExecSignal, hc2.SignalPayload(ref, hc2.SigTERM))
+	_, _ = s.mgr.hcClient().Request(cctx, hc2.TypeExecSignal, hc2.SignalPayload(ref, hc2.SigTERM))
 	cancel()
 	if !s.waitExecDone(ctx, 500*time.Millisecond) {
 		cctx, cancel = context.WithTimeout(ctx, 2*time.Second)
-		_, _ = s.mgr.hc.Request(cctx, hc2.TypeExecSignal, hc2.SignalPayload(ref, hc2.SigKILL))
+		_, _ = s.mgr.hcClient().Request(cctx, hc2.TypeExecSignal, hc2.SignalPayload(ref, hc2.SigKILL))
 		cancel()
 		_ = s.waitExecDone(ctx, 500*time.Millisecond)
 	}
@@ -1894,7 +1919,7 @@ func (s *Session) forceTerminateExec(ctx context.Context, ref uint64) {
 
 func (s *Session) releaseExec(ctx context.Context, ref uint64) {
 	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	_, _ = s.mgr.hc.Request(cctx, hc2.TypeExecRelease, hc2.U64Payload(ref))
+	_, _ = s.mgr.hcClient().Request(cctx, hc2.TypeExecRelease, hc2.U64Payload(ref))
 	cancel()
 }
 

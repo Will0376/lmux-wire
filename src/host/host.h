@@ -83,6 +83,30 @@ struct v2_target_service_status {
 
 #define V2_HOST_STRUCTURED_MAX_EXECS V2_EXEC_MAX_RUNNING
 #define V2_HOST_STRUCTURED_CTL_QUEUE_MAX 8
+#define V2_HOST_STRUCTURED_FILE_HISTORY 8
+#define V2_HOST_STRUCTURED_FILE_ERROR_MAX 160
+#define V2_HOST_STRUCTURED_FILE_NAMESPACE_MAX 64
+#define V2_HOST_STRUCTURED_FILE_TOKEN_MAX 128
+
+struct v2_host_structured_file_operation {
+    int used;
+    uint64_t op_id;
+    uint64_t local_conn;
+    uint64_t peer_conn;
+    uint64_t incarnation;
+    uint64_t bytes;
+    uint64_t total;
+    uint32_t error_code;
+    uint8_t kind;
+    uint8_t state;
+    uint8_t total_known;
+    uint8_t digest[32];
+    char error[V2_HOST_STRUCTURED_FILE_ERROR_MAX];
+    char local_path[LXF_PATH_MAX];
+    char target_path[LXF_PATH_MAX];
+    char request_namespace[V2_HOST_STRUCTURED_FILE_NAMESPACE_MAX];
+    char request_token[V2_HOST_STRUCTURED_FILE_TOKEN_MAX];
+};
 
 struct v2_host_structured_exec {
     int used;
@@ -175,6 +199,8 @@ struct v2_host {
     int structured_control_queue_len;
     struct v2_host_structured_exec structured_execs[V2_HOST_STRUCTURED_MAX_EXECS];
     uint64_t structured_next_file_op_id;
+    struct v2_host_structured_file_operation
+        structured_file_operations[V2_HOST_STRUCTURED_FILE_HISTORY];
     uint64_t structured_file_op_id;
     uint64_t structured_file_req_id;
     uint64_t structured_file_stream;

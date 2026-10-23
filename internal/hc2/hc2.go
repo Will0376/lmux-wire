@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,34 +22,41 @@ const (
 	HeaderLen         = 24
 	MaxPayload        = 4096
 
-	TypeClientHello    uint16 = 1
-	TypeServerHello    uint16 = 2
-	TypeError          uint16 = 3
-	TypeStatusRequest  uint16 = 10
-	TypeStatusReply    uint16 = 11
-	TypeExecStart      uint16 = 20
-	TypeExecStarted    uint16 = 21
-	TypeExecAttach     uint16 = 22
-	TypeExecStatus     uint16 = 23
-	TypeExecStdinData  uint16 = 24
-	TypeExecStdinClose uint16 = 25
-	TypeExecSignal     uint16 = 26
-	TypeExecRelease    uint16 = 27
-	TypeExecStdout     uint16 = 40
-	TypeExecStderr     uint16 = 41
-	TypeExecState      uint16 = 42
-	TypeExecLost       uint16 = 43
-	TypeExecStdinReady uint16 = 44
-	TypeFilePutStart   uint16 = 60
-	TypeFileGetStart   uint16 = 61
-	TypeFileStarted    uint16 = 62
-	TypeFileDone       uint16 = 63
-	TypeFileError      uint16 = 64
-	TypeFileProgress   uint16 = 65
+	TypeClientHello            uint16 = 1
+	TypeServerHello            uint16 = 2
+	TypeError                  uint16 = 3
+	TypeStatusRequest          uint16 = 10
+	TypeStatusReply            uint16 = 11
+	TypeExecStart              uint16 = 20
+	TypeExecStarted            uint16 = 21
+	TypeExecAttach             uint16 = 22
+	TypeExecStatus             uint16 = 23
+	TypeExecStdinData          uint16 = 24
+	TypeExecStdinClose         uint16 = 25
+	TypeExecSignal             uint16 = 26
+	TypeExecRelease            uint16 = 27
+	TypeExecStdout             uint16 = 40
+	TypeExecStderr             uint16 = 41
+	TypeExecState              uint16 = 42
+	TypeExecLost               uint16 = 43
+	TypeExecStdinReady         uint16 = 44
+	TypeFilePutStart           uint16 = 60
+	TypeFileGetStart           uint16 = 61
+	TypeFileStarted            uint16 = 62
+	TypeFileDone               uint16 = 63
+	TypeFileError              uint16 = 64
+	TypeFileProgress           uint16 = 65
+	TypeFileStatus             uint16 = 66
+	TypeFileCancel             uint16 = 67
+	TypeFileState              uint16 = 68
+	TypeFilePutStartIdempotent uint16 = 69
+	TypeFileGetStartIdempotent uint16 = 70
+	TypeFileStatusToken        uint16 = 71
 
-	CapStatus uint32 = 1 << 0
-	CapExec   uint32 = 1 << 1
-	CapFile   uint32 = 1 << 2
+	CapStatus        uint32 = 1 << 0
+	CapExec          uint32 = 1 << 1
+	CapFile          uint32 = 1 << 2
+	CapFileLifecycle uint32 = 1 << 3
 
 	ErrOK                 uint32 = 0
 	ErrInvalidArgument    uint32 = 1
@@ -67,6 +75,12 @@ const (
 	SigTERM byte = 2
 	SigKILL byte = 3
 	SigHUP  byte = 4
+
+	FileRunning   byte = 1
+	FileDoneState byte = 2
+	FileFailed    byte = 3
+	FileCancelled byte = 4
+	FileLost      byte = 5
 )
 
 type Frame struct {
@@ -145,6 +159,24 @@ type FileStarted struct {
 	OpID          uint64
 	Kind          byte
 	ExpectedBytes uint64
+	Incarnation   uint64
+}
+
+type FileOperation struct {
+	OpID        uint64
+	LocalConn   uint64
+	PeerConn    uint64
+	Incarnation uint64
+	Bytes       uint64
+	Total       uint64
+	ErrorCode   uint32
+	Kind        byte
+	State       byte
+	TotalKnown  bool
+	SHA256      [32]byte
+	Error       string
+	LocalPath   string
+	TargetPath  string
 }
 
 type FileDone struct {
@@ -231,6 +263,12 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
+func (c *Client) Closed() (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed, c.err
+}
+
 func (c *Client) nextID() uint64 {
 	id := c.nextReq.Add(1)
 	if id == 0 {
@@ -255,6 +293,8 @@ func (c *Client) Request(ctx context.Context, typ uint16, payload []byte) (Frame
 	c.mu.Unlock()
 	if err := c.writeFrame(Frame{Type: typ, RequestID: req, Payload: payload}); err != nil {
 		c.forget(req)
+		_ = c.conn.Close()
+		c.closeWith(err)
 		return Frame{}, err
 	}
 	for {
@@ -264,7 +304,11 @@ func (c *Client) Request(ctx context.Context, typ uint16, payload []byte) (Frame
 			return Frame{}, ctx.Err()
 		case fr, ok := <-ch:
 			if !ok {
-				return Frame{}, io.ErrClosedPipe
+				_, err := c.Closed()
+				if err == nil {
+					err = io.ErrClosedPipe
+				}
+				return Frame{}, err
 			}
 			if fr.Type == TypeError {
 				e := DecodeError(fr.Payload)
@@ -526,6 +570,41 @@ func EncodeTwoStrings(a, b string) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+func EncodeFileStart(requestNamespace, requestToken, a, b string) ([]byte, error) {
+	var buf bytes.Buffer
+	for _, s := range []string{requestNamespace, requestToken, a, b} {
+		if s == "" || strings.IndexByte(s, 0) >= 0 {
+			return nil, errors.New("FILE request fields must be non-empty and contain no NUL")
+		}
+		if err := EncodeString(&buf, s); err != nil {
+			return nil, err
+		}
+	}
+	if len(requestNamespace) >= 64 || len(requestToken) >= 128 {
+		return nil, errors.New("FILE request namespace or token too long")
+	}
+	if buf.Len() > MaxPayload {
+		return nil, errors.New("FILE start request too large")
+	}
+	return buf.Bytes(), nil
+}
+
+func EncodeFileToken(requestNamespace, requestToken string) ([]byte, error) {
+	var buf bytes.Buffer
+	for _, s := range []string{requestNamespace, requestToken} {
+		if s == "" || strings.IndexByte(s, 0) >= 0 {
+			return nil, errors.New("FILE request namespace and token are required")
+		}
+		if err := EncodeString(&buf, s); err != nil {
+			return nil, err
+		}
+	}
+	if len(requestNamespace) >= 64 || len(requestToken) >= 128 {
+		return nil, errors.New("FILE request namespace or token too long")
+	}
+	return buf.Bytes(), nil
+}
+
 func U64Payload(v uint64) []byte {
 	var p [8]byte
 	binary.LittleEndian.PutUint64(p[:], v)
@@ -553,11 +632,46 @@ func ParseFileStarted(p []byte) (FileStarted, bool) {
 	if len(p) < 24 {
 		return FileStarted{}, false
 	}
-	return FileStarted{
+	s := FileStarted{
 		OpID:          binary.LittleEndian.Uint64(p[:8]),
 		Kind:          p[8],
 		ExpectedBytes: binary.LittleEndian.Uint64(p[16:24]),
-	}, true
+	}
+	if len(p) >= 32 {
+		s.Incarnation = binary.LittleEndian.Uint64(p[24:32])
+	}
+	return s, true
+}
+
+func ParseFileOperation(p []byte) (FileOperation, bool) {
+	if len(p) < 96 {
+		return FileOperation{}, false
+	}
+	var op FileOperation
+	op.OpID = binary.LittleEndian.Uint64(p[0:8])
+	op.LocalConn = binary.LittleEndian.Uint64(p[8:16])
+	op.PeerConn = binary.LittleEndian.Uint64(p[16:24])
+	op.Incarnation = binary.LittleEndian.Uint64(p[24:32])
+	op.Bytes = binary.LittleEndian.Uint64(p[32:40])
+	op.Total = binary.LittleEndian.Uint64(p[40:48])
+	op.ErrorCode = binary.LittleEndian.Uint32(p[48:52])
+	op.Kind = p[52]
+	op.State = p[53]
+	op.TotalKnown = p[54] != 0
+	copy(op.SHA256[:], p[64:96])
+	errorLen := int(binary.LittleEndian.Uint16(p[56:58]))
+	localLen := int(binary.LittleEndian.Uint16(p[58:60]))
+	targetLen := int(binary.LittleEndian.Uint16(p[60:62]))
+	if errorLen+localLen+targetLen > len(p)-96 {
+		return FileOperation{}, false
+	}
+	off := 96
+	op.Error = string(p[off : off+errorLen])
+	off += errorLen
+	op.LocalPath = string(p[off : off+localLen])
+	off += localLen
+	op.TargetPath = string(p[off : off+targetLen])
+	return op, op.OpID != 0
 }
 
 func ParseFileDone(p []byte) (FileDone, bool) {

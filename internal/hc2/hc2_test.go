@@ -82,8 +82,53 @@ func TestEncodeRequests(t *testing.T) {
 	if !bytes.Contains(p, []byte("/target/b")) {
 		t.Fatalf("encoded payload missing path")
 	}
+	p, err = EncodeFileStart("session-a", "caller-token", "/host/a", "/target/b")
+	if err != nil || !bytes.Contains(p, []byte("caller-token")) {
+		t.Fatalf("bad idempotent FILE start payload: %x, %v", p, err)
+	}
+	p, err = EncodeFileToken("session-a", "caller-token")
+	if err != nil || !bytes.Contains(p, []byte("caller-token")) {
+		t.Fatalf("bad FILE token lookup payload: %x, %v", p, err)
+	}
+	if _, err := EncodeFileStart("session-a", "", "/host/a", "/target/b"); err == nil {
+		t.Fatal("empty FILE request token accepted")
+	}
 	if _, err := StdinPayload(1, make([]byte, MaxPayload)); err == nil {
 		t.Fatalf("oversized stdin accepted")
+	}
+}
+
+func TestParseFileOperation(t *testing.T) {
+	p := make([]byte, 96)
+	binary.LittleEndian.PutUint64(p[0:8], 91)
+	binary.LittleEndian.PutUint64(p[8:16], 101)
+	binary.LittleEndian.PutUint64(p[16:24], 102)
+	binary.LittleEndian.PutUint64(p[24:32], 7)
+	binary.LittleEndian.PutUint64(p[32:40], 4096)
+	binary.LittleEndian.PutUint64(p[40:48], 8192)
+	p[52], p[53], p[54] = 1, FileRunning, 1
+	errorText, local, target := "", "/host/source", "/target/destination"
+	binary.LittleEndian.PutUint16(p[56:58], uint16(len(errorText)))
+	binary.LittleEndian.PutUint16(p[58:60], uint16(len(local)))
+	binary.LittleEndian.PutUint16(p[60:62], uint16(len(target)))
+	p = append(p, errorText...)
+	p = append(p, local...)
+	p = append(p, target...)
+	op, ok := ParseFileOperation(p)
+	if !ok || op.OpID != 91 || op.State != FileRunning ||
+		!op.TotalKnown || op.Bytes != 4096 || op.Total != 8192 ||
+		op.LocalPath != local || op.TargetPath != target ||
+		op.Incarnation != 7 {
+		t.Fatalf("bad FILE_STATE decode: %+v ok=%v", op, ok)
+	}
+	binary.LittleEndian.PutUint64(p[0:8], ^uint64(0))
+	maxOp, ok := ParseFileOperation(p)
+	if !ok || maxOp.OpID != ^uint64(0) {
+		t.Fatalf("max uint64 FILE operation ID lost in HC2 decode: %+v ok=%v", maxOp, ok)
+	}
+	p[56], p[57] = 0xff, 0xff
+	if _, ok := ParseFileOperation(p); ok {
+		t.Fatal("accepted truncated FILE_STATE strings")
 	}
 }
 

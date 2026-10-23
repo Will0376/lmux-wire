@@ -565,10 +565,13 @@ STDOUT
 STDERR
 
 FILE_PUT_START
-FILE_PUT_DONE
 FILE_GET_START
-FILE_GET_DONE
-FILE_ERROR
+FILE_OPERATION_START
+FILE_OPERATION_PROGRESS
+FILE_OPERATION_DONE
+FILE_OPERATION_FAILED
+FILE_OPERATION_CANCELLED
+FILE_OPERATION_LOST
 
 LMUX_CONNECTED
 LMUX_DISCONNECTED
@@ -909,7 +912,7 @@ The caller may decide to continue from `earliest_cursor`.
 MCP file tools use the existing FILE service. They must not reimplement file
 transfer through shell, exec, base64, or private exec.
 
-Implemented v1 tools:
+The original blocking tools remain available:
 
 ```text
 file_put(local_source, target_destination)
@@ -919,7 +922,52 @@ file_get(target_source, local_destination)
 The FILE service already provides PUT/GET and SHA-verified transfers in the
 LMUX stack. MCP surfaces those operations through the host internal API and
 waits for structured FILE completion before returning byte count and SHA256.
-It should not become a general remote filesystem RPC framework.
+They now honor the MCP request context. If that context expires after start,
+the returned error includes the operation ID and explicitly says to query
+status before retrying; the daemon-owned transfer is not automatically retried
+or implicitly cancelled.
+
+Post-1.0 long-running helpers are:
+
+```text
+file_put_start(local_source, target_destination, request_token)
+file_get_start(target_source, local_destination, request_token)
+file_operation_status(operation_id | request_token)
+file_operation_wait(operation_id, timeout_ms)
+file_operation_cancel(operation_id)
+```
+
+`request_token` is caller-supplied and known before START. The host key is the
+pair of the private MCP session namespace and this token. A retained duplicate
+with identical direction and paths returns the original operation; a parameter
+conflict is rejected. Status by token finds RUNNING and retained terminal
+results, including when the START response was lost. Status with neither ID nor
+token remains an active-operation diagnostic only.
+
+`operation_id` is an opaque decimal string in MCP JSON so a 64-bit ID is never
+rounded by a JSON/JavaScript client. Status returns direction, paths, `RUNNING |
+DONE | FAILED | CANCELLED | LOST`, byte progress, total size when known, LMUX
+incarnation, and the terminal error or SHA256. Wait defaults to 15 seconds, is
+capped at 20 seconds, accounts for the MCP context deadline with a response
+reserve, and uses terminal notifications plus an authoritative final status
+read instead of busy polling. Local expiry returns `RUNNING` plus
+`wait_timed_out=true`. Cancel returns the authoritative state; a transport
+failure during cancel is reported as an unknown cancellation result.
+
+The synchronous `file_put` and `file_get` results retain `file_op_id` as a
+deprecated compatibility alias. In 1.0.1 it is also a decimal JSON string,
+identical to `operation_id`; consumers must not expect a JSON number. New code
+should use `operation_id`. This type correction prevents JavaScript-style JSON
+consumers from rounding randomly seeded 64-bit operation IDs above `2^53-1`.
+
+Keyed results use the bounded eight-entry daemon history. Lookup after eviction
+or daemon restart returns `UNKNOWN`, `outcome_ambiguous=true`, and a warning;
+absence must not be treated as permission to retry. The guarantee survives HC2
+reconnect within one MCP/daemon lifetime, not process restart. A concurrent
+start `BUSY` diagnostic includes the active operation ID.
+
+These tools use the same host FILE engine and target LXF service. They do not
+create a general remote filesystem RPC framework.
 
 Optional future helpers may expose remote SHA/status if supported cleanly by
 the existing FILE service or a documented extension. P9 does not require a new
@@ -1022,6 +1070,11 @@ lmux_status
 
 file_put
 file_get
+file_put_start
+file_get_start
+file_operation_status
+file_operation_wait
+file_operation_cancel
 
 command_start
 command_status

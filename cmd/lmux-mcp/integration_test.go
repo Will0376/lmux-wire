@@ -6,11 +6,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -36,6 +38,13 @@ func TestMCPProcessIntegration(t *testing.T) {
 
 	sup := startCmd(t, root, "build/host/lmuxd", "--supervisor", "--carrier-listen", carrier)
 	defer stopCmd(sup)
+	workerPID := waitChildPID(t, sup.Process.Pid, 10*time.Second)
+	workerStopped := false
+	defer func() {
+		if workerStopped {
+			_ = syscall.Kill(workerPID, syscall.SIGCONT)
+		}
+	}()
 	host := startCmd(t, root, "build/host/lmuxd", "--role", "host",
 		"--carrier-connect", carrier,
 		"--control", control,
@@ -56,6 +65,11 @@ func TestMCPProcessIntegration(t *testing.T) {
 	}
 	if !hasTool(tools, "debug_capabilities") {
 		t.Fatalf("tools/list missing debug_capabilities: %+v", tools.Tools)
+	}
+	for _, name := range []string{"file_put_start", "file_get_start", "file_operation_status", "file_operation_wait", "file_operation_cancel"} {
+		if !hasTool(tools, name) {
+			t.Fatalf("tools/list missing %s: %+v", name, tools.Tools)
+		}
 	}
 	status := callTool(t, mcpSession, "lmux_status", map[string]any{})
 	if !strings.Contains(mustJSON(status), "__exec") {
@@ -117,13 +131,101 @@ func TestMCPProcessIntegration(t *testing.T) {
 	if put["sha256"] != hex.EncodeToString(wantSum[:]) {
 		t.Fatalf("bad put sha: %v want %s", put, hex.EncodeToString(wantSum[:]))
 	}
+	if opID, ok := put["operation_id"].(string); !ok || opID == "" || put["file_op_id"] != opID {
+		t.Fatalf("PUT operation IDs are not identical decimal strings: %v", put)
+	}
 	get := callTool(t, mcpSession, "file_get", map[string]any{"target_source": target, "local_destination": localDst})
 	if get["sha256"] != hex.EncodeToString(wantSum[:]) {
 		t.Fatalf("bad get sha: %v want %s", get, hex.EncodeToString(wantSum[:]))
 	}
+	if opID, ok := get["operation_id"].(string); !ok || opID == "" || get["file_op_id"] != opID {
+		t.Fatalf("GET operation IDs are not identical decimal strings: %v", get)
+	}
 	got, err := os.ReadFile(localDst)
 	if err != nil || !bytes.Equal(got, data) {
 		t.Fatalf("bad get content err=%v", err)
+	}
+
+	largeSrc := filepath.Join(dir, "large-put.bin")
+	if err := os.WriteFile(largeSrc, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(largeSrc, 256*1024*1024); err != nil {
+		t.Fatal(err)
+	}
+	largeTarget := target + "-large"
+	if err := syscall.Kill(workerPID, syscall.SIGSTOP); err != nil {
+		t.Fatal(err)
+	}
+	workerStopped = true
+	const largeRequestToken = "mcp-it-large-put"
+	started := callTool(t, mcpSession, "file_put_start", map[string]any{"local_source": largeSrc, "target_destination": largeTarget, "request_token": largeRequestToken})
+	opID, _ := started["operation_id"].(string)
+	if opID == "" || started["state"] != "RUNNING" {
+		t.Fatalf("bad async FILE start: %v", started)
+	}
+	current := callTool(t, mcpSession, "file_operation_status", map[string]any{"request_token": largeRequestToken})
+	if current["operation_id"] != opID {
+		t.Fatalf("FILE token recovery mismatch: got %v want %s", current, opID)
+	}
+	duplicate := callTool(t, mcpSession, "file_put_start", map[string]any{"local_source": largeSrc, "target_destination": largeTarget, "request_token": largeRequestToken})
+	if duplicate["operation_id"] != opID || duplicate["state"] != "RUNNING" {
+		t.Fatalf("idempotent FILE duplicate mismatch: %v", duplicate)
+	}
+	conflict := callToolRaw(t, mcpSession, 5*time.Second, "file_put_start", map[string]any{"local_source": largeSrc, "target_destination": largeTarget + "-conflict", "request_token": largeRequestToken})
+	if !conflict.IsError || !strings.Contains(toolText(conflict), "conflicts") {
+		t.Fatalf("conflicting FILE token was not rejected: %s", toolText(conflict))
+	}
+	waitStarted := time.Now()
+	waited := callToolWithTimeout(t, mcpSession, 2500*time.Millisecond, "file_operation_wait", map[string]any{"operation_id": opID, "timeout_ms": 1000})
+	if waited["state"] != "RUNNING" || waited["wait_timed_out"] != true {
+		t.Fatalf("deadline-aware FILE wait did not return RUNNING: %v", waited)
+	}
+	if time.Since(waitStarted) >= 2500*time.Millisecond {
+		t.Fatalf("FILE wait did not preserve MCP response reserve")
+	}
+	fileStatus := callTool(t, mcpSession, "file_operation_status", map[string]any{"operation_id": opID})
+	if fileStatus["state"] != "RUNNING" && fileStatus["state"] != "DONE" {
+		t.Fatalf("bad async FILE status: %v", fileStatus)
+	}
+	if fileStatus["state"] == "RUNNING" {
+		cancelled := callTool(t, mcpSession, "file_operation_cancel", map[string]any{"operation_id": opID})
+		if cancelled["state"] != "CANCELLED" {
+			t.Fatalf("FILE cancel not terminal: %v", cancelled)
+		}
+	}
+	if err := syscall.Kill(workerPID, syscall.SIGCONT); err != nil {
+		t.Fatal(err)
+	}
+	workerStopped = false
+
+	terminalToken := "mcp-it-terminal-wait"
+	terminalStarted := callTool(t, mcpSession, "file_put_start", map[string]any{"local_source": localSrc, "target_destination": target + "-terminal-wait", "request_token": terminalToken})
+	terminalOp, _ := terminalStarted["operation_id"].(string)
+	terminal := callTool(t, mcpSession, "file_operation_wait", map[string]any{"operation_id": terminalOp, "timeout_ms": 20000})
+	if terminal["state"] != "DONE" || terminal["wait_timed_out"] == true {
+		t.Fatalf("FILE wait missed terminal completion: %v", terminal)
+	}
+	for i := 0; i < 8; i++ {
+		token := fmt.Sprintf("mcp-it-evict-%d", i)
+		evict := callTool(t, mcpSession, "file_put_start", map[string]any{
+			"local_source": localSrc, "target_destination": fmt.Sprintf("%s-evict-%d", target, i), "request_token": token,
+		})
+		evictOp, _ := evict["operation_id"].(string)
+		evictDone := callTool(t, mcpSession, "file_operation_wait", map[string]any{"operation_id": evictOp, "timeout_ms": 20000})
+		if evictDone["state"] != "DONE" {
+			t.Fatalf("FILE eviction setup failed: %v", evictDone)
+		}
+	}
+	unknown := callTool(t, mcpSession, "file_operation_status", map[string]any{"request_token": terminalToken})
+	if unknown["state"] != "UNKNOWN" || unknown["outcome_ambiguous"] != true {
+		t.Fatalf("evicted FILE token was not reported ambiguous: %v", unknown)
+	}
+
+	postCancelTarget := target + "-post-cancel"
+	postCancel := callTool(t, mcpSession, "file_put", map[string]any{"local_source": localSrc, "target_destination": postCancelTarget})
+	if postCancel["sha256"] != hex.EncodeToString(wantSum[:]) {
+		t.Fatalf("bad post-cancel put: %v", postCancel)
 	}
 	if _, err := os.Stat(filepath.Join(runtime, "current", "session.log")); err != nil {
 		t.Fatalf("journal not discoverable: %v", err)
@@ -150,12 +252,12 @@ func startMCP(t *testing.T, root, control, runtime string) *mcp.ClientSession {
 
 func callTool(t *testing.T, session *mcp.ClientSession, name string, args any) map[string]any {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
-	if err != nil {
-		t.Fatal(err)
-	}
+	return callToolWithTimeout(t, session, 30*time.Second, name, args)
+}
+
+func callToolWithTimeout(t *testing.T, session *mcp.ClientSession, timeout time.Duration, name string, args any) map[string]any {
+	t.Helper()
+	res := callToolRaw(t, session, timeout, name, args)
 	if res.IsError {
 		t.Fatalf("tool %s error: %s", name, toolText(res))
 	}
@@ -165,6 +267,37 @@ func callTool(t *testing.T, session *mcp.ClientSession, name string, args any) m
 		t.Fatalf("bad structured content for %s: %#v: %v", name, res.StructuredContent, err)
 	}
 	return out
+}
+
+func callToolRaw(t *testing.T, session *mcp.ClientSession, timeout time.Duration, name string, args any) *mcp.CallToolResult {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res
+}
+
+func waitChildPID(t *testing.T, parent int, timeout time.Duration) int {
+	t.Helper()
+	path := filepath.Join("/proc", strconv.Itoa(parent), "task", strconv.Itoa(parent), "children")
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			for _, field := range strings.Fields(string(data)) {
+				pid, parseErr := strconv.Atoi(field)
+				if parseErr == nil && pid > 0 {
+					return pid
+				}
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("supervisor %d did not create a worker", parent)
+	return 0
 }
 
 func hasTool(list *mcp.ListToolsResult, name string) bool {

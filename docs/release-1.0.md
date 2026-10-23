@@ -81,6 +81,7 @@ These surfaces are supported for 1.0 users:
 Current contract:
   README.md
   docs/release-1.0.md
+  docs/release-1.0.1.md
   docs/outer1-wire.md
   docs/lmux2-wire.md
   docs/host-control.md

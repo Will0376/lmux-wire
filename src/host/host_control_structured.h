@@ -41,7 +41,21 @@ enum lmux_hc2_type {
     LMUX_HC2_FILE_STARTED = 62,
     LMUX_HC2_FILE_PROGRESS = 65,
     LMUX_HC2_FILE_DONE = 63,
-    LMUX_HC2_FILE_ERROR = 64
+    LMUX_HC2_FILE_ERROR = 64,
+    LMUX_HC2_FILE_STATUS = 66,
+    LMUX_HC2_FILE_CANCEL = 67,
+    LMUX_HC2_FILE_STATE = 68,
+    LMUX_HC2_FILE_PUT_START_IDEMPOTENT = 69,
+    LMUX_HC2_FILE_GET_START_IDEMPOTENT = 70,
+    LMUX_HC2_FILE_STATUS_TOKEN = 71
+};
+
+enum lmux_hc2_file_state {
+    LMUX_HC2_FILE_RUNNING = 1,
+    LMUX_HC2_FILE_DONE_STATE = 2,
+    LMUX_HC2_FILE_FAILED = 3,
+    LMUX_HC2_FILE_CANCELLED = 4,
+    LMUX_HC2_FILE_LOST = 5
 };
 
 enum lmux_hc2_error {
@@ -62,7 +76,8 @@ enum lmux_hc2_error {
 enum lmux_hc2_caps {
     LMUX_HC2_CAP_STATUS = 1u << 0,
     LMUX_HC2_CAP_EXEC = 1u << 1,
-    LMUX_HC2_CAP_FILE = 1u << 2
+    LMUX_HC2_CAP_FILE = 1u << 2,
+    LMUX_HC2_CAP_FILE_LIFECYCLE = 1u << 3
 };
 
 enum lmux_hc2_exec_signal {

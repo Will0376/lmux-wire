@@ -221,6 +221,99 @@ static int hc2_make_tmp_for_final(const char *final, char *tmp, size_t cap)
     return 0;
 }
 
+static struct v2_host_structured_file_operation *
+hc2_file_operation_find(struct v2_host *h, uint64_t op_id)
+{
+    int i;
+    if (!op_id)
+        return NULL;
+    for (i = 0; i < V2_HOST_STRUCTURED_FILE_HISTORY; i++)
+        if (h->structured_file_operations[i].used &&
+            h->structured_file_operations[i].op_id == op_id)
+            return &h->structured_file_operations[i];
+    return NULL;
+}
+
+static struct v2_host_structured_file_operation *
+hc2_file_operation_find_token(struct v2_host *h, const char *request_namespace,
+                              const char *request_token)
+{
+    int i;
+    if (!request_namespace || !*request_namespace ||
+        !request_token || !*request_token)
+        return NULL;
+    for (i = 0; i < V2_HOST_STRUCTURED_FILE_HISTORY; i++) {
+        struct v2_host_structured_file_operation *op =
+            &h->structured_file_operations[i];
+        if (op->used &&
+            strcmp(op->request_namespace, request_namespace) == 0 &&
+            strcmp(op->request_token, request_token) == 0)
+            return op;
+    }
+    return NULL;
+}
+
+static struct v2_host_structured_file_operation *
+hc2_file_operation_alloc(struct v2_host *h)
+{
+    struct v2_host_structured_file_operation *oldest = NULL;
+    int i;
+    for (i = 0; i < V2_HOST_STRUCTURED_FILE_HISTORY; i++) {
+        struct v2_host_structured_file_operation *op =
+            &h->structured_file_operations[i];
+        if (!op->used) {
+            memset(op, 0, sizeof(*op));
+            op->used = 1;
+            return op;
+        }
+        if (op->state != LMUX_HC2_FILE_RUNNING &&
+            (!oldest || op->op_id < oldest->op_id))
+            oldest = op;
+    }
+    if (!oldest)
+        return NULL;
+    memset(oldest, 0, sizeof(*oldest));
+    oldest->used = 1;
+    return oldest;
+}
+
+static struct v2_host_structured_file_operation *
+hc2_file_active_operation(struct v2_host *h)
+{
+    return hc2_file_operation_find(h, h->structured_file_op_id);
+}
+
+static void hc2_file_sync_operation(struct v2_host *h)
+{
+    struct v2_host_structured_file_operation *op =
+        hc2_file_active_operation(h);
+    if (!op)
+        return;
+    op->bytes = h->structured_file_count;
+    op->total = h->structured_file_expected;
+    if (h->structured_file_kind == HC2_FILE_KIND_PUT ||
+        h->structured_file_phase == HC2_FILE_GET_RECV)
+        op->total_known = 1;
+}
+
+static void hc2_file_terminal(struct v2_host *h, uint8_t state,
+                              uint32_t code, const char *msg)
+{
+    struct v2_host_structured_file_operation *op =
+        hc2_file_active_operation(h);
+    if (!op)
+        return;
+    hc2_file_sync_operation(h);
+    op->state = state;
+    op->error_code = code;
+    if (msg) {
+        strncpy(op->error, msg, sizeof(op->error) - 1);
+        op->error[sizeof(op->error) - 1] = 0;
+    }
+    if (state == LMUX_HC2_FILE_DONE_STATE)
+        memcpy(op->digest, h->structured_file_digest, sizeof(op->digest));
+}
+
 static void hc2_file_clear(struct v2_app *a, struct v2_host *h, int close_stream)
 {
     int i;
@@ -292,8 +385,7 @@ static void hc2_close_client(struct v2_host *h)
 static void hc2_close_client_runtime(struct v2_app *a, struct v2_host *h)
 {
     int i;
-    if (h->structured_file_active)
-        hc2_file_clear(a, h, 1);
+    /* FILE operations are daemon-owned and deliberately outlive HC2 clients. */
     for (i = 0; i < V2_HOST_STRUCTURED_MAX_EXECS; i++)
         if (h->structured_execs[i].used)
             hc2_exec_close_streams(a, &h->structured_execs[i]);
@@ -457,7 +549,8 @@ static int hc2_queue_server_hello(struct v2_host *h, uint64_t request_id)
     size_t n = strlen(ver);
     if (n > 40)
         n = 40;
-    lmux_put_le32(p, LMUX_HC2_CAP_STATUS | LMUX_HC2_CAP_EXEC | LMUX_HC2_CAP_FILE);
+    lmux_put_le32(p, LMUX_HC2_CAP_STATUS | LMUX_HC2_CAP_EXEC |
+                  LMUX_HC2_CAP_FILE | LMUX_HC2_CAP_FILE_LIFECYCLE);
     lmux_put_le32(p + 4, LMUX_HC2_MAX_PAYLOAD);
     lmux_put_le32(p + 8, LMUX_HC2_TX_CAP);
     lmux_put_le16(p + 12, (uint16_t)n);
@@ -504,15 +597,54 @@ static int hc2_append_string(uint8_t *p, size_t cap, size_t *off, const char *s)
     return 0;
 }
 
+static int hc2_queue_file_state(struct v2_host *h, uint64_t request_id,
+                                const struct v2_host_structured_file_operation *op)
+{
+    uint8_t p[LMUX_HC2_MAX_PAYLOAD];
+    size_t off = 96, error_len, local_len, target_len;
+    if (!op)
+        return -1;
+    error_len = strlen(op->error);
+    local_len = strlen(op->local_path);
+    target_len = strlen(op->target_path);
+    if (off + error_len + local_len + target_len > sizeof(p) ||
+        error_len > UINT16_MAX || local_len > UINT16_MAX ||
+        target_len > UINT16_MAX)
+        return -1;
+    memset(p, 0, 96);
+    lmux_hc2_put_u64(p, op->op_id);
+    lmux_hc2_put_u64(p + 8, op->local_conn);
+    lmux_hc2_put_u64(p + 16, op->peer_conn);
+    lmux_hc2_put_u64(p + 24, op->incarnation);
+    lmux_hc2_put_u64(p + 32, op->bytes);
+    lmux_hc2_put_u64(p + 40, op->total);
+    lmux_put_le32(p + 48, op->error_code);
+    p[52] = op->kind;
+    p[53] = op->state;
+    p[54] = op->total_known;
+    lmux_put_le16(p + 56, (uint16_t)error_len);
+    lmux_put_le16(p + 58, (uint16_t)local_len);
+    lmux_put_le16(p + 60, (uint16_t)target_len);
+    memcpy(p + 64, op->digest, sizeof(op->digest));
+    memcpy(p + off, op->error, error_len); off += error_len;
+    memcpy(p + off, op->local_path, local_len); off += local_len;
+    memcpy(p + off, op->target_path, target_len); off += target_len;
+    return hc2_queue_frame(h, LMUX_HC2_FILE_STATE, 0, request_id,
+                           p, (uint32_t)off);
+}
+
 static int hc2_queue_file_started(struct v2_host *h)
 {
     uint8_t p[32];
+    struct v2_host_structured_file_operation *op =
+        hc2_file_active_operation(h);
     lmux_hc2_put_u64(p, h->structured_file_op_id);
     p[8] = (uint8_t)h->structured_file_kind;
     memset(p + 9, 0, 7);
     lmux_put_le64(p + 16, h->structured_file_expected);
+    lmux_put_le64(p + 24, op ? op->incarnation : 0);
     return hc2_queue_frame(h, LMUX_HC2_FILE_STARTED, 0,
-                           h->structured_file_req_id, p, 24);
+                           h->structured_file_req_id, p, 32);
 }
 
 static int hc2_queue_file_progress(struct v2_host *h)
@@ -529,8 +661,7 @@ static int hc2_queue_file_done(struct v2_host *h)
     lmux_hc2_put_u64(p, h->structured_file_op_id);
     lmux_put_le64(p + 8, h->structured_file_count);
     memcpy(p + 16, h->structured_file_digest, 32);
-    return hc2_queue_frame(h, LMUX_HC2_FILE_DONE, 0,
-                           h->structured_file_req_id, p, sizeof(p));
+    return hc2_queue_frame(h, LMUX_HC2_FILE_DONE, 0, 0, p, sizeof(p));
 }
 
 static int hc2_queue_file_error_frame(struct v2_host *h, uint32_t code,
@@ -545,8 +676,8 @@ static int hc2_queue_file_error_frame(struct v2_host *h, uint32_t code,
     lmux_put_le16(p + 12, (uint16_t)n);
     if (n)
         memcpy(p + 14, msg, n);
-    return hc2_queue_frame(h, LMUX_HC2_FILE_ERROR, 0,
-                           h->structured_file_req_id, p, (uint32_t)(14 + n));
+    return hc2_queue_frame(h, LMUX_HC2_FILE_ERROR, 0, 0,
+                           p, (uint32_t)(14 + n));
 }
 
 static int hc2_file_queue_lxf(struct v2_host *h, uint8_t type,
@@ -1078,17 +1209,51 @@ static int hc2_file_open_stream(struct v2_app *a, struct v2_host *h,
     return 0;
 }
 
+static int hc2_file_begin_operation(struct v2_app *a, struct v2_host *h,
+                                    const char *request_namespace,
+                                    const char *request_token)
+{
+    struct v2_host_structured_file_operation *op =
+        hc2_file_operation_alloc(h);
+    if (!op) {
+        errno = ENOSPC;
+        return -1;
+    }
+    h->structured_file_op_id = h->structured_next_file_op_id++;
+    if (!h->structured_next_file_op_id)
+        h->structured_next_file_op_id = 1;
+    op->op_id = h->structured_file_op_id;
+    op->kind = (uint8_t)h->structured_file_kind;
+    op->state = LMUX_HC2_FILE_RUNNING;
+    op->bytes = h->structured_file_count;
+    op->total = h->structured_file_expected;
+    op->total_known = h->structured_file_kind == HC2_FILE_KIND_PUT;
+    strcpy(op->local_path, h->structured_file_local_path);
+    strcpy(op->target_path, h->structured_file_target_path);
+    if (request_namespace)
+        strcpy(op->request_namespace, request_namespace);
+    if (request_token)
+        strcpy(op->request_token, request_token);
+    v2_runtime_lmux_marker(a, &op->local_conn, &op->peer_conn,
+                           &op->incarnation);
+    return 0;
+}
+
 static int hc2_file_prepare_put(struct v2_app *a, struct v2_host *h,
                                 const char *local, const char *target,
-                                uint64_t req_id)
+                                uint64_t req_id,
+                                const char *request_namespace,
+                                const char *request_token)
 {
     struct v2_host_service *s;
     struct stat st;
     uint8_t p[16 + LXF_PATH_MAX];
     size_t path_len;
     int fd;
-    if (!hc2_abs_path_ok(local) || !hc2_abs_path_ok(target))
+    if (!hc2_abs_path_ok(local) || !hc2_abs_path_ok(target)) {
+        errno = EINVAL;
         return -1;
+    }
     fd = open(local, O_RDONLY);
     if (fd < 0)
         return -1;
@@ -1122,9 +1287,6 @@ static int hc2_file_prepare_put(struct v2_app *a, struct v2_host *h,
     h->structured_file_kind = HC2_FILE_KIND_PUT;
     h->structured_file_phase = HC2_FILE_PUT_WAIT_OK;
     h->structured_file_req_id = req_id;
-    h->structured_file_op_id = h->structured_next_file_op_id++;
-    if (!h->structured_next_file_op_id)
-        h->structured_next_file_op_id = 1;
     h->structured_file_expected = (uint64_t)st.st_size;
     h->structured_file_count = 0;
     h->structured_file_last_progress = 0;
@@ -1132,18 +1294,24 @@ static int hc2_file_prepare_put(struct v2_app *a, struct v2_host *h,
     strcpy(h->structured_file_local_path, local);
     strcpy(h->structured_file_target_path, target);
     sha256_init(&h->structured_file_sha);
+    if (hc2_file_begin_operation(a, h, request_namespace, request_token) < 0)
+        return -1;
     return 0;
 }
 
 static int hc2_file_prepare_get(struct v2_app *a, struct v2_host *h,
                                 const char *target, const char *local,
-                                uint64_t req_id)
+                                uint64_t req_id,
+                                const char *request_namespace,
+                                const char *request_token)
 {
     struct v2_host_service *s;
     struct stat st;
     size_t path_len;
-    if (!hc2_abs_path_ok(target) || !hc2_abs_path_ok(local))
+    if (!hc2_abs_path_ok(target) || !hc2_abs_path_ok(local)) {
+        errno = EINVAL;
         return -1;
+    }
     if (lstat(local, &st) == 0 && !S_ISREG(st.st_mode)) {
         errno = EINVAL;
         return -1;
@@ -1170,58 +1338,208 @@ static int hc2_file_prepare_get(struct v2_app *a, struct v2_host *h,
     h->structured_file_kind = HC2_FILE_KIND_GET;
     h->structured_file_phase = HC2_FILE_GET_WAIT_OK;
     h->structured_file_req_id = req_id;
-    h->structured_file_op_id = h->structured_next_file_op_id++;
-    if (!h->structured_next_file_op_id)
-        h->structured_next_file_op_id = 1;
     h->structured_file_expected = 0;
     h->structured_file_count = 0;
     h->structured_file_last_progress = 0;
     strcpy(h->structured_file_local_path, local);
     strcpy(h->structured_file_target_path, target);
     sha256_init(&h->structured_file_sha);
+    if (hc2_file_begin_operation(a, h, request_namespace, request_token) < 0)
+        return -1;
     return 0;
 }
 
 static void hc2_handle_file_start(struct v2_app *a, struct v2_host *h,
-                                  const struct hc2_frame *fr, int is_put)
+                                  const struct hc2_frame *fr, int is_put,
+                                  int idempotent)
 {
-    const uint8_t *a0, *a1;
-    uint16_t a0_len, a1_len;
+    const uint8_t *a0, *a1, *ns = NULL, *token = NULL;
+    uint16_t a0_len, a1_len, ns_len = 0, token_len = 0;
     char p0[LXF_PATH_MAX], p1[LXF_PATH_MAX];
+    char request_namespace[V2_HOST_STRUCTURED_FILE_NAMESPACE_MAX] = {0};
+    char request_token[V2_HOST_STRUCTURED_FILE_TOKEN_MAX] = {0};
+    struct v2_host_structured_file_operation *existing = NULL;
+    const char *local_path, *target_path;
     size_t off = 0;
     int rc;
-    if (h->structured_file_active) {
-        hc2_queue_error(h, fr->request_id, LMUX_HC2_E_BUSY, "file busy");
-        return;
-    }
-    if (hc2_get_string(fr->payload, fr->payload_len, &off, &a0, &a0_len) < 0 ||
+    if ((idempotent &&
+         (hc2_get_string(fr->payload, fr->payload_len, &off, &ns, &ns_len) < 0 ||
+          hc2_get_string(fr->payload, fr->payload_len, &off, &token,
+                         &token_len) < 0)) ||
+        hc2_get_string(fr->payload, fr->payload_len, &off, &a0, &a0_len) < 0 ||
         hc2_get_string(fr->payload, fr->payload_len, &off, &a1, &a1_len) < 0 ||
         off != fr->payload_len || a0_len == 0 || a1_len == 0 ||
-        a0_len >= sizeof(p0) || a1_len >= sizeof(p1)) {
+        a0_len >= sizeof(p0) || a1_len >= sizeof(p1) ||
+        (idempotent &&
+         (ns_len == 0 || token_len == 0 ||
+          ns_len >= sizeof(request_namespace) ||
+          token_len >= sizeof(request_token)))) {
         hc2_queue_error(h, fr->request_id, LMUX_HC2_E_INVALID_ARGUMENT, "bad file request");
         return;
     }
     memcpy(p0, a0, a0_len); p0[a0_len] = 0;
     memcpy(p1, a1, a1_len); p1[a1_len] = 0;
-    rc = is_put ? hc2_file_prepare_put(a, h, p0, p1, fr->request_id) :
-        hc2_file_prepare_get(a, h, p0, p1, fr->request_id);
-    if (rc < 0) {
-        uint32_t code = errno == ENOTCONN ? LMUX_HC2_E_NOT_CONNECTED :
-            (errno == EBUSY ? LMUX_HC2_E_BUSY :
-             (errno == ENOENT ? LMUX_HC2_E_NOT_FOUND :
-              (errno == EACCES ? LMUX_HC2_E_IO : LMUX_HC2_E_INVALID_ARGUMENT)));
-        hc2_file_clear(a, h, 1);
-        hc2_queue_error(h, fr->request_id, code, strerror(errno));
+    local_path = is_put ? p0 : p1;
+    target_path = is_put ? p1 : p0;
+    if (idempotent) {
+        memcpy(request_namespace, ns, ns_len);
+        memcpy(request_token, token, token_len);
+        existing = hc2_file_operation_find_token(h, request_namespace,
+                                                 request_token);
+        if (existing) {
+            if (existing->kind != (is_put ? HC2_FILE_KIND_PUT : HC2_FILE_KIND_GET) ||
+                strcmp(existing->local_path, local_path) != 0 ||
+                strcmp(existing->target_path, target_path) != 0) {
+                hc2_queue_error(h, fr->request_id,
+                                LMUX_HC2_E_INVALID_ARGUMENT,
+                                "FILE request token conflicts with different parameters");
+                return;
+            }
+            if (existing->state == LMUX_HC2_FILE_RUNNING)
+                hc2_file_sync_operation(h);
+            if (hc2_queue_file_state(h, fr->request_id, existing) < 0)
+                hc2_queue_error(h, fr->request_id,
+                                LMUX_HC2_E_RESOURCE_LIMIT,
+                                "FILE state too large");
+            return;
+        }
+    }
+    if (h->structured_file_active) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "file busy: operation_id=%llu",
+                 (unsigned long long)h->structured_file_op_id);
+        hc2_queue_error(h, fr->request_id, LMUX_HC2_E_BUSY, msg);
         return;
     }
-    if (hc2_queue_file_started(h) < 0) {
+    rc = is_put ? hc2_file_prepare_put(a, h, p0, p1, fr->request_id,
+                                        idempotent ? request_namespace : NULL,
+                                        idempotent ? request_token : NULL) :
+        hc2_file_prepare_get(a, h, p0, p1, fr->request_id,
+                             idempotent ? request_namespace : NULL,
+                             idempotent ? request_token : NULL);
+    if (rc < 0) {
+        int saved_errno = errno;
+        uint32_t code = saved_errno == ENOTCONN ? LMUX_HC2_E_NOT_CONNECTED :
+            (saved_errno == EBUSY ? LMUX_HC2_E_BUSY :
+             (saved_errno == ENOENT ? LMUX_HC2_E_NOT_FOUND :
+              (saved_errno == EACCES ? LMUX_HC2_E_IO :
+               (saved_errno == ENOSPC ? LMUX_HC2_E_RESOURCE_LIMIT :
+                LMUX_HC2_E_INVALID_ARGUMENT))));
+        hc2_file_clear(a, h, 1);
+        hc2_queue_error(h, fr->request_id, code, strerror(saved_errno));
+        return;
+    }
+    existing = hc2_file_active_operation(h);
+    rc = idempotent ? hc2_queue_file_state(h, fr->request_id, existing) :
+        hc2_queue_file_started(h);
+    if (rc < 0) {
+        hc2_file_terminal(h, LMUX_HC2_FILE_FAILED,
+                          LMUX_HC2_E_RESOURCE_LIMIT,
+                          "file started queue");
         hc2_file_clear(a, h, 1);
         hc2_queue_error(h, fr->request_id, LMUX_HC2_E_RESOURCE_LIMIT, "file started queue");
     }
 }
 
+static void hc2_handle_file_status(struct v2_host *h,
+                                   const struct hc2_frame *fr)
+{
+    struct v2_host_structured_file_operation *op;
+    uint64_t op_id;
+    if (fr->payload_len != 8) {
+        hc2_queue_error(h, fr->request_id, LMUX_HC2_E_INVALID_ARGUMENT,
+                        "FILE status requires operation_id");
+        return;
+    }
+    op_id = lmux_hc2_get_u64(fr->payload);
+    if (!op_id && h->structured_file_active)
+        op_id = h->structured_file_op_id;
+    op = hc2_file_operation_find(h, op_id);
+    if (!op) {
+        hc2_queue_error(h, fr->request_id, LMUX_HC2_E_NOT_FOUND,
+                        "FILE operation not found or expired");
+        return;
+    }
+    if (op->state == LMUX_HC2_FILE_RUNNING)
+        hc2_file_sync_operation(h);
+    if (hc2_queue_file_state(h, fr->request_id, op) < 0)
+        hc2_queue_error(h, fr->request_id, LMUX_HC2_E_RESOURCE_LIMIT,
+                        "FILE state too large");
+}
+
+static void hc2_handle_file_status_token(struct v2_host *h,
+                                         const struct hc2_frame *fr)
+{
+    const uint8_t *ns, *token;
+    uint16_t ns_len, token_len;
+    char request_namespace[V2_HOST_STRUCTURED_FILE_NAMESPACE_MAX];
+    char request_token[V2_HOST_STRUCTURED_FILE_TOKEN_MAX];
+    struct v2_host_structured_file_operation *op;
+    size_t off = 0;
+    if (hc2_get_string(fr->payload, fr->payload_len, &off, &ns, &ns_len) < 0 ||
+        hc2_get_string(fr->payload, fr->payload_len, &off, &token,
+                       &token_len) < 0 ||
+        off != fr->payload_len || ns_len == 0 || token_len == 0 ||
+        ns_len >= sizeof(request_namespace) ||
+        token_len >= sizeof(request_token)) {
+        hc2_queue_error(h, fr->request_id, LMUX_HC2_E_INVALID_ARGUMENT,
+                        "FILE token status requires namespace and token");
+        return;
+    }
+    memcpy(request_namespace, ns, ns_len);
+    request_namespace[ns_len] = 0;
+    memcpy(request_token, token, token_len);
+    request_token[token_len] = 0;
+    op = hc2_file_operation_find_token(h, request_namespace, request_token);
+    if (!op) {
+        hc2_queue_error(h, fr->request_id, LMUX_HC2_E_NOT_FOUND,
+                        "FILE request token unknown or expired; outcome ambiguous");
+        return;
+    }
+    if (op->state == LMUX_HC2_FILE_RUNNING)
+        hc2_file_sync_operation(h);
+    if (hc2_queue_file_state(h, fr->request_id, op) < 0)
+        hc2_queue_error(h, fr->request_id, LMUX_HC2_E_RESOURCE_LIMIT,
+                        "FILE state too large");
+}
+
+static void hc2_handle_file_cancel(struct v2_app *a, struct v2_host *h,
+                                   const struct hc2_frame *fr)
+{
+    struct v2_host_structured_file_operation *op;
+    uint64_t op_id;
+    if (fr->payload_len != 8) {
+        hc2_queue_error(h, fr->request_id, LMUX_HC2_E_INVALID_ARGUMENT,
+                        "FILE cancel requires operation_id");
+        return;
+    }
+    op_id = lmux_hc2_get_u64(fr->payload);
+    op = hc2_file_operation_find(h, op_id);
+    if (!op) {
+        hc2_queue_error(h, fr->request_id, LMUX_HC2_E_NOT_FOUND,
+                        "FILE operation not found or expired");
+        return;
+    }
+    if (op->state == LMUX_HC2_FILE_RUNNING) {
+        if (!h->structured_file_active ||
+            h->structured_file_op_id != op_id) {
+            op->state = LMUX_HC2_FILE_LOST;
+            op->error_code = LMUX_HC2_E_INTERNAL;
+            strcpy(op->error, "FILE engine state lost");
+        } else {
+            hc2_file_terminal(h, LMUX_HC2_FILE_CANCELLED, LMUX_HC2_OK,
+                              "cancelled by client");
+            hc2_file_clear(a, h, 1);
+        }
+    }
+    if (hc2_queue_file_state(h, fr->request_id, op) < 0)
+        hc2_queue_error(h, fr->request_id, LMUX_HC2_E_RESOURCE_LIMIT,
+                        "FILE state too large");
+}
+
 static void hc2_file_maybe_progress(struct v2_host *h)
 {
+    hc2_file_sync_operation(h);
     if (h->structured_file_count - h->structured_file_last_progress <
         HC2_FILE_PROGRESS_STEP &&
         h->structured_file_count != h->structured_file_expected)
@@ -1257,6 +1575,7 @@ static void hc2_file_remote_error(struct v2_app *a, struct v2_host *h,
             break;
         }
     }
+    hc2_file_terminal(h, LMUX_HC2_FILE_FAILED, code, msg);
     (void)hc2_queue_file_error_frame(h, code, msg);
     hc2_file_clear(a, h, 1);
 }
@@ -1264,12 +1583,14 @@ static void hc2_file_remote_error(struct v2_app *a, struct v2_host *h,
 static void hc2_file_fail(struct v2_app *a, struct v2_host *h,
                           uint32_t code, const char *msg)
 {
+    hc2_file_terminal(h, LMUX_HC2_FILE_FAILED, code, msg);
     (void)hc2_queue_file_error_frame(h, code, msg);
     hc2_file_clear(a, h, 1);
 }
 
 static void hc2_file_complete(struct v2_app *a, struct v2_host *h)
 {
+    hc2_file_terminal(h, LMUX_HC2_FILE_DONE_STATE, LMUX_HC2_OK, NULL);
     (void)hc2_queue_file_done(h);
     hc2_file_clear(a, h, 1);
 }
@@ -1377,6 +1698,7 @@ static void hc2_file_step_get(struct v2_app *a, struct v2_host *h)
             }
             h->structured_file_mode = lmux_get_le32(payload) & 0777;
             h->structured_file_expected = lmux_get_le64(payload + 4);
+            hc2_file_sync_operation(h);
             h->structured_file_fd = open(h->structured_file_tmp_path,
                                          O_WRONLY | O_CREAT | O_EXCL, 0600);
             if (h->structured_file_fd < 0) {
@@ -1700,10 +2022,25 @@ static void hc2_handle_frame(struct v2_app *a, struct v2_host *h,
         hc2_handle_exec_status_or_release(h, fr, 1);
         break;
     case LMUX_HC2_FILE_PUT_START:
-        hc2_handle_file_start(a, h, fr, 1);
+        hc2_handle_file_start(a, h, fr, 1, 0);
         break;
     case LMUX_HC2_FILE_GET_START:
-        hc2_handle_file_start(a, h, fr, 0);
+        hc2_handle_file_start(a, h, fr, 0, 0);
+        break;
+    case LMUX_HC2_FILE_PUT_START_IDEMPOTENT:
+        hc2_handle_file_start(a, h, fr, 1, 1);
+        break;
+    case LMUX_HC2_FILE_GET_START_IDEMPOTENT:
+        hc2_handle_file_start(a, h, fr, 0, 1);
+        break;
+    case LMUX_HC2_FILE_STATUS:
+        hc2_handle_file_status(h, fr);
+        break;
+    case LMUX_HC2_FILE_CANCEL:
+        hc2_handle_file_cancel(a, h, fr);
+        break;
+    case LMUX_HC2_FILE_STATUS_TOKEN:
+        hc2_handle_file_status_token(h, fr);
         break;
     default:
         hc2_queue_error(h, fr->request_id, LMUX_HC2_E_PROTOCOL, "unknown frame");
@@ -1985,6 +2322,8 @@ void v2_host_structured_on_outer_down(struct v2_host *h)
 {
     int i;
     if (h->structured_file_active) {
+        hc2_file_terminal(h, LMUX_HC2_FILE_LOST,
+                          LMUX_HC2_E_TARGET_LOST, "file transfer lost");
         if (h->structured_fd >= 0)
             (void)hc2_queue_file_error_frame(h, LMUX_HC2_E_TARGET_LOST,
                                              "file transfer lost");

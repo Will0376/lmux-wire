@@ -22,6 +22,7 @@
 #define V2_EXEC_FD_STDOUT 2
 #define V2_EXEC_FD_STDERR 3
 #define V2_EXEC_FD_ERR 4
+#define V2_PTY_OUTPUT_CAP 16384
 
 enum v2_exec_role {
     V2_EXEC_ROLE_CONTROL = 1,
@@ -192,6 +193,12 @@ struct v2_service {
     char pty_slave_path[V2_PATH_MAX];
     struct termios pty_baseline_tio;
     int pty_have_baseline_tio;
+    uint8_t pty_output[V2_PTY_OUTPUT_CAP];
+    uint64_t pty_output_start;
+    uint64_t pty_output_end;
+    uint64_t pty_send_pos;
+    int pty_reset_pending;
+    long long pty_reset_deadline_ms;
     pid_t child_pid;
     long long respawn_at_ms;
     int supervised;
@@ -240,6 +247,8 @@ void v2_pty_restore_baseline(struct v2_service *s);
 void v2_pty_supervise(struct v2_app *a, struct v2_service services[V2_MAX_SERVICES]);
 void v2_pty_apply_winsize(struct v2_service *s, unsigned rows, unsigned cols,
                           unsigned xp, unsigned yp);
+int v2_pty_attach_stream(struct v2_service *s, uint64_t stream_id);
+int v2_pty_wants_master_read(const struct v2_service *s);
 void v2_pty_deliver_stream_rx(struct lmux2_conn *conn, struct v2_service *s);
 void v2_pty_collect_tx(struct lmux2_conn *conn, struct v2_service *s);
 

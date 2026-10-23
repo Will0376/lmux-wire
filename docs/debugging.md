@@ -143,7 +143,23 @@ LMUX transport failure. Historical gdbserver versions have had Ctrl-C/SIGIO
 handling fixes, so replacing or rebuilding the old vendor gdbserver is the
 preferred follow-up.
 
-`debug_memory_read` is read-only and bounded to 64 KiB per call. LMUX 1.0 does not
+`debug_memory_read` is read-only and bounded to 64 KiB per call. Its optional
+`format` parameter accepts `base64` (the default), `hex`, or `both`. Omitting
+`format` preserves the original `{base64, bytes}` response. `hex` returns
+`{address, hex, bytes}`, where `address` is GDB's actual resolved starting
+address and `hex` is a 16-byte-per-line dump with 64-bit addresses, byte
+columns, and printable ASCII. `both` includes all four fields. Non-printable
+bytes are shown as `.` in the ASCII column; the byte values remain exact in the
+hex and base64 representations. The input bound also bounds the larger `hex`
+and `both` MCP responses.
+
+For example:
+
+```text
+0000000000001000  00 41 1f 20 7e 7f ff 30  31 32 33 34 35 36 37 38  |.A. ~..012345678|
+```
+
+LMUX 1.0 does not
 implement memory writes, register writes, arbitrary CLI commands, multi-inferior
 GDB sessions, DAP, TUI, TCP forwarding, SSH, `socat`, target debugger logic, or
 RSP parsing in `lmuxd`.

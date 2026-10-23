@@ -717,11 +717,14 @@ static pid_t spawn_target(const char *carrier)
 {
     pid_t pid = fork();
     if (pid == 0) {
+        const char *lmuxd = getenv("LMUX2_IT_TARGET_LMUXD");
+        if (!lmuxd || !*lmuxd)
+            lmuxd = "build/host/lmuxd";
         if (getenv("LMUX2_IT_VERBOSE"))
-            execl("build/host/lmuxd", "lmuxd", "--role", "target",
+            execl(lmuxd, "lmuxd", "--role", "target",
                   "--carrier-listen", carrier, "--verbose", (char *)NULL);
         else
-            execl("build/host/lmuxd", "lmuxd", "--role", "target",
+            execl(lmuxd, "lmuxd", "--role", "target",
                   "--carrier-listen", carrier, (char *)NULL);
         _exit(127);
     }
@@ -735,15 +738,18 @@ static pid_t spawn_host(const char *carrier, const char *control,
 {
     pid_t pid = fork();
     if (pid == 0) {
+        const char *lmuxd = getenv("LMUX2_IT_HOST_LMUXD");
+        if (!lmuxd || !*lmuxd)
+            lmuxd = "build/host/lmuxd";
         if (getenv("LMUX2_IT_VERBOSE"))
-            execl("build/host/lmuxd", "lmuxd", "--role", "host",
+            execl(lmuxd, "lmuxd", "--role", "host",
                   "--carrier-connect", carrier, "--control", control, "--verbose",
                   "--pty", pty1, "--pty", pty2,
                   "--unix", gdb,
                   "--file", file1, "--file", file_dup,
                   "--pty", file_conflict, (char *)NULL);
         else
-            execl("build/host/lmuxd", "lmuxd", "--role", "host",
+            execl(lmuxd, "lmuxd", "--role", "host",
                   "--carrier-connect", carrier, "--control", control,
                   "--pty", pty1, "--pty", pty2,
                   "--unix", gdb,

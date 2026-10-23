@@ -770,9 +770,14 @@ static void service_handle_open_received(struct v2_app *a, struct lmux2_stream *
         }
         if (lmux2_accept_stream(&a->conn, st->id) < 0)
             return;
-        s->active_stream_id = st->id;
-        s->last_stream_id = st->id;
         a->stream_open_count++;
+        if (v2_pty_attach_stream(s, st->id) < 0) {
+            (void)lmux2_close_stream(&a->conn, st->id);
+            a->stream_close_count++;
+            log_msg(a, 1, "lmux2 STREAM_CLOSE sent stream=%llu service=%s pty-reset-failed",
+                    (unsigned long long)st->id, s->name);
+            return;
+        }
         log_msg(a, 1, "lmux2 STREAM_OPEN_OK sent stream=%llu service=%s pty-bound child=%ld",
                 (unsigned long long)st->id, s->name, (long)s->child_pid);
         log_msg(a, 1, "lmux2 target attached pty stream=%llu service=%s",
@@ -1663,15 +1668,16 @@ static void run_loop(struct v2_app *a)
                                  j * 10 + V2_EXEC_FD_ERR);
                 }
             }
-            if (ts->type == V2_SERVICE_PTY &&
-                ts->pty_master_fd >= 0 && ts->active_stream_id) {
+            if (ts->type == V2_SERVICE_PTY && ts->pty_master_fd >= 0) {
                 short ev = 0;
-                if (stream_can_send_endpoint_data(a, ts->active_stream_id) &&
-                    lmux2_stream_tx_len(&a->conn, ts->active_stream_id) < LMUX2_STREAM_TX_CAP)
+                if (v2_pty_wants_master_read(ts))
                     ev |= POLLIN;
-                if (lmux2_stream_rx_len(&a->conn, ts->active_stream_id) > 0)
+                if (ts->active_stream_id &&
+                    lmux2_stream_rx_len(&a->conn, ts->active_stream_id) > 0)
                     ev |= POLLOUT;
-                add_poll(pfds, kind, svc, bind, &n, ts->pty_master_fd, ev, 5, (int)i, -1);
+                if (ev || ts->active_stream_id)
+                    add_poll(pfds, kind, svc, bind, &n, ts->pty_master_fd,
+                             ev, 5, (int)i, -1);
             }
         }
         if (poll(pfds, n, timeout) < 0) {
@@ -1792,6 +1798,12 @@ static void run_loop(struct v2_app *a)
         (void)step_file_services(a);
         (void)step_exec_services(a);
         v2_pty_supervise(a, a->services);
+        if (a->role == LMUX2_ROLE_TARGET) {
+            for (i = 0; i < V2_MAX_SERVICES; i++)
+                if (a->services[i].used &&
+                    a->services[i].type == V2_SERVICE_PTY)
+                    v2_pty_collect_tx(&a->conn, &a->services[i]);
+        }
         if ((!a->worker_mode || a->worker_link_active || a->worker_link_up_flush) &&
             (!a->outer_enabled || a->outer.state == LMUX_LINK_ESTABLISHED)) {
             build_next_output(a);

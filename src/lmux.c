@@ -814,7 +814,8 @@ static void term_help(void)
 
 static void term_print_attached(const char *label)
 {
-    fprintf(stderr, "[attached: %s]\n", label ? label : "console1");
+    /* Output processing is disabled in raw mode, so emit CRLF explicitly. */
+    fprintf(stderr, "[attached: %s]\r\n", label ? label : "console1");
     fflush(stderr);
 }
 

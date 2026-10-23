@@ -60,6 +60,9 @@ structured RX frame  24 + 4096 bytes
 structured TX queue  65536 bytes per client
 max argv count       16
 max argv bytes       4096
+FILE client namespace 63 bytes
+FILE request token    127 bytes
+FILE operation history 8 entries
 ```
 
 The daemon supports partial reads and writes, fragmented headers, fragmented
@@ -102,10 +105,14 @@ Current capabilities:
 STATUS
 EXEC
 FILE
+FILE_LIFECYCLE
 ```
 
 `FILE` is advertised only by builds that implement the path-based structured
 PUT/GET operations over the existing LMUX FILE/LXF service.
+`FILE_LIFECYCLE` advertises the v1.0.1 daemon-owned status/cancel and
+caller-token idempotency extension. A v1.0.1 `lmux-mcp` diagnoses its absence
+explicitly instead of sending lifecycle frames to a v1.0.0 daemon.
 
 Before `CLIENT_HELLO`, all non-hello operations receive a protocol error.
 `SERVER_HELLO` uses the same `request_id` as the `CLIENT_HELLO`. After the
@@ -355,12 +362,24 @@ FILE_PUT_START
 FILE_GET_START
   string target_source_path
   string local_destination_path
+
+FILE_PUT_START_IDEMPOTENT
+  string client_namespace
+  string request_token
+  string local_source_path
+  string target_destination_path
+
+FILE_GET_START_IDEMPOTENT
+  string client_namespace
+  string request_token
+  string target_source_path
+  string local_destination_path
 ```
 
 All paths are absolute strings in v1. The local paths are interpreted by trusted
 host `lmuxd`; target paths are sent to the target FILE service. One structured
-FILE operation is active at a time for the structured client. A second start
-request while one is active returns `BUSY`.
+FILE operation is active at a time in `lmuxd`. A second start request while one
+is active returns `BUSY` and names the active operation ID in the diagnostic.
 
 Start response:
 
@@ -369,6 +388,7 @@ FILE_STARTED
   u64 file_op_id
   u8  kind          1=put, 2=get
   u64 expected_bytes_or_0
+  u64 lmux_incarnation
 ```
 
 Progress is asynchronous and may be sparse:
@@ -379,8 +399,9 @@ FILE_PROGRESS
   u64 bytes
 ```
 
-Completion and failure correlate to the original request ID and include the
-operation ID:
+Completion and failure are unsolicited (`request_id=0`) and include the
+operation ID. This prevents a terminal event from an operation created before
+an HC2 reconnect colliding with a reused request ID on the new connection:
 
 ```text
 FILE_DONE
@@ -394,16 +415,77 @@ FILE_ERROR
   string message
 ```
 
+The start request only creates the daemon-owned operation. Its request ID is
+not the operation identity and the operation does not depend on the requesting
+HC2 connection remaining open. Status and cancellation requests use the opaque
+`file_op_id`:
+
+```text
+FILE_STATUS / FILE_CANCEL
+  u64 file_op_id
+
+FILE_STATUS_TOKEN
+  string client_namespace
+  string request_token
+
+FILE_STATE
+  u64 file_op_id
+  u64 lmux_local_conn
+  u64 lmux_peer_conn
+  u64 lmux_incarnation
+  u64 bytes_transferred
+  u64 total_bytes
+  u32 error_code
+  u8  kind
+  u8  state             1=RUNNING, 2=DONE, 3=FAILED, 4=CANCELLED, 5=LOST
+  u8  total_known
+  string error
+  string local_path
+  string target_path
+  u8  sha256[32]
+```
+
+For `FILE_STATUS` only, ID zero means "the current active operation". It is
+diagnostic convenience only. Zero never selects an arbitrary terminal result
+and is invalid for cancellation. Ambiguous START recovery uses
+`FILE_STATUS_TOKEN`, so it also finds retained terminal operations.
+
+The idempotent START variants return `FILE_STATE` directly. The key is the
+pair `(client_namespace, request_token)`. Repeating a retained key with the
+same direction and paths returns the original RUNNING or terminal operation;
+it never creates a second transfer. Reusing a retained key with different
+parameters returns `INVALID_ARGUMENT`. `lmux-mcp` uses its random MCP session
+ID as the namespace and requires the agent to supply `request_token` before an
+asynchronous START. Namespace ownership relies on the existing single HC2
+client contract and Unix-socket access controls; it is not a new remote
+authentication mechanism.
+
+The on-wire `FILE_STATE` uses a fixed 96-byte prefix followed by the three
+length-delimited strings; SHA256 occupies bytes 64..95. Terminal results are
+retained in a bounded eight-entry daemon table. Once evicted, status returns
+`NOT_FOUND` with an ambiguous-outcome diagnostic. Absence after eviction or a
+daemon restart does not prove that START was never executed and must not cause
+an automatic retry. Deduplication is guaranteed only while the keyed operation
+is retained in the current daemon lifetime. Operation IDs are seeded per daemon lifetime, and the LMUX
+connection IDs plus establishment counter identify the incarnation in which
+the operation started.
+
 PUT computes SHA256 from local bytes while streaming and verifies the target
 FILE service's final digest. GET writes to a temporary host file in the
 destination directory, verifies byte count and SHA256 from the target, then
 renames the verified temporary file to the requested local destination. On FILE
 failure, the active operation is reported with `FILE_ERROR`, temporary local
-GET files are cleaned up best-effort, and `lmuxd` remains usable.
+GET files are cleaned up best-effort, and `lmuxd` remains usable. Every terminal
+path records state before clearing the active engine state.
 
-Structured client disconnect aborts any active structured FILE operation. If
-OUTER/LMUX is lost during FILE transfer, the operation fails with
-`TARGET_LOST`; it is not automatically reconstructed.
+Structured-client disconnect does not abort an active FILE operation; it keeps
+running under `lmuxd` and can be observed after reconnect. Explicit cancel
+closes the FILE stream, removes temporary local output, records `CANCELLED`, and
+releases the single active slot. If OUTER/LMUX is lost during FILE transfer, the
+operation becomes `LOST` with `TARGET_LOST`; it is never reconstructed in the
+new incarnation. Daemon shutdown closes local descriptors and removes a local
+GET temporary file, but naturally cannot preserve in-memory status across
+daemon process death.
 
 ## Legacy Coexistence
 

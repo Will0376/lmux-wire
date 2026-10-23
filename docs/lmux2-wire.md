@@ -324,9 +324,33 @@ generic transport frame type. The host local control socket accepts
 `WINSIZE service rows cols [xp yp]`; for compatibility with the current CLI,
 `1` and `2` are aliases for `console1` and `console2`.
 
-When a PTY service has no active stream, the daemon does not read the PTY
-master. Output is therefore bounded by kernel-side PTY backpressure; LMUX/2 does
-not provide scrollback or unbounded userspace replay buffering.
+The target does not retain scrollback or reconstruct a terminal line. While no
+client is attached it drains and discards PTY output, preserving poll-loop
+fairness without accumulating a transcript. The fixed 16 KiB PTY buffer is
+only a pending-output queue for an active attachment; normal stream flow
+control protects every queued live byte.
+
+On a new attachment the target compares the current tty flags with the saved
+PTY baseline and checks that the foreground process group is the durable shell
+itself. The automatic input reset is attempted only for the exact BusyBox ash
+idle-editor transformation: unchanged input/output/control flags and local
+flags equal to the baseline with `ICANON`, `ECHO`, and `ISIG` disabled. It uses
+Linux `TIOCSIG(SIGINT)` on the PTY master, so no synthetic byte is placed in the
+input stream. Ash clears its own edit buffer and emits its current prompt.
+Before signaling, the worker discards any output that was still pending from
+the detached interval. Input received on the new stream is held until the PTY
+produces reset output, so an immediately typed command cannot be split by the
+asynchronous signal. If that causal confirmation does not arrive within the
+bounded reset deadline, the attachment is closed rather than risking delivery
+into an ambiguous old edit state.
+
+If the foreground group differs, or any tty flag is not recognized, attachment
+has no side effect on the PTY process. This protects external commands,
+builtins in the baseline tty mode, and raw-mode applications. Such an
+attachment receives only subsequent live bytes; LMUX neither invents a prompt
+nor claims generic readline/fullscreen restoration. The check and signal run
+once when the target accepts that stream, and the reset gate is owned by that
+stream, so transport reconciliation cannot repeat it for one attachment.
 
 ## Runtime Bounds
 
@@ -336,6 +360,7 @@ The first daemon-integrated LMUX/2 slice adds these fixed runtime bounds:
 services per daemon: 8
 desired host services: 8
 active endpoint bindings per service: 8
+PTY pending attachment output per service: 16384 bytes
 service name bytes including NUL: 32
 UNIX socket path bytes including NUL: 108
 poll slots per loop: 64

@@ -323,9 +323,9 @@ int main(void)
         strcmp(console_label_for_arg("2"), "console2") != 0 ||
         strcmp(console_label_for_arg("/tmp/x.sock"), "/tmp/x.sock") != 0)
         return fail("term label mapping");
-    if (capture_stderr(term_print_attached, "console1", "[attached: console1]") < 0)
+    if (capture_stderr(term_print_attached, "console1", "[attached: console1]\r\n") < 0)
         return fail("attached console label");
-    if (capture_stderr(term_print_attached, "/tmp/x.sock", "[attached: /tmp/x.sock]") < 0)
+    if (capture_stderr(term_print_attached, "/tmp/x.sock", "[attached: /tmp/x.sock]\r\n") < 0)
         return fail("attached socket label");
     if (capture_stderr(term_print_disconnected, "console1", "[disconnected: console1]") < 0)
         return fail("disconnected console label");

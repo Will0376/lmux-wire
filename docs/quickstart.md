@@ -102,6 +102,19 @@ Detach closes the transient LMUX stream, but the shell process stays alive in
 the durable PTY service while the worker stays alive. Re-running
 `build/host/lmux term 1` attaches to the same console service again.
 
+On attach, LMUX does not replay detached output or reconstruct terminal state.
+For the target's normal BusyBox ash, LMUX recognizes the idle line-editor tty
+mode and asks the PTY to deliver `SIGINT` to that shell process group. Ash then
+discards any unfinished input and prints its real current prompt; depending on
+the shell, its normal `^C` interrupt marker may precede the prompt. Pressing
+Enter after attach cannot execute the discarded text.
+
+The reset is deliberately skipped when the foreground process group is not the
+durable shell or the tty mode does not exactly match the known idle editor
+mode. Thus attaching does not interrupt a running command, builtin, or raw-mode
+application. In those cases LMUX waits for new live output and does not invent
+a prompt. PTY input/output otherwise remains an uninterpreted byte stream.
+
 ## Copy A File
 
 Create a small host file:

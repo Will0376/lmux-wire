@@ -599,13 +599,19 @@ static int hc2_read_frame_tiny(int fd, uint16_t *type, uint64_t *req,
 static int hc2_expect_error(int fd, uint64_t want_req, uint32_t want_code)
 {
     uint8_t payload[LMUX_HC2_MAX_PAYLOAD];
-    uint16_t type;
-    uint64_t req;
-    uint32_t len;
+    uint16_t type = 0;
+    uint64_t req = 0;
+    uint32_t len = 0;
     if (hc2_read_frame(fd, &type, &req, payload, &len, 3000) < 0 ||
         type != LMUX_HC2_ERROR || req != want_req || len < 4 ||
-        lmux_get_le32(payload) != want_code)
+        lmux_get_le32(payload) != want_code) {
+        fprintf(stderr,
+                "hc2_expect_error want_req=%llu want_code=%u got_type=%u got_req=%llu got_len=%u got_code=%u\n",
+                (unsigned long long)want_req, want_code, type,
+                (unsigned long long)req, len,
+                len >= 4 ? lmux_get_le32(payload) : 0);
         return -1;
+    }
     return 0;
 }
 
@@ -724,8 +730,10 @@ static int hc2_connect_hello(const char *path)
         return -1;
     }
     caps = lmux_get_le32(payload);
-    if ((caps & (LMUX_HC2_CAP_STATUS | LMUX_HC2_CAP_EXEC | LMUX_HC2_CAP_FILE)) !=
-        (LMUX_HC2_CAP_STATUS | LMUX_HC2_CAP_EXEC | LMUX_HC2_CAP_FILE)) {
+    if ((caps & (LMUX_HC2_CAP_STATUS | LMUX_HC2_CAP_EXEC |
+                 LMUX_HC2_CAP_FILE | LMUX_HC2_CAP_FILE_LIFECYCLE)) !=
+        (LMUX_HC2_CAP_STATUS | LMUX_HC2_CAP_EXEC |
+         LMUX_HC2_CAP_FILE | LMUX_HC2_CAP_FILE_LIFECYCLE)) {
         close(fd);
         return -1;
     }
@@ -1118,6 +1126,80 @@ static int hc2_file_start(int fd, uint16_t type, uint64_t req,
         hc2_put_string(p, sizeof(p), &off, b) < 0)
         return -1;
     return hc2_send_frame(fd, type, req, p, (uint32_t)off);
+}
+
+static int hc2_file_start_idempotent(int fd, uint16_t type, uint64_t req,
+                                     const char *request_namespace,
+                                     const char *request_token,
+                                     const char *a, const char *b)
+{
+    uint8_t p[LMUX_HC2_MAX_PAYLOAD];
+    size_t off = 0;
+    if (hc2_put_string(p, sizeof(p), &off, request_namespace) < 0 ||
+        hc2_put_string(p, sizeof(p), &off, request_token) < 0 ||
+        hc2_put_string(p, sizeof(p), &off, a) < 0 ||
+        hc2_put_string(p, sizeof(p), &off, b) < 0)
+        return -1;
+    return hc2_send_frame(fd, type, req, p, (uint32_t)off);
+}
+
+static int hc2_file_status_token(int fd, uint64_t req,
+                                 const char *request_namespace,
+                                 const char *request_token)
+{
+    uint8_t p[LMUX_HC2_MAX_PAYLOAD];
+    size_t off = 0;
+    if (hc2_put_string(p, sizeof(p), &off, request_namespace) < 0 ||
+        hc2_put_string(p, sizeof(p), &off, request_token) < 0)
+        return -1;
+    return hc2_send_frame(fd, LMUX_HC2_FILE_STATUS_TOKEN, req,
+                          p, (uint32_t)off);
+}
+
+static int hc2_wait_file_state(int fd, uint64_t want_req, int timeout_ms,
+                               uint8_t *state, uint64_t *op_id)
+{
+    uint8_t payload[LMUX_HC2_MAX_PAYLOAD];
+    uint16_t type;
+    uint64_t req;
+    uint32_t len;
+    long long end = now_ms() + timeout_ms;
+    while (now_ms() < end) {
+        int rem = (int)(end - now_ms());
+        if (hc2_read_frame(fd, &type, &req, payload, &len, rem) < 0)
+            return -1;
+        if (type == LMUX_HC2_FILE_STATE && req == want_req && len >= 96) {
+            if (state)
+                *state = payload[53];
+            if (op_id)
+                *op_id = hc2_test_get_u64(payload);
+            return 0;
+        }
+        if (type == LMUX_HC2_ERROR && req == want_req)
+            return -1;
+    }
+    return -1;
+}
+
+static int hc2_wait_file_done(int fd, uint64_t want_op, int timeout_ms)
+{
+    uint8_t payload[LMUX_HC2_MAX_PAYLOAD];
+    uint16_t type;
+    uint64_t req;
+    uint32_t len;
+    long long end = now_ms() + timeout_ms;
+    while (now_ms() < end) {
+        int rem = (int)(end - now_ms());
+        if (hc2_read_frame(fd, &type, &req, payload, &len, rem) < 0)
+            return -1;
+        if (type == LMUX_HC2_FILE_DONE && len >= 48 &&
+            hc2_test_get_u64(payload) == want_op)
+            return 0;
+        if (type == LMUX_HC2_FILE_ERROR && len >= 12 &&
+            hc2_test_get_u64(payload) == want_op)
+            return -1;
+    }
+    return -1;
 }
 
 static int wait_marker(const char *path, int timeout_ms)
@@ -1526,6 +1608,12 @@ static const char *hc2_type_name(uint16_t type)
     case LMUX_HC2_FILE_PROGRESS: return "FILE_PROGRESS";
     case LMUX_HC2_FILE_DONE: return "FILE_DONE";
     case LMUX_HC2_FILE_ERROR: return "FILE_ERROR";
+    case LMUX_HC2_FILE_STATUS: return "FILE_STATUS";
+    case LMUX_HC2_FILE_CANCEL: return "FILE_CANCEL";
+    case LMUX_HC2_FILE_STATE: return "FILE_STATE";
+    case LMUX_HC2_FILE_PUT_START_IDEMPOTENT: return "FILE_PUT_START_IDEMPOTENT";
+    case LMUX_HC2_FILE_GET_START_IDEMPOTENT: return "FILE_GET_START_IDEMPOTENT";
+    case LMUX_HC2_FILE_STATUS_TOKEN: return "FILE_STATUS_TOKEN";
     default: return "UNKNOWN";
     }
 }
@@ -6870,7 +6958,7 @@ static int structured_control_test(void)
     char carrier[160], control[160], structured[160], console[160], file_sock[160];
     char file_src[160], file_target[160], file_got[160], src_hex[65], got_hex[65];
     char pty_arg[360], file_arg[240], out[32768];
-    pid_t sup = -1, host = -1;
+    pid_t sup = -1, host = -1, worker = -1;
     int fd = -1, rc = 1;
     uint8_t payload[LMUX_HC2_MAX_PAYLOAD], stdin_payload[64];
     uint16_t type;
@@ -6886,6 +6974,7 @@ static int structured_control_test(void)
     char stdout_seen[64] = {0}, stderr_seen[64] = {0}, cat_seen[64] = {0};
     size_t cat_len = 0;
     int done = 0;
+    int worker_stopped = 0;
     const char *where = "setup";
 
     if (hc2_reader_fragmentation_selftest() < 0) {
@@ -6906,6 +6995,9 @@ static int structured_control_test(void)
     snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
     sup = spawn_supervisor_with_storage(carrier, NULL);
     if (sup <= 0)
+        goto out;
+    worker = wait_child_pid(sup, -1, 10000);
+    if (worker <= 0)
         goto out;
     host = spawn_host_structured(carrier, control, structured, pty_arg, file_arg);
     if (host <= 0)
@@ -7239,6 +7331,276 @@ static int structured_control_test(void)
         files_equal(file_src, file_got) < 0)
         goto out;
 
+    where = "structured file lifecycle cancel";
+    if (make_file(file_src, 64u * 1024u * 1024u) < 0 ||
+        hc2_file_start(fd, LMUX_HC2_FILE_PUT_START, 43,
+                       file_src, file_target) < 0)
+        goto out;
+    file_op = 0;
+    while (!file_op) {
+        if (hc2_read_frame(fd, &type, &req, payload, &len, 10000) < 0)
+            goto out;
+        if (type == LMUX_HC2_FILE_STARTED && len >= 24)
+            file_op = hc2_test_get_u64(payload);
+        else if (type == LMUX_HC2_FILE_ERROR || type == LMUX_HC2_ERROR)
+            goto out;
+    }
+    if (kill(worker, SIGSTOP) < 0)
+        goto out;
+    worker_stopped = 1;
+    if (hc2_file_start(fd, LMUX_HC2_FILE_GET_START, 430,
+                       file_target, file_got) < 0)
+        goto out;
+    for (;;) {
+        if (hc2_read_frame(fd, &type, &req, payload, &len, 10000) < 0)
+            goto out;
+        if (type == LMUX_HC2_ERROR && req == 430 && len >= 8) {
+            if (lmux_get_le32(payload) != LMUX_HC2_E_BUSY ||
+                lmux_get_le32(payload + 4) == 0)
+                goto out;
+            break;
+        }
+        if (type == LMUX_HC2_FILE_ERROR)
+            goto out;
+    }
+    hc2_test_put_u64(payload, file_op);
+    if (hc2_send_frame(fd, LMUX_HC2_FILE_STATUS, 44, payload, 8) < 0)
+        goto out;
+    for (;;) {
+        if (hc2_read_frame(fd, &type, &req, payload, &len, 10000) < 0)
+            goto out;
+        if (type == LMUX_HC2_FILE_STATE && req == 44 && len >= 96) {
+            if (hc2_test_get_u64(payload) != file_op ||
+                payload[53] != LMUX_HC2_FILE_RUNNING)
+                goto out;
+            break;
+        }
+        if (type == LMUX_HC2_FILE_ERROR || type == LMUX_HC2_ERROR)
+            goto out;
+    }
+    hc2_test_put_u64(payload, file_op);
+    if (hc2_send_frame(fd, LMUX_HC2_FILE_CANCEL, 45, payload, 8) < 0)
+        goto out;
+    for (;;) {
+        if (hc2_read_frame(fd, &type, &req, payload, &len, 10000) < 0)
+            goto out;
+        if (type == LMUX_HC2_FILE_STATE && req == 45 && len >= 96) {
+            if (hc2_test_get_u64(payload) != file_op ||
+                payload[53] != LMUX_HC2_FILE_CANCELLED)
+                goto out;
+            break;
+        }
+        if (type == LMUX_HC2_FILE_ERROR || type == LMUX_HC2_ERROR)
+            goto out;
+    }
+    if (kill(worker, SIGCONT) < 0)
+        goto out;
+    worker_stopped = 0;
+
+    where = "structured file after cancel";
+    if (make_file(file_src, 1024 * 1024) < 0 ||
+        hc2_file_start(fd, LMUX_HC2_FILE_PUT_START, 46,
+                       file_src, file_target) < 0)
+        goto out;
+    done = 0;
+    while (!done) {
+        if (hc2_read_frame(fd, &type, &req, payload, &len, 10000) < 0)
+            goto out;
+        if (type == LMUX_HC2_FILE_DONE && len >= 48)
+            done = 1;
+        else if (type == LMUX_HC2_FILE_ERROR || type == LMUX_HC2_ERROR)
+            goto out;
+    }
+
+    where = "structured file disconnect status";
+    done = 0;
+    if (make_file(file_src, 64u * 1024u * 1024u) < 0 ||
+        hc2_file_start(fd, LMUX_HC2_FILE_PUT_START, 47,
+                       file_src, file_target) < 0)
+        goto out;
+    file_op = 0;
+    while (!file_op) {
+        if (hc2_read_frame(fd, &type, &req, payload, &len, 10000) < 0)
+            goto out;
+        if (type == LMUX_HC2_FILE_STARTED && len >= 24)
+            file_op = hc2_test_get_u64(payload);
+        else if (type == LMUX_HC2_FILE_ERROR || type == LMUX_HC2_ERROR)
+            goto out;
+    }
+    close(fd);
+    fd = -1;
+    fd = hc2_connect_hello(structured);
+    if (fd < 0)
+        goto out;
+    hc2_test_put_u64(payload, file_op);
+    if (hc2_send_frame(fd, LMUX_HC2_FILE_STATUS, 48, payload, 8) < 0)
+        goto out;
+    for (;;) {
+        if (hc2_read_frame(fd, &type, &req, payload, &len, 10000) < 0)
+            goto out;
+        if (type == LMUX_HC2_FILE_STATE && req == 48 && len >= 96) {
+            if (hc2_test_get_u64(payload) != file_op ||
+                (payload[53] != LMUX_HC2_FILE_RUNNING &&
+                 payload[53] != LMUX_HC2_FILE_DONE_STATE))
+                goto out;
+            if (payload[53] == LMUX_HC2_FILE_RUNNING) {
+                hc2_test_put_u64(payload, file_op);
+                if (hc2_send_frame(fd, LMUX_HC2_FILE_CANCEL, 49,
+                                   payload, 8) < 0)
+                    goto out;
+            } else {
+                done = 1;
+            }
+            break;
+        }
+        if (type == LMUX_HC2_FILE_ERROR || type == LMUX_HC2_ERROR)
+            goto out;
+    }
+    if (!done) {
+        for (;;) {
+            if (hc2_read_frame(fd, &type, &req, payload, &len, 10000) < 0)
+                goto out;
+            if (type == LMUX_HC2_FILE_STATE && req == 49 && len >= 96) {
+                if (payload[53] != LMUX_HC2_FILE_CANCELLED)
+                    goto out;
+                break;
+            }
+            if (type == LMUX_HC2_FILE_ERROR || type == LMUX_HC2_ERROR)
+                goto out;
+        }
+    }
+
+    {
+        const char *request_namespace = "mcp-session-recovery";
+        uint64_t discarded_op = 0, recovered_op = 0, duplicate_op = 0;
+        uint8_t state = 0;
+        int i;
+
+        where = "idempotent start lost response running";
+        if (make_file(file_src, 64u * 1024u * 1024u) < 0 ||
+            kill(worker, SIGSTOP) < 0)
+            goto out;
+        worker_stopped = 1;
+        if (hc2_file_start_idempotent(
+                fd, LMUX_HC2_FILE_PUT_START_IDEMPOTENT, 500,
+                request_namespace, "lost-running", file_src,
+                file_target) < 0 ||
+            hc2_wait_file_state(fd, 500, 10000, &state,
+                                &discarded_op) < 0 ||
+            state != LMUX_HC2_FILE_RUNNING || !discarded_op)
+            goto out;
+        close(fd);
+        fd = -1;
+        fd = hc2_connect_hello_retry(structured, 3000);
+        if (fd < 0 ||
+            hc2_file_status_token(fd, 501, request_namespace,
+                                  "lost-running") < 0 ||
+            hc2_wait_file_state(fd, 501, 10000, &state,
+                                &recovered_op) < 0 ||
+            state != LMUX_HC2_FILE_RUNNING ||
+            recovered_op != discarded_op)
+            goto out;
+
+        where = "idempotent duplicate running";
+        if (hc2_file_start_idempotent(
+                fd, LMUX_HC2_FILE_PUT_START_IDEMPOTENT, 502,
+                request_namespace, "lost-running", file_src,
+                file_target) < 0 ||
+            hc2_wait_file_state(fd, 502, 10000, &state,
+                                &duplicate_op) < 0 ||
+            state != LMUX_HC2_FILE_RUNNING ||
+            duplicate_op != recovered_op)
+            goto out;
+        if (hc2_file_start_idempotent(
+                fd, LMUX_HC2_FILE_PUT_START_IDEMPOTENT, 503,
+                request_namespace, "lost-running", file_src,
+                file_got) < 0 ||
+            hc2_expect_error(fd, 503, LMUX_HC2_E_INVALID_ARGUMENT) < 0)
+            goto out;
+
+        where = "idempotent recovered cancel";
+        hc2_test_put_u64(payload, recovered_op);
+        if (hc2_send_frame(fd, LMUX_HC2_FILE_CANCEL, 504,
+                           payload, 8) < 0 ||
+            hc2_wait_file_state(fd, 504, 10000, &state, NULL) < 0 ||
+            state != LMUX_HC2_FILE_CANCELLED ||
+            kill(worker, SIGCONT) < 0)
+            goto out;
+        worker_stopped = 0;
+
+        where = "idempotent start lost response done";
+        if (make_file(file_src, 1024u * 1024u) < 0 ||
+            hc2_file_start_idempotent(
+                fd, LMUX_HC2_FILE_PUT_START_IDEMPOTENT, 510,
+                request_namespace, "lost-done", file_src,
+                file_target) < 0 ||
+            hc2_wait_file_state(fd, 510, 10000, &state,
+                                &discarded_op) < 0 ||
+            !discarded_op)
+            goto out;
+        close(fd);
+        fd = -1;
+        fd = hc2_connect_hello_retry(structured, 3000);
+        if (fd < 0)
+            goto out;
+        if (hc2_file_status_token(fd, 511, request_namespace,
+                                  "lost-done") < 0 ||
+            hc2_wait_file_state(fd, 511, 10000, &state,
+                                &recovered_op) < 0)
+            goto out;
+        if (state == LMUX_HC2_FILE_RUNNING) {
+            if (hc2_wait_file_done(fd, recovered_op, 15000) < 0 ||
+                hc2_file_status_token(fd, 512, request_namespace,
+                                      "lost-done") < 0 ||
+                hc2_wait_file_state(fd, 512, 10000, &state,
+                                    &recovered_op) < 0)
+                goto out;
+        }
+        if (state != LMUX_HC2_FILE_DONE_STATE ||
+            recovered_op != discarded_op)
+            goto out;
+
+        where = "idempotent duplicate terminal";
+        if (hc2_file_start_idempotent(
+                fd, LMUX_HC2_FILE_PUT_START_IDEMPOTENT, 600,
+                request_namespace, "lost-done", file_src,
+                file_target) < 0 ||
+            hc2_wait_file_state(fd, 600, 10000, &state,
+                                &duplicate_op) < 0 ||
+            state != LMUX_HC2_FILE_DONE_STATE ||
+            duplicate_op != recovered_op)
+            goto out;
+
+        where = "idempotent terminal eviction";
+        for (i = 0; i < 8; i++) {
+            char token[32];
+            uint64_t start_req = 610 + (uint64_t)i * 32;
+            uint64_t evict_op = 0;
+            snprintf(token, sizeof(token), "evict-%d", i);
+            if (hc2_file_start_idempotent(
+                    fd, LMUX_HC2_FILE_PUT_START_IDEMPOTENT, start_req,
+                    request_namespace, token, file_src, file_target) < 0 ||
+                hc2_wait_file_state(fd, start_req, 10000, &state,
+                                    &evict_op) < 0 ||
+                !evict_op)
+                goto out;
+            if (state == LMUX_HC2_FILE_RUNNING &&
+                hc2_wait_file_done(fd, evict_op, 15000) < 0)
+                goto out;
+            if (hc2_file_status_token(fd, start_req + 1,
+                                      request_namespace, token) < 0 ||
+                hc2_wait_file_state(fd, start_req + 1, 10000, &state,
+                                    NULL) < 0)
+                goto out;
+            if (state != LMUX_HC2_FILE_DONE_STATE)
+                goto out;
+        }
+        if (hc2_file_status_token(fd, 900, request_namespace,
+                                  "lost-done") < 0 ||
+            hc2_expect_error(fd, 900, LMUX_HC2_E_NOT_FOUND) < 0)
+            goto out;
+    }
+
     where = "disconnect reattach";
     if (hc2_exec_start(fd, 7, "", argv3, 3) < 0)
         goto out;
@@ -7303,6 +7665,8 @@ out:
     }
     if (fd >= 0)
         close(fd);
+    if (worker_stopped)
+        kill(worker, SIGCONT);
     stop_pid(host);
     stop_pid(sup);
     unlink(carrier);
@@ -7894,14 +8258,16 @@ static int structured_worker_replacement_test(void)
 {
     char dir[] = "/tmp/lmux-structured-worker-XXXXXX";
     char carrier[160], control[160], structured[160], console[160], file_sock[160];
-    char pty_arg[360], file_arg[240], out[32768];
+    char pty_arg[360], file_arg[240], file_src[160], file_target[160], out[32768];
     pid_t sup = -1, host = -1, worker = -1, worker2 = -1;
     int fd = -1, console_fd = -1, rc = 1;
     uint8_t payload[LMUX_HC2_MAX_PAYLOAD];
     uint16_t type;
-    uint64_t req, ref = 0;
+    uint64_t req, ref = 0, file_op = 0;
     uint64_t fresh_ref = 0;
     uint64_t second_ref = 0;
+    uint64_t token_file_op = 0;
+    uint8_t token_file_state = 0;
     uint32_t len;
     long shell_pid = -1, shell_pid_after = -1;
     const char *argv[] = {"/bin/sh", "-c", "printf PRE; sleep 30"};
@@ -7923,6 +8289,8 @@ static int structured_worker_replacement_test(void)
     snprintf(structured, sizeof(structured), "%s/control-v2.sock", dir);
     snprintf(console, sizeof(console), "%s/console.sock", dir);
     snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(file_src, sizeof(file_src), "%s/file-src.bin", dir);
+    snprintf(file_target, sizeof(file_target), "%s/file-target.bin", dir);
     snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
     snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
 
@@ -7969,6 +8337,16 @@ static int structured_worker_replacement_test(void)
             goto out;
         }
     }
+
+    where = "start file before worker replacement";
+    if (make_file(file_src, 64u * 1024u * 1024u) < 0 ||
+        hc2_file_start_idempotent(
+            fd, LMUX_HC2_FILE_PUT_START_IDEMPOTENT, 200,
+            "worker-replacement", "lost-transfer",
+            file_src, file_target) < 0 ||
+        hc2_wait_file_state(fd, 200, 7000, NULL, &file_op) < 0 ||
+        !file_op)
+        goto out;
 
     where = "replace worker";
     kill(worker, SIGKILL);
@@ -8017,6 +8395,30 @@ static int structured_worker_replacement_test(void)
             goto out;
         }
     }
+
+    where = "file lost after worker replacement";
+    hc2_test_put_u64(payload, file_op);
+    if (hc2_send_frame(fd, LMUX_HC2_FILE_STATUS, 206, payload, 8) < 0)
+        goto out;
+    for (;;) {
+        if (hc2_read_frame(fd, &type, &req, payload, &len, 10000) < 0)
+            goto out;
+        if (type == LMUX_HC2_FILE_STATE && req == 206 && len >= 96) {
+            if (hc2_test_get_u64(payload) != file_op ||
+                payload[53] != LMUX_HC2_FILE_LOST ||
+                lmux_get_le32(payload + 48) != LMUX_HC2_E_TARGET_LOST)
+                goto out;
+            break;
+        }
+        if (type == LMUX_HC2_ERROR)
+            goto out;
+    }
+    if (hc2_file_status_token(fd, 209, "worker-replacement",
+                              "lost-transfer") < 0 ||
+        hc2_wait_file_state(fd, 209, 10000, &token_file_state,
+                            &token_file_op) < 0 ||
+        token_file_op != file_op || token_file_state != LMUX_HC2_FILE_LOST)
+        goto out;
 
     where = "stale ref errors";
     hc2_test_put_u64(payload, ref);
@@ -8116,6 +8518,8 @@ out:
     unlink(structured);
     unlink(console);
     unlink(file_sock);
+    unlink(file_src);
+    unlink(file_target);
     rmdir(dir);
     return rc;
 }
@@ -8604,6 +9008,7 @@ static int mixed_service_soak_test(void)
     char carrier[160], control[160], structured[160], console[160], file_sock[160];
     char unix_host[160], unix_target[160], pty_arg[320], file_arg[240], unix_arg[400];
     char src[160], target_path[160], got_path[160], out[32768];
+    char producer_cmd[512];
     pid_t sup = -1, host = -1, worker = -1, worker2 = -1;
     int fd = -1, console_fd = -1, uh = -1, ut = -1, rc = 1;
     int host_fd_base = -1, host_fd_end = -1;
@@ -8669,6 +9074,12 @@ static int mixed_service_soak_test(void)
         goto out;
     shell_pid = parse_pid_marker(out, "MPID:");
     if (shell_pid <= 0)
+        goto out;
+    where = "start detached PTY producer";
+    snprintf(producer_cmd, sizeof(producer_cmd),
+             "while [ ! -f %s ]; do printf '\\132'; done\n", target_path);
+    if (write_all(console_fd, producer_cmd, strlen(producer_cmd)) < 0 ||
+        read_until(console_fd, "ZZZZ", out, sizeof(out), 5000) < 0)
         goto out;
     close(console_fd);
     console_fd = -1;

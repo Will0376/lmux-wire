@@ -217,8 +217,22 @@ func TestMCPDebugToolLifecycleWithFakeGDB(t *testing.T) {
 	callTool(t, clientSession, "debug_select_thread", map[string]any{"debug_token": token, "thread_id": "1"})
 	callTool(t, clientSession, "debug_registers", map[string]any{"debug_token": token})
 	mem := callTool(t, clientSession, "debug_memory_read", map[string]any{"debug_token": token, "address": "0x1000", "length": 2})
-	if mem["bytes"].(float64) != 2 {
+	if mem["bytes"].(float64) != 2 || mem["base64"] != "QUI=" || len(mem) != 2 {
 		t.Fatalf("bad memory read: %v", mem)
+	}
+	hexMem := callTool(t, clientSession, "debug_memory_read", map[string]any{"debug_token": token, "address": "symbol+4", "length": 2, "format": "hex"})
+	if hexMem["address"] != "0x1000" || hexMem["bytes"].(float64) != 2 ||
+		!strings.Contains(hexMem["hex"].(string), "41 42") ||
+		!strings.HasSuffix(hexMem["hex"].(string), "|AB|") {
+		t.Fatalf("bad hex memory read: %v", hexMem)
+	}
+	bothMem := callTool(t, clientSession, "debug_memory_read", map[string]any{"debug_token": token, "address": "0x1000", "length": 2, "format": "both"})
+	if bothMem["base64"] != "QUI=" || bothMem["hex"] != hexMem["hex"] {
+		t.Fatalf("bad both memory read: %v", bothMem)
+	}
+	invalidMem := callToolRaw(t, clientSession, 5*time.Second, "debug_memory_read", map[string]any{"debug_token": token, "address": "0x1000", "length": 2, "format": "raw"})
+	if !invalidMem.IsError {
+		t.Fatalf("invalid memory format accepted: %#v", invalidMem.StructuredContent)
 	}
 	callTool(t, clientSession, "debug_breakpoint_delete", map[string]any{"debug_token": token, "breakpoint_id": "1"})
 	detach := callTool(t, clientSession, "debug_detach", map[string]any{"debug_token": token})
