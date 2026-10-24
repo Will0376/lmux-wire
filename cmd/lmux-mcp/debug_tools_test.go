@@ -199,10 +199,7 @@ func TestMCPDebugToolLifecycleWithFakeGDB(t *testing.T) {
 		t.Fatalf("bad breakpoint: %v", bp)
 	}
 	callTool(t, clientSession, "debug_continue", map[string]any{"debug_token": token})
-	wait := callTool(t, clientSession, "debug_wait", map[string]any{"debug_token": token, "timeout_ms": 1000})
-	if wait["state"] != "STOPPED" || wait["stop_reason"] != "breakpoint-hit" {
-		t.Fatalf("bad wait: %v", wait)
-	}
+	waitForMCPDebugStopped(t, clientSession, token, "breakpoint-hit", time.Second)
 	callTool(t, clientSession, "debug_interrupt", map[string]any{"debug_token": token})
 	callTool(t, clientSession, "debug_step", map[string]any{"debug_token": token, "kind": "next"})
 	bt := callTool(t, clientSession, "debug_backtrace", map[string]any{"debug_token": token, "max_frames": 8})
@@ -294,6 +291,40 @@ func waitForMCPStdin(t *testing.T, fhc *mcpFakeHC2, want string) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("target stdin missing %q", want)
+}
+
+func waitForMCPDebugStopped(t *testing.T, session *mcp.ClientSession,
+	token, reason string, timeout time.Duration) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last map[string]any
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.Fatalf("timed out waiting for debug stop reason %q, last=%v", reason, last)
+		}
+		timeoutMS := int(remaining / time.Millisecond)
+		if timeoutMS < 1 {
+			timeoutMS = 1
+		}
+		last = callTool(t, session, "debug_wait", map[string]any{
+			"debug_token": token,
+			"timeout_ms":  timeoutMS,
+		})
+		switch last["state"] {
+		case "STOPPED":
+			if last["stop_reason"] != reason {
+				t.Fatalf("debug stopped for unexpected reason: %v", last)
+			}
+			return last
+		case "RUNNING":
+			// debug_wait reports every state notification. A queued *running
+			// event may therefore wake this waiter before the following
+			// *stopped event is published.
+		default:
+			t.Fatalf("unexpected debug state while waiting for stop: %v", last)
+		}
+	}
 }
 
 func mcpExecStatePayload(ref uint64, state byte) []byte {

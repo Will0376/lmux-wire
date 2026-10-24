@@ -381,12 +381,19 @@ func TestDebugAsyncStepInterruptDoesNotWaitForStop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if intr["state"] != "RUNNING" {
-		t.Fatalf("interrupt should return before later *stopped, got %#v", intr)
+	w := intr
+	switch intr["state"] {
+	case "RUNNING":
+		w = s.Wait(ctx, time.Second)
+	case "STOPPED":
+		// The asynchronous stop may be published before Interrupt takes its
+		// result snapshot. Interrupt does not require STOPPED, but it may
+		// legitimately observe it.
+	default:
+		t.Fatalf("unexpected interrupt state: %#v", intr)
 	}
-	w := s.Wait(ctx, time.Second)
 	if w["state"] != "STOPPED" || w["stop_reason"] != "signal-received" {
-		t.Fatalf("debug_wait did not observe later stop: %#v", w)
+		t.Fatalf("interrupt stop was not observed: %#v", w)
 	}
 	log := mustReadString(t, filepath.Join(dir, "gdb.commands"))
 	asyncIdx := strings.Index(log, "-gdb-set mi-async on")

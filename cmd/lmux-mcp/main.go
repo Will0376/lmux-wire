@@ -976,10 +976,7 @@ func (a *app) toolDebugStart(req debugmgr.StartRequest) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	st := s.Status()
-	st["debug_token"] = s.Token
-	st["state"] = s.State
-	return st, nil
+	return s.Status(), nil
 }
 
 func (a *app) toolDebugList() (any, error) {
