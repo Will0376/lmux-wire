@@ -16,9 +16,30 @@ ci-check:
     DEBIAN_FRONTEND: noninteractive
   before_script:
     - apt-get update
-    - apt-get install --yes --no-install-recommends build-essential file git binutils-arm-linux-gnueabi gcc-arm-linux-gnueabi libc6-dev-armel-cross
+    - apt-get install --yes --no-install-recommends build-essential file git binutils-arm-linux-gnueabi gcc-arm-linux-gnueabi libc6-dev-armel-cross libcap2-bin passwd util-linux
+    - |
+      printf '%s\n' 'GitLab container execution context:'
+      id
+      uname -a
+      grep -E '^(Cap(Inh|Prm|Eff|Bnd|Amb)|NoNewPrivs):' /proc/self/status
+      capsh --print
+    - useradd --create-home --shell /bin/sh lmux-ci
+    - chown -R lmux-ci:lmux-ci "$CI_PROJECT_DIR"
   script:
-    - sh scripts/ci-check.sh
+    # TIOCEXCL intentionally permits CAP_SYS_ADMIN to bypass exclusivity.
+    - |
+      setpriv --reuid=lmux-ci --regid=lmux-ci --init-groups \
+        --inh-caps=-all --ambient-caps=-all --no-new-privs \
+        env HOME=/home/lmux-ci sh -ec '
+          printf "%s\n" "GitLab test execution context:"
+          id
+          uname -a
+          grep -E "^(Cap(Inh|Prm|Eff|Bnd|Amb)|NoNewPrivs):" /proc/self/status
+          capsh --print
+          cap_eff=$(sed -n "s/^CapEff:[[:space:]]*//p" /proc/self/status)
+          test "$cap_eff" = 0000000000000000
+          exec sh scripts/ci-check.sh
+        '
   artifacts:
     expire_in: 7 days
     paths:
@@ -29,4 +50,3 @@ ci-check:
       - build/target/lmux
       - build/target/lmuxd
       - build/target/lmux-uart-dispatch
-
