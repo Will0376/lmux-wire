@@ -1,6 +1,7 @@
 #include "dispatcher.h"
 #include "dispatch_ipc.h"
 #include "lmc1.h"
+#include "version.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -706,6 +707,11 @@ int lmux_uart_dispatch_main(int argc, char **argv)
     a.tty_fd = a.listen_fd = a.peer_fd = a.trace_fd = -1;
     a.peer_uid = geteuid();
     a.active_loss = ACTIVE_LOSS_CONSOLE;
+    if (argc >= 2 && strcmp(argv[1], "--version") == 0) {
+        printf("lmux-uart-dispatch %s (%s)\n", LMUX_BUILD_VERSION,
+               LMUX_PROJECT_NAME);
+        return 0;
+    }
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--tty") == 0 && ++i < argc)
             tty_path = argv[i];

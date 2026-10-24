@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Install native and ARM build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            file \
+            binutils-arm-linux-gnueabi \
+            gcc-arm-linux-gnueabi \
+            libc6-dev-armel-cross
+
+      - name: Run CI checks
+        run: sh scripts/ci-check.sh
+
+      - name: Upload software build outputs
+        uses: actions/upload-artifact@v7
+        with:
+          name: lmux-software-build-${{ github.sha }}
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            build/host/lmux
+            build/host/lmuxd
+            build/host/lmux-uart-dispatch
+            build/host/lmux-mcp
+            build/target/lmux
+            build/target/lmuxd
+            build/target/lmux-uart-dispatch
+

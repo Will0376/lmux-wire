@@ -1,0 +1,32 @@
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+
+stages:
+  - test
+
+ci-check:
+  stage: test
+  image: golang:1.25-bookworm
+  variables:
+    DEBIAN_FRONTEND: noninteractive
+  before_script:
+    - apt-get update
+    - apt-get install --yes --no-install-recommends build-essential file git binutils-arm-linux-gnueabi gcc-arm-linux-gnueabi libc6-dev-armel-cross
+  script:
+    - sh scripts/ci-check.sh
+  artifacts:
+    expire_in: 7 days
+    paths:
+      - build/host/lmux
+      - build/host/lmuxd
+      - build/host/lmux-uart-dispatch
+      - build/host/lmux-mcp
+      - build/target/lmux
+      - build/target/lmuxd
+      - build/target/lmux-uart-dispatch
+

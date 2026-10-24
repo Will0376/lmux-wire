@@ -303,6 +303,11 @@ func connectInMemory(t *testing.T, server *mcp.Server) *mcp.ClientSession {
 	if got := clientSession.InitializeResult().ProtocolVersion; got != "2026-07-28" {
 		t.Fatalf("protocol version = %q, want 2026-07-28", got)
 	}
+	serverInfo := clientSession.InitializeResult().ServerInfo
+	if serverInfo == nil || serverInfo.Name != "lmux-mcp" ||
+		serverInfo.Version != buildVersion {
+		t.Fatalf("server info = %#v, want lmux-mcp %q", serverInfo, buildVersion)
+	}
 	return clientSession
 }
 

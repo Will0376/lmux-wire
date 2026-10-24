@@ -23,6 +23,8 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+var buildVersion = "development"
+
 type app struct {
 	controlPath string
 	manager     *mcpapp.Manager
@@ -43,6 +45,7 @@ func main() {
 	var controlPath, runtimeDir string
 	var gdbPath, targetGDBServer, gdbSysroot, gdbSolib string
 	var maxDebugSessions, gdbRemoteTimeout int
+	var showVersion bool
 	flag.StringVar(&controlPath, "control", envDefault("LMUX_MCP_CONTROL", "/run/lmux/control-v2.sock"), "lmuxd structured control socket")
 	flag.StringVar(&runtimeDir, "runtime-dir", envDefault("LMUX_MCP_RUNTIME_DIR", ""), "lmux-mcp runtime directory (default: $XDG_RUNTIME_DIR/lmux/mcp)")
 	flag.StringVar(&runtimeDir, "runtime", envDefault("LMUX_MCP_RUNTIME_DIR", ""), "alias for --runtime-dir")
@@ -52,7 +55,12 @@ func main() {
 	flag.StringVar(&gdbSysroot, "gdb-sysroot", envDefault("LMUX_MCP_GDB_SYSROOT", ""), "optional GDB sysroot")
 	flag.StringVar(&gdbSolib, "gdb-solib-search-path", envDefault("LMUX_MCP_GDB_SOLIB_SEARCH_PATH", ""), "optional GDB solib-search-path")
 	flag.IntVar(&gdbRemoteTimeout, "gdb-remote-timeout", envIntDefault("LMUX_MCP_GDB_REMOTE_TIMEOUT", debugmgr.DefaultGDBRemoteTimeoutSeconds), "GDB remotetimeout in seconds for target remote negotiation (1..300)")
+	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.Parse()
+	if showVersion {
+		fmt.Printf("lmux-mcp %s (LMUX Wire)\n", buildVersion)
+		return
+	}
 	if err := validateGDBRemoteTimeoutSeconds(gdbRemoteTimeout); err != nil {
 		fmt.Fprintf(os.Stderr, "lmux-mcp: %v\n", err)
 		os.Exit(2)
@@ -418,7 +426,7 @@ func mustJSON(v any) string {
 }
 
 func newMCPServer(a *app) *mcp.Server {
-	server := mcp.NewServer(&mcp.Implementation{Name: "lmux-mcp", Version: "0.1"}, nil)
+	server := mcp.NewServer(&mcp.Implementation{Name: "lmux-mcp", Version: buildVersion}, nil)
 	for _, spec := range tools() {
 		name := spec.Name
 		server.AddTool(&mcp.Tool{

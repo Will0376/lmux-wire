@@ -192,6 +192,8 @@ selftest: $(HOST_DIR)/lmuxd $(HOST_DIR)/lmux $(HOST_DIR)/lmux-uart-dispatch $(HO
 	$(HOST_DIR)/test_lmux2_file_integration
 	$(HOST_DIR)/test_supervisor_integration
 	test "$$($(HOST_DIR)/lmux --version | sed 's/^lmux //')" = "$$($(HOST_DIR)/lmuxd --version | sed 's/^lmuxd //')"
+	test "$$($(HOST_DIR)/lmux --version | sed 's/^lmux //')" = "$$($(HOST_DIR)/lmux-uart-dispatch --version | sed 's/^lmux-uart-dispatch //')"
+	test "$$($(HOST_DIR)/lmux --version | sed 's/^lmux //')" = "$$($(HOST_DIR)/lmux-mcp --version | sed 's/^lmux-mcp //')"
 	grep -F -q "$$($(HOST_DIR)/lmux --version | sed 's/^lmux //' | sed 's/ (LMUX Wire)//')" $(GEN_DIR)/version.h
 	test "$$($(HOST_DIR)/lmux 2>&1 | sed -n '1p')" = "$$($(HOST_DIR)/lmux --version)"
 	test "$$($(HOST_DIR)/lmuxd 2>&1 | sed -n '1p')" = "$$($(HOST_DIR)/lmuxd --version)"
@@ -228,8 +230,8 @@ $(HOST_DIR)/lmux: $(LMUX) $(COMMON_SRC) $(ZEROMUX_SRC) $(CARRIER_DIR)/carrier_tt
 $(HOST_DIR)/lmux-uart-dispatch: $(DISPATCHER_SRC) $(CARRIER_HDRS) $(GEN_VERSION) | $(HOST_DIR)
 	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(DISPATCHER_SRC)
 
-$(HOST_DIR)/lmux-mcp: $(GO_SRC) | $(HOST_DIR)
-	GOCACHE=$(GO_CACHE) $(GO) build -o $@ ./cmd/lmux-mcp
+$(HOST_DIR)/lmux-mcp: $(GO_SRC) $(GEN_VERSION) | $(HOST_DIR)
+	GOCACHE=$(GO_CACHE) $(GO) build -ldflags "-X main.buildVersion=$$(cat $(GEN_DIR)/version.txt)" -o $@ ./cmd/lmux-mcp
 
 go-test:
 	GOCACHE=$(GO_CACHE) $(GO) test ./...

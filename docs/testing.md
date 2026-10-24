@@ -206,3 +206,32 @@ these findings.  Treat the stream, FILE fairness, PTY detach, target-select
 diagnostic, and failed-path cleanup observations as sequence/load-sensitive
 issues until independently diagnosed; a later successful full gate
 demonstrates gate status but does not erase them.
+
+## Continuous integration
+
+GitLab push and merge-request pipelines and the GitHub push-mirror workflow use
+the same entrypoint:
+
+```sh
+sh scripts/ci-check.sh
+```
+
+The entrypoint checks shell syntax and `git diff --check`, builds the host,
+runs `test-unit`, `test-carrier`, `test-structured-dirty`, and the focused USB
+regression, then builds and strips the ARM target binaries.  `test-unit`
+already runs `go test ./...`, while `test-carrier` already includes the
+dispatcher unit and process regressions, so CI does not run either group a
+second time.  The final artifact check requires the target runtime binaries to
+be stripped, statically linked 32-bit ARM executables marked for the soft-float
+ABI.
+
+The jobs need a native C toolchain, Go 1.25 (from `go.mod`), `file`, and the
+GNU ARM EABI soft-float compiler and binutils.  Process tests use private Unix
+sockets and child processes inside an ordinary unprivileged CI job; they do
+not require serial devices, USB access, or a hardware runner.
+
+Successful jobs retain the host runtime tools and stripped ARM runtime tools
+for seven days.  These are diagnostic CI outputs, not release or
+hardware-accepted artifacts.  Normal CI deliberately excludes
+`verify-release`, `test-services`, soak/recovery repetition, deploy, release,
+and hardware acceptance; those targets remain available for explicit gates.
