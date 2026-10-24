@@ -1,6 +1,9 @@
 #include "lmux2_runtime.h"
 #include "boot_protocol.h"
 #include "carrier.h"
+#include "carrier_manager.h"
+#include "dirty.h"
+#include "lmc1.h"
 #include "host.h"
 #include "lmux2_control.h"
 #include "lmux2_core.h"
@@ -28,9 +31,20 @@
 #include <time.h>
 #include <unistd.h>
 
+enum carrier_switch_phase {
+    CARRIER_SWITCH_IDLE = 0,
+    CARRIER_SWITCH_QUERYING,
+    CARRIER_SWITCH_WAIT_QUERY,
+    CARRIER_SWITCH_PREPARING,
+    CARRIER_SWITCH_WAIT_READY,
+    CARRIER_SWITCH_SENDING_COMMIT,
+    CARRIER_SWITCH_RESOLVING,
+    CARRIER_SWITCH_CONVERGING
+};
+
 struct v2_app {
     enum lmux2_role role;
-    struct lmux_carrier carrier;
+    struct lmux_carrier_manager carriers;
     int verbose;
     int stop;
     int worker_mode;
@@ -61,6 +75,40 @@ struct v2_app {
     struct v2_service services[V2_MAX_SERVICES];
     struct v2_target_service_status target_status[V2_MAX_SERVICES];
     struct v2_host host;
+    struct lmux_lmc1_raw_io lmc_io[LMUX_CARRIER_MAX_ENDPOINTS];
+    struct lmux_lmc1_dirty_io lmc_dirty_io[LMUX_CARRIER_MAX_ENDPOINTS];
+    struct lmux_dirty dirty;
+    int dirty_active;
+    struct {
+        enum carrier_switch_phase phase;
+        char name[LMUX_CARRIER_NAME_MAX + 1];
+        enum lmux_carrier_mode mode;
+        uint8_t nonce[LMUX_LMC1_NONCE_LEN];
+        uint8_t cookie[LMUX_LMC1_COOKIE_LEN];
+        uint8_t boot_id[LMUX_LMC1_BOOT_ID_LEN];
+        uint64_t observed_generation;
+        uint64_t committed_generation;
+        long long deadline_ms;
+        long long next_retry_ms;
+        uint64_t pre_local_conn;
+        uint64_t pre_peer_conn;
+        unsigned long long pre_established_count;
+        int old_outer_frozen;
+        int target_committed;
+        unsigned resolve_attempt;
+    } carrier_switch;
+    int carrier_committed_but_down;
+    char carrier_last_error[96];
+    struct {
+        int active;
+        unsigned endpoint;
+        size_t pos;
+        long long deadline_ms;
+        uint8_t wire[32];
+        size_t wire_len;
+    } carrier_console;
+    unsigned carrier_console_hold_mask;
+    unsigned carrier_failure_hold_mask;
 };
 
 static struct v2_app *global_v2_app;
@@ -71,6 +119,49 @@ static void build_next_output(struct v2_app *a);
 static void flush_carrier(struct v2_app *a);
 static void worker_maybe_finish_link_up(struct v2_app *a);
 static void feed_lmux_bytes(struct v2_app *a, const uint8_t *buf, size_t len);
+static void feed_raw_endpoint(struct v2_app *a, unsigned endpoint,
+                              int allow_outer);
+static void flush_raw_control(struct v2_app *a, unsigned endpoint);
+
+static enum lmux_carrier_mode active_carrier_mode(const struct v2_app *a)
+{
+    const struct lmux_carrier_endpoint *ep =
+        lmux_carrier_manager_active_endpoint_const(&a->carriers);
+    return ep ? ep->mode : LMUX_CARRIER_MODE_RAW;
+}
+
+static int lmc_any_output(const struct v2_app *a, unsigned endpoint)
+{
+    return endpoint < LMUX_CARRIER_MAX_ENDPOINTS &&
+        (lmux_lmc1_raw_has_output(&a->lmc_io[endpoint]) ||
+         lmux_lmc1_dirty_has_output(&a->lmc_dirty_io[endpoint]));
+}
+
+static int dirty_has_work(const struct lmux_dirty *d)
+{
+    unsigned i;
+    if (!d)
+        return 0;
+    if (d->output_pos < d->output_len || d->pending_fail)
+        return 1;
+    for (i = 0; i < LMUX_DIRTY_WINDOW_MAX; i++)
+        if (d->tx[i].used)
+            return 1;
+    for (i = 0; i < LMUX_DIRTY_CONTROL_MAX; i++)
+        if (d->control[i].used)
+            return 1;
+    return 0;
+}
+
+static struct lmux_carrier *active_carrier(struct v2_app *a)
+{
+    return lmux_carrier_manager_active(&a->carriers);
+}
+
+static const struct lmux_carrier *active_carrier_const(const struct v2_app *a)
+{
+    return lmux_carrier_manager_active_const(&a->carriers);
+}
 
 void v2_app_log(struct v2_app *a, int verbose, const char *fmt, ...)
 {
@@ -112,6 +203,31 @@ static uint64_t make_conn_id(void)
     return v;
 }
 
+static void runtime_random_bytes(uint8_t *out, size_t len)
+{
+    size_t off = 0;
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        while (off < len) {
+            ssize_t r = read(fd, out + off, len - off);
+            if (r > 0) {
+                off += (size_t)r;
+                continue;
+            }
+            if (r < 0 && errno == EINTR)
+                continue;
+            break;
+        }
+        close(fd);
+    }
+    while (off < len) {
+        uint64_t v = make_conn_id() ^ (uint64_t)off;
+        size_t n = len - off < sizeof(v) ? len - off : sizeof(v);
+        memcpy(out + off, &v, n);
+        off += n;
+    }
+}
+
 static int parse_role(const char *s, enum lmux2_role *role)
 {
     if (strcmp(s, "host") == 0) {
@@ -139,25 +255,150 @@ static void begin_outer(struct v2_app *a)
 
 static void try_open_carrier(struct v2_app *a)
 {
-    int rc;
-    if (lmux_carrier_fd(&a->carrier) >= 0 ||
-        lmux_carrier_listen_fd(&a->carrier) >= 0)
+    unsigned opened = lmux_carrier_manager_try_open_except(
+        &a->carriers, now_ms(),
+        a->role == LMUX2_ROLE_HOST ? a->carrier_console_hold_mask : 0);
+    int id;
+    for (id = 0; id < LMUX_CARRIER_MAX_ENDPOINTS; id++) {
+        struct lmux_carrier_endpoint *ep;
+        if (!(opened & (1u << id)))
+            continue;
+        ep = lmux_carrier_manager_at(&a->carriers, (unsigned)id);
+        if (!ep)
+            continue;
+        log_msg(a, 1, "lmux2 %s carrier opened %s%s",
+                ep->name,
+                lmux_carrier_label(&ep->carrier),
+                lmux_carrier_manager_is_active(&a->carriers, ep) ?
+                " active" : " standby");
+        if (!lmux_carrier_manager_is_active(&a->carriers, ep))
+            continue;
+        if (a->carrier_console.active)
+            continue;
+        if (a->carrier_failure_hold_mask & (1u << (unsigned)id))
+            continue;
+        if (a->outer_enabled) {
+            if (!a->carrier_switch.old_outer_frozen)
+                begin_outer(a);
+        } else {
+            reset_connection_streams(a);
+        }
+    }
+}
+
+int v2_runtime_carrier_console_start(struct v2_app *a, const char *name,
+                                     char *error, size_t error_cap)
+{
+    static const uint8_t escape[] = "\r\n~LMUX CONSOLE\r\n";
+    struct lmux_carrier_endpoint *ep;
+    ptrdiff_t endpoint;
+    if (!a || a->role != LMUX2_ROLE_HOST || !name) {
+        snprintf(error, error_cap, "unavailable");
+        return -1;
+    }
+    ep = lmux_carrier_manager_find(&a->carriers, name);
+    if (!ep) {
+        snprintf(error, error_cap, "unknown-carrier");
+        return -1;
+    }
+    endpoint = ep - a->carriers.endpoint;
+    if (!lmux_carrier_manager_is_active(&a->carriers, ep) ||
+        ep->mode != LMUX_CARRIER_MODE_DIRTY) {
+        snprintf(error, error_cap, "not-active-dirty");
+        return -1;
+    }
+    if (a->carrier_switch.phase != CARRIER_SWITCH_IDLE ||
+        a->carrier_console.active) {
+        snprintf(error, error_cap, "busy");
+        return -1;
+    }
+    if (a->carrier_console_hold_mask & (1u << (unsigned)endpoint)) {
+        snprintf(error, error_cap, "already-released");
+        return -1;
+    }
+    v2_host_control_outer_down(&a->host);
+    lmux_link_endpoint_down(&a->outer);
+    retire_connection_streams(a);
+    a->out_len = a->out_pos = 0;
+    a->enc_in_len = 0;
+    a->discard_until_delim = 0;
+    memset(&a->dirty, 0, sizeof(a->dirty));
+    a->dirty_active = 0;
+    lmux_lmc1_raw_init(&a->lmc_io[endpoint]);
+    lmux_lmc1_dirty_init(&a->lmc_dirty_io[endpoint]);
+    memset(&a->carrier_console, 0, sizeof(a->carrier_console));
+    a->carrier_console.active = 1;
+    a->carrier_console.endpoint = (unsigned)endpoint;
+    a->carrier_console.deadline_ms = now_ms() + 5000;
+    memcpy(a->carrier_console.wire, escape, sizeof(escape) - 1);
+    a->carrier_console.wire_len = sizeof(escape) - 1;
+    return 0;
+}
+
+static void carrier_console_finish(struct v2_app *a, int ok,
+                                   const char *reason)
+{
+    char line[128];
+    struct lmux_carrier_endpoint *ep =
+        lmux_carrier_manager_at(&a->carriers,
+                                a->carrier_console.endpoint);
+    if (ok) {
+        snprintf(line, sizeof(line), "OK CARRIER CONSOLE name=%s\n",
+                 ep ? ep->name : "-");
+        a->carrier_console_hold_mask |=
+            1u << a->carrier_console.endpoint;
+        if (ep && lmux_carrier_fd(&ep->carrier) >= 0)
+            lmux_carrier_mark_lost(&ep->carrier, now_ms());
+    } else {
+        snprintf(line, sizeof(line), "ERR CARRIER CONSOLE %s\n",
+                 reason ? reason : "failed");
+    }
+    a->carrier_console.active = 0;
+    v2_host_control_carrier_result(&a->host, line);
+}
+
+static void carrier_console_tick(struct v2_app *a, long long now)
+{
+    struct lmux_carrier_endpoint *ep;
+    struct lmux_carrier_io io;
+    if (!a->carrier_console.active)
         return;
-    rc = lmux_carrier_try_open(&a->carrier, now_ms());
-    if (rc <= 0)
+    if (now > a->carrier_console.deadline_ms) {
+        carrier_console_finish(a, 0, "timeout");
         return;
-    log_msg(a, 1, "lmux2 carrier opened %s", lmux_carrier_label(&a->carrier));
-    if (a->outer_enabled)
-        begin_outer(a);
-    else
-        reset_connection_streams(a);
+    }
+    ep = lmux_carrier_manager_at(&a->carriers,
+                                 a->carrier_console.endpoint);
+    if (!ep) {
+        carrier_console_finish(a, 0, "carrier-missing");
+        return;
+    }
+    if (lmux_carrier_fd(&ep->carrier) < 0)
+        return;
+    io = lmux_carrier_write(&ep->carrier,
+        a->carrier_console.wire + a->carrier_console.pos,
+        a->carrier_console.wire_len - a->carrier_console.pos);
+    if (io.status == LMUX_CARRIER_IO_PROGRESS) {
+        a->carrier_console.pos += (size_t)io.n;
+        if (a->carrier_console.pos == a->carrier_console.wire_len)
+            carrier_console_finish(a, 1, NULL);
+    } else if (io.status != LMUX_CARRIER_IO_WOULD_BLOCK) {
+        carrier_console_finish(a, 0, "write-failed");
+    }
 }
 
 static void carrier_lost(struct v2_app *a)
 {
-    if (lmux_carrier_fd(&a->carrier) < 0)
+    struct lmux_carrier *carrier = active_carrier(a);
+    unsigned active = (unsigned)a->carriers.active_index;
+    if (!carrier || lmux_carrier_fd(carrier) < 0)
         return;
     log_msg(a, 1, "lmux2 carrier lost");
+    if (a->dirty_active && active_carrier_mode(a) == LMUX_CARRIER_MODE_DIRTY) {
+        lmux_dirty_peer_lost(&a->dirty);
+        if (active < LMUX_CARRIER_MAX_ENDPOINTS)
+            a->carrier_failure_hold_mask |= 1u << active;
+    }
     if (a->outer_enabled) {
         if (a->role == LMUX2_ROLE_HOST)
             v2_host_control_outer_down(&a->host);
@@ -166,10 +407,16 @@ static void carrier_lost(struct v2_app *a)
     } else {
         reset_connection_streams(a);
     }
-    lmux_carrier_mark_lost(&a->carrier, now_ms());
+    lmux_carrier_mark_lost(carrier, now_ms());
     a->out_len = a->out_pos = 0;
     a->enc_in_len = 0;
     a->discard_until_delim = 0;
+    if (a->role == LMUX2_ROLE_HOST &&
+        active_carrier_mode(a) == LMUX_CARRIER_MODE_DIRTY) {
+        a->carrier_committed_but_down = 1;
+        snprintf(a->carrier_last_error, sizeof(a->carrier_last_error),
+                 "dirty-%s", lmux_dirty_fail_reason_name(a->dirty.fail_reason));
+    }
 }
 
 int v2_runtime_boot_supported(struct v2_app *a)
@@ -304,16 +551,32 @@ int v2_runtime_close_stream(struct v2_app *a, uint64_t stream_id)
     return lmux2_close_stream(&a->conn, stream_id);
 }
 
-static void accept_carrier(struct v2_app *a)
+static void accept_carrier(struct v2_app *a, unsigned id)
 {
-    int rc = lmux_carrier_accept(&a->carrier);
+    struct lmux_carrier_endpoint *ep =
+        lmux_carrier_manager_at(&a->carriers, id);
+    int rc = ep ? lmux_carrier_accept(&ep->carrier) : -1;
     if (rc <= 0)
         return;
-    log_msg(a, 1, "lmux2 carrier accepted");
-    if (a->outer_enabled)
-        begin_outer(a);
-    else
+    log_msg(a, 1, "lmux2 %s carrier accepted%s",
+            ep->name,
+            lmux_carrier_manager_is_active(&a->carriers, ep) ?
+            " active" : " standby");
+    if (!lmux_carrier_manager_is_active(&a->carriers, ep) ||
+        (a->carrier_failure_hold_mask & (1u << id)))
+        return;
+    if (a->outer_enabled) {
+        if (!a->carrier_switch.old_outer_frozen)
+            begin_outer(a);
+    } else {
         reset_connection_streams(a);
+    }
+}
+
+static void drain_standby_carrier(struct v2_app *a,
+                                  unsigned id)
+{
+    feed_raw_endpoint(a, id, 0);
 }
 
 static int queue_control(struct v2_app *a, uint8_t kind, uint32_t req_id,
@@ -1030,8 +1293,8 @@ static void worker_link_down(struct v2_app *a, uint64_t epoch)
     log_msg(a, 1, "lmux2 supervisor LINK_DOWN epoch=%llu",
             (unsigned long long)epoch);
     retire_connection_streams(a);
-    if (lmux_carrier_fd(&a->carrier) >= 0)
-        (void)lmux_supervisor_drain_fd(lmux_carrier_fd(&a->carrier));
+    if (lmux_carrier_fd(active_carrier(a)) >= 0)
+        (void)lmux_supervisor_drain_fd(lmux_carrier_fd(active_carrier(a)));
     (void)send_supervisor_msg(a, LMUX_SUP_LINK_DOWN_ACK, epoch);
     log_msg(a, 1, "lmux2 supervisor LINK_DOWN_ACK epoch=%llu",
             (unsigned long long)epoch);
@@ -1247,7 +1510,7 @@ static void feed_carrier(struct v2_app *a)
 {
     uint8_t buf[256];
     for (;;) {
-        struct lmux_carrier_io io = lmux_carrier_read(&a->carrier, buf, sizeof(buf));
+        struct lmux_carrier_io io = lmux_carrier_read(active_carrier(a), buf, sizeof(buf));
         if (io.status == LMUX_CARRIER_IO_PROGRESS) {
             feed_lmux_bytes(a, buf, (size_t)io.n);
             continue;
@@ -1272,10 +1535,10 @@ static void build_next_output(struct v2_app *a)
 
 static void flush_carrier(struct v2_app *a)
 {
-    if (lmux_carrier_fd(&a->carrier) < 0)
+    if (lmux_carrier_fd(active_carrier(a)) < 0)
         return;
     while (a->out_pos < a->out_len) {
-        struct lmux_carrier_io io = lmux_carrier_write(&a->carrier,
+        struct lmux_carrier_io io = lmux_carrier_write(active_carrier(a),
                                                        a->out + a->out_pos,
                                                        a->out_len - a->out_pos);
         if (io.status == LMUX_CARRIER_IO_PROGRESS) {
@@ -1298,7 +1561,7 @@ static void outer_session_down(struct v2_app *a)
     if (a->role == LMUX2_ROLE_HOST)
         v2_host_control_outer_down(&a->host);
     retire_connection_streams(a);
-    if (lmux_carrier_fd(&a->carrier) >= 0)
+    if (lmux_carrier_fd(active_carrier(a)) >= 0)
         begin_outer(a);
 }
 
@@ -1395,26 +1658,554 @@ static void drain_outer_boot_frames(struct v2_app *a)
     }
 }
 
-static void feed_outer_carrier(struct v2_app *a)
+static const char *carrier_switch_phase_name(enum carrier_switch_phase phase)
 {
-    uint8_t buf[256];
-    for (;;) {
-        struct lmux_carrier_io io = lmux_carrier_read(&a->carrier, buf, sizeof(buf));
-        if (io.status == LMUX_CARRIER_IO_PROGRESS) {
-            unsigned events = 0;
-            (void)lmux_link_input_bytes(&a->outer, buf, (size_t)io.n, &events);
-            handle_outer_events(a, events);
-            if (a->role == LMUX2_ROLE_HOST)
-                drain_outer_boot_frames(a);
-            drain_outer_transport_rx(a);
-            continue;
-        }
-        if (io.status == LMUX_CARRIER_IO_LOST || io.status == LMUX_CARRIER_IO_FATAL) {
-            carrier_lost(a);
+    switch (phase) {
+    case CARRIER_SWITCH_IDLE: return "idle";
+    case CARRIER_SWITCH_QUERYING: return "querying";
+    case CARRIER_SWITCH_WAIT_QUERY: return "wait-query";
+    case CARRIER_SWITCH_PREPARING: return "preparing";
+    case CARRIER_SWITCH_WAIT_READY: return "wait-ready";
+    case CARRIER_SWITCH_SENDING_COMMIT: return "sending-commit";
+    case CARRIER_SWITCH_RESOLVING: return "resolving";
+    case CARRIER_SWITCH_CONVERGING: return "converging";
+    }
+    return "unknown";
+}
+
+static int carrier_endpoint_index(struct v2_app *a,
+                                  struct lmux_carrier_endpoint *ep)
+{
+    ptrdiff_t index;
+    if (!a || !ep)
+        return -1;
+    index = ep - a->carriers.endpoint;
+    return index >= 0 && index < LMUX_CARRIER_MAX_ENDPOINTS ?
+        (int)index : -1;
+}
+
+static int queue_switch_msg(struct v2_app *a, uint8_t type)
+{
+    struct lmux_carrier_endpoint *ep =
+        lmux_carrier_manager_find(&a->carriers, a->carrier_switch.name);
+    struct lmux_lmc1_msg msg;
+    int index = carrier_endpoint_index(a, ep);
+    if (index < 0 || lmux_carrier_fd(&ep->carrier) < 0) {
+        errno = ENODEV;
+        return -1;
+    }
+    memset(&msg, 0, sizeof(msg));
+    msg.type = type;
+    msg.mode = a->carrier_switch.mode;
+    msg.generation = a->carrier_switch.observed_generation;
+    msg.deadline_ms = LMUX_LMC1_DEFAULT_DEADLINE_MS;
+    memcpy(msg.nonce, a->carrier_switch.nonce, sizeof(msg.nonce));
+    memcpy(msg.cookie, a->carrier_switch.cookie, sizeof(msg.cookie));
+    memcpy(msg.boot_id, a->carrier_switch.boot_id, sizeof(msg.boot_id));
+    strcpy(msg.name, a->carrier_switch.name);
+    if (a->carrier_switch.mode == LMUX_CARRIER_MODE_DIRTY) {
+        if (lmux_lmc1_dirty_queue(&a->lmc_dirty_io[index], &msg) < 0)
+            return -1;
+    } else if (lmux_lmc1_raw_queue(&a->lmc_io[index], &msg) < 0) {
+        return -1;
+    }
+    log_msg(a, 1, "LMC1 %s queued endpoint=%s generation=%llu",
+            lmux_lmc1_type_name(type), ep->name,
+            (unsigned long long)msg.generation);
+    return 0;
+}
+
+static void freeze_old_outer_for_commit(struct v2_app *a)
+{
+    if (a->carrier_switch.old_outer_frozen)
+        return;
+    a->carrier_switch.old_outer_frozen = 1;
+    v2_host_control_outer_down(&a->host);
+    lmux_link_endpoint_down(&a->outer);
+    retire_connection_streams(a);
+    a->out_len = a->out_pos = 0;
+    a->enc_in_len = 0;
+    a->discard_until_delim = 0;
+    log_msg(a, 0, "carrier switch COMMIT sent; old OUTER frozen");
+}
+
+static void finish_carrier_switch(struct v2_app *a, int success,
+                                  const char *reason)
+{
+    char detail[192];
+    if (success) {
+        a->carrier_committed_but_down = 0;
+        a->carrier_last_error[0] = 0;
+        snprintf(detail, sizeof(detail),
+                 "OK CARRIER active=%s mode=%s generation=%llu\n",
+                 a->carrier_switch.name,
+                 lmux_carrier_mode_name(a->carrier_switch.mode),
+                 (unsigned long long)a->carriers.generation);
+    } else {
+        snprintf(a->carrier_last_error, sizeof(a->carrier_last_error), "%s",
+                 reason ? reason : "failed");
+        if (a->carrier_switch.target_committed)
+            a->carrier_committed_but_down = 1;
+        snprintf(detail, sizeof(detail),
+                 "ERR CARRIER %s%s\n",
+                 a->carrier_switch.target_committed ?
+                 "committed-but-down " : "",
+                 a->carrier_last_error);
+    }
+    v2_host_control_carrier_result(&a->host, detail);
+    a->carrier_switch.phase = CARRIER_SWITCH_IDLE;
+}
+
+static void activate_runtime_dirty(struct v2_app *a, uint64_t generation)
+{
+    uint64_t host_session, target_session;
+    struct lmux_carrier_endpoint *ep =
+        lmux_carrier_manager_active_endpoint(&a->carriers);
+    uint32_t baud = ep && ep->carrier.serial.baud ?
+        ep->carrier.serial.baud : 115200;
+    lmux_lmc1_dirty_session_ids(a->carrier_switch.boot_id, generation,
+                                a->carrier_switch.name,
+                                &host_session, &target_session);
+    lmux_dirty_init(&a->dirty, host_session, target_session, 0, 0,
+                    baud, (uint64_t)now_ms());
+    a->dirty_active = 1;
+}
+
+static void adopt_committed_carrier(struct v2_app *a, uint64_t generation)
+{
+    struct lmux_carrier_endpoint *ep;
+    freeze_old_outer_for_commit(a);
+    if (lmux_carrier_manager_set_active(&a->carriers,
+                                        a->carrier_switch.name,
+                                        a->carrier_switch.mode,
+                                        generation) < 0) {
+        finish_carrier_switch(a, 0, "local-carrier-missing");
+        return;
+    }
+    ep = lmux_carrier_manager_active_endpoint(&a->carriers);
+    a->carrier_failure_hold_mask &=
+        ~(1u << (unsigned)a->carriers.active_index);
+    a->carrier_switch.committed_generation = generation;
+    a->carrier_switch.target_committed = 1;
+    a->carrier_switch.phase = CARRIER_SWITCH_CONVERGING;
+    a->carrier_switch.old_outer_frozen = 0;
+    if (a->carrier_switch.mode == LMUX_CARRIER_MODE_DIRTY)
+        activate_runtime_dirty(a, generation);
+    else {
+        memset(&a->dirty, 0, sizeof(a->dirty));
+        a->dirty_active = 0;
+    }
+    lmux_lmc1_raw_reset_rx(&a->lmc_io[a->carriers.active_index]);
+    lmux_lmc1_dirty_reset_rx(
+        &a->lmc_dirty_io[a->carriers.active_index]);
+    if (ep && lmux_carrier_fd(&ep->carrier) >= 0)
+        begin_outer(a);
+    log_msg(a, 0, "carrier authority active=%s mode=%s generation=%llu",
+            a->carrier_switch.name,
+            lmux_carrier_mode_name(a->carrier_switch.mode),
+            (unsigned long long)generation);
+}
+
+struct runtime_lmc_context {
+    struct v2_app *a;
+    unsigned endpoint;
+    enum lmux_lmc1_codec codec;
+};
+
+static void runtime_lmc_control(void *opaque,
+                                const struct lmux_lmc1_msg *msg)
+{
+    struct runtime_lmc_context *ctx = opaque;
+    struct v2_app *a = ctx->a;
+    struct lmux_carrier_endpoint *ep =
+        lmux_carrier_manager_at(&a->carriers, ctx->endpoint);
+    if (!ep || a->carrier_switch.phase == CARRIER_SWITCH_IDLE ||
+        !lmux_lmc1_nonce_equal(msg->nonce, a->carrier_switch.nonce))
+        return;
+    log_msg(a, 1, "LMC1 %s received endpoint=%s generation=%llu status=%s",
+            lmux_lmc1_type_name(msg->type), ep->name,
+            (unsigned long long)msg->generation,
+            lmux_lmc1_status_name(msg->status));
+    if (msg->type == LMUX_LMC1_ERROR) {
+        if (a->carrier_switch.phase == CARRIER_SWITCH_RESOLVING) {
+            a->carrier_switch.next_retry_ms = now_ms();
             return;
+        }
+        finish_carrier_switch(a, 0, lmux_lmc1_status_name(msg->status));
+        return;
+    }
+    if (msg->type == LMUX_LMC1_QUERY_REPLY) {
+        if (a->carrier_switch.phase == CARRIER_SWITCH_WAIT_QUERY ||
+            a->carrier_switch.phase == CARRIER_SWITCH_QUERYING) {
+            memcpy(a->carrier_switch.boot_id, msg->boot_id,
+                   sizeof(a->carrier_switch.boot_id));
+            a->carrier_switch.observed_generation = msg->generation;
+            if (strcmp(msg->name, a->carrier_switch.name) == 0 &&
+                msg->mode == a->carrier_switch.mode) {
+                adopt_committed_carrier(a, msg->generation);
+            } else {
+                a->carrier_switch.phase = CARRIER_SWITCH_PREPARING;
+                a->carrier_switch.next_retry_ms = now_ms();
+            }
+            return;
+        }
+        if (a->carrier_switch.phase == CARRIER_SWITCH_RESOLVING) {
+            if (memcmp(msg->boot_id, a->carrier_switch.boot_id,
+                       LMUX_LMC1_BOOT_ID_LEN) != 0) {
+                finish_carrier_switch(a, 0, "target-restarted");
+            } else if (strcmp(msg->name, a->carrier_switch.name) == 0 &&
+                       msg->mode == a->carrier_switch.mode &&
+                       msg->generation >
+                       a->carrier_switch.observed_generation) {
+                adopt_committed_carrier(a, msg->generation);
+            } else if (msg->generation ==
+                       a->carrier_switch.observed_generation) {
+                a->carrier_switch.next_retry_ms = now_ms();
+            } else {
+                finish_carrier_switch(a, 0, "authority-conflict");
+            }
         }
         return;
     }
+    if (msg->type == LMUX_LMC1_READY &&
+        a->carrier_switch.phase == CARRIER_SWITCH_WAIT_READY) {
+        if (msg->generation != a->carrier_switch.observed_generation ||
+            memcmp(msg->boot_id, a->carrier_switch.boot_id,
+                   LMUX_LMC1_BOOT_ID_LEN) != 0 ||
+            strcmp(msg->name, a->carrier_switch.name) != 0 ||
+            msg->mode != a->carrier_switch.mode) {
+            finish_carrier_switch(a, 0, "invalid-ready");
+            return;
+        }
+        memcpy(a->carrier_switch.cookie, msg->cookie,
+               sizeof(a->carrier_switch.cookie));
+        if (queue_switch_msg(a, LMUX_LMC1_COMMIT) < 0) {
+            finish_carrier_switch(a, 0, "commit-queue");
+            return;
+        }
+        a->carrier_switch.phase = CARRIER_SWITCH_SENDING_COMMIT;
+        return;
+    }
+    if (msg->type == LMUX_LMC1_COMMITTED &&
+        (a->carrier_switch.phase == CARRIER_SWITCH_RESOLVING ||
+         a->carrier_switch.phase == CARRIER_SWITCH_SENDING_COMMIT)) {
+        if (memcmp(msg->boot_id, a->carrier_switch.boot_id,
+                   LMUX_LMC1_BOOT_ID_LEN) != 0 ||
+            strcmp(msg->name, a->carrier_switch.name) != 0 ||
+            msg->generation <= a->carrier_switch.observed_generation) {
+            finish_carrier_switch(a, 0, "invalid-committed");
+            return;
+        }
+        adopt_committed_carrier(a, msg->generation);
+    }
+}
+
+static void runtime_lmc_outer(void *opaque, const uint8_t *encoded,
+                              size_t len)
+{
+    struct runtime_lmc_context *ctx = opaque;
+    struct v2_app *a = ctx->a;
+    unsigned events = 0;
+    uint8_t delim = 0;
+    (void)lmux_link_input_bytes(&a->outer, encoded, len, &events);
+    (void)lmux_link_input_bytes(&a->outer, &delim, 1, &events);
+    handle_outer_events(a, events);
+    drain_outer_boot_frames(a);
+    drain_outer_transport_rx(a);
+}
+
+static int runtime_dirty_deliver(struct v2_app *a)
+{
+    const uint8_t *data;
+    size_t len;
+    uint32_t seq;
+    int rc;
+    while ((rc = lmux_dirty_receive_peek(&a->dirty, &data, &len, &seq)) > 0) {
+        unsigned events = 0;
+        (void)seq;
+        if (lmux_link_input_bytes(&a->outer, data, len, &events) < 0)
+            return -1;
+        handle_outer_events(a, events);
+        drain_outer_boot_frames(a);
+        drain_outer_transport_rx(a);
+        if (lmux_dirty_receive_consume(&a->dirty) < 0)
+            return -1;
+    }
+    return rc < 0 ? -1 : 0;
+}
+
+static void feed_raw_endpoint(struct v2_app *a, unsigned endpoint,
+                              int allow_outer)
+{
+    struct lmux_carrier_endpoint *ep =
+        lmux_carrier_manager_at(&a->carriers, endpoint);
+    struct runtime_lmc_context ctx = { a, endpoint, LMUX_LMC1_CODEC_RAW };
+    uint8_t buf[256];
+    unsigned budget = 8;
+    if (!ep)
+        return;
+    while (budget-- > 0) {
+        struct lmux_carrier_io r =
+            lmux_carrier_read(&ep->carrier, buf, sizeof(buf));
+        if (r.status == LMUX_CARRIER_IO_PROGRESS) {
+            size_t i;
+            int discarded = 0;
+            (void)allow_outer;
+            /* COMMITTED can make this endpoint authoritative in this same
+             * read.  Route records according to current authority, not the
+             * state captured before read(2). */
+            for (i = 0; i < (size_t)r.n; i++) {
+                int current_allow =
+                    lmux_carrier_manager_is_active(&a->carriers, ep) &&
+                    !(a->carrier_failure_hold_mask & (1u << endpoint)) &&
+                    !a->carrier_switch.old_outer_frozen;
+                int dirty_mode = current_allow &&
+                    ep->mode == LMUX_CARRIER_MODE_DIRTY && a->dirty_active;
+                int raw_mode = current_allow && !dirty_mode;
+                int raw_boundary = a->lmc_io[endpoint].rx_len == 0 &&
+                    !a->lmc_io[endpoint].discard_until_delim;
+                int boot_was = lmux_lmc1_dirty_receiving(
+                    &a->lmc_dirty_io[endpoint]);
+                int boot_feed = !raw_mode || boot_was || raw_boundary;
+                int data_was = dirty_mode && a->dirty.parser.in_record;
+                if (!current_allow) {
+                    ep->standby_rx_bytes++;
+                    discarded = 1;
+                }
+                if (!boot_was && !data_was &&
+                    lmux_lmc1_raw_feed(&a->lmc_io[endpoint], buf + i, 1,
+                                       current_allow && !dirty_mode,
+                                       runtime_lmc_control,
+                                       runtime_lmc_outer, &ctx) < 0) {
+                    if (current_allow)
+                        carrier_lost(a);
+                    return;
+                }
+                /* On active RAW, a bootstrap envelope is serialized between
+                 * complete COBS records.  Never search for its ASCII prefix
+                 * inside arbitrary encoded OUTER bytes. */
+                if (raw_mode && !boot_was && !raw_boundary &&
+                    a->lmc_dirty_io[endpoint].prefix_match) {
+                    const char *prefix = LMUX_LMC1_DIRTY_PREFIX;
+                    unsigned match =
+                        a->lmc_dirty_io[endpoint].prefix_match;
+                    if (buf[i] == (uint8_t)prefix[match])
+                        boot_feed = 1;
+                    else
+                        lmux_lmc1_dirty_reset_rx(
+                            &a->lmc_dirty_io[endpoint]);
+                }
+                ctx.codec = LMUX_LMC1_CODEC_DIRTY_BOOTSTRAP;
+                if (boot_feed && lmux_lmc1_dirty_feed(
+                        &a->lmc_dirty_io[endpoint], buf + i, 1,
+                        runtime_lmc_control, &ctx) < 0) {
+                    if (current_allow)
+                        carrier_lost(a);
+                    return;
+                }
+                ctx.codec = LMUX_LMC1_CODEC_RAW;
+                if (!boot_was && lmux_lmc1_dirty_receiving(
+                        &a->lmc_dirty_io[endpoint]))
+                    lmux_lmc1_raw_reset_rx(&a->lmc_io[endpoint]);
+                if (dirty_mode) {
+                    if (lmux_dirty_feed(&a->dirty, buf + i, 1,
+                                        (uint64_t)now_ms()) < 0 ||
+                        runtime_dirty_deliver(a) < 0) {
+                        carrier_lost(a);
+                        return;
+                    }
+                    if (!data_was && a->dirty.parser.in_record)
+                        lmux_lmc1_raw_reset_rx(&a->lmc_io[endpoint]);
+                }
+            }
+            if (discarded)
+                ep->standby_discard_events++;
+            continue;
+        }
+        if (r.status == LMUX_CARRIER_IO_LOST ||
+            r.status == LMUX_CARRIER_IO_FATAL) {
+            if (lmux_carrier_manager_is_active(&a->carriers, ep))
+                carrier_lost(a);
+            else
+                lmux_carrier_mark_lost(&ep->carrier, now_ms());
+        }
+        return;
+    }
+}
+
+static void switch_tx_completed(struct v2_app *a, uint8_t type)
+{
+    if (type == LMUX_LMC1_QUERY &&
+        a->carrier_switch.phase == CARRIER_SWITCH_QUERYING)
+        a->carrier_switch.phase = CARRIER_SWITCH_WAIT_QUERY;
+    else if (type == LMUX_LMC1_PREPARE &&
+             a->carrier_switch.phase == CARRIER_SWITCH_PREPARING)
+        a->carrier_switch.phase = CARRIER_SWITCH_WAIT_READY;
+    else if (type == LMUX_LMC1_COMMIT &&
+             a->carrier_switch.phase == CARRIER_SWITCH_SENDING_COMMIT) {
+        freeze_old_outer_for_commit(a);
+        a->carrier_switch.phase = CARRIER_SWITCH_RESOLVING;
+        /* QUERY first resolves a lost COMMITTED; the next attempt repeats COMMIT. */
+        a->carrier_switch.resolve_attempt = 1;
+        a->carrier_switch.next_retry_ms = now_ms() + 250;
+    }
+}
+
+static void flush_raw_control(struct v2_app *a, unsigned endpoint)
+{
+    struct lmux_carrier_endpoint *ep =
+        lmux_carrier_manager_at(&a->carriers, endpoint);
+    uint8_t completed = 0;
+    int rc;
+    int use_dirty;
+    if (!ep || !lmc_any_output(a, endpoint))
+        return;
+    if (lmux_carrier_manager_is_active(&a->carriers, ep) &&
+        ep->mode == LMUX_CARRIER_MODE_DIRTY && a->dirty_active &&
+        a->dirty.output_pos < a->dirty.output_len)
+        return;
+    use_dirty = lmux_lmc1_dirty_has_output(&a->lmc_dirty_io[endpoint]) &&
+        (!lmux_lmc1_raw_has_output(&a->lmc_io[endpoint]) ||
+         a->lmc_dirty_io[endpoint].tx_pos != 0);
+    rc = use_dirty ?
+        lmux_lmc1_dirty_flush(&a->lmc_dirty_io[endpoint], &ep->carrier,
+                              &completed) :
+        lmux_lmc1_raw_flush(&a->lmc_io[endpoint], &ep->carrier,
+                            &completed);
+    if (rc < 0) {
+        if (lmux_carrier_manager_is_active(&a->carriers, ep))
+            carrier_lost(a);
+        else
+            lmux_carrier_mark_lost(&ep->carrier, now_ms());
+        return;
+    }
+    if (completed) {
+        log_msg(a, 1, "LMC1 %s committed endpoint=%s",
+                lmux_lmc1_type_name(completed), ep->name);
+        switch_tx_completed(a, completed);
+    }
+}
+
+int v2_runtime_carrier_switch_start(struct v2_app *a, const char *name,
+                                    enum lmux_carrier_mode mode,
+                                    unsigned timeout_ms,
+                                    char *error, size_t error_cap)
+{
+    struct lmux_carrier_endpoint *candidate, *active;
+    if (!a || a->role != LMUX2_ROLE_HOST || !a->outer_enabled) {
+        snprintf(error, error_cap, "unavailable");
+        return -1;
+    }
+    if (mode != LMUX_CARRIER_MODE_RAW &&
+        mode != LMUX_CARRIER_MODE_DIRTY) {
+        snprintf(error, error_cap, "unsupported-mode");
+        return -1;
+    }
+    candidate = lmux_carrier_manager_find(&a->carriers, name);
+    if (!candidate) {
+        snprintf(error, error_cap, "unknown-carrier");
+        return -1;
+    }
+    if (a->carrier_switch.phase != CARRIER_SWITCH_IDLE) {
+        snprintf(error, error_cap, "busy");
+        return -1;
+    }
+    /* An explicit switch is the only operation which resumes a UART that was
+     * deliberately released to an independent console consumer. */
+    a->carrier_console_hold_mask &=
+        ~(1u << (unsigned)(candidate - a->carriers.endpoint));
+    active = lmux_carrier_manager_active_endpoint(&a->carriers);
+    if (active == candidate && active->mode == mode &&
+        a->outer.state == LMUX_LINK_ESTABLISHED &&
+        a->conn.state == LMUX2_CONN_ESTABLISHED &&
+        v2_host_desired_reconciled(&a->host))
+        return 1;
+    memset(&a->carrier_switch, 0, sizeof(a->carrier_switch));
+    a->carrier_switch.phase = CARRIER_SWITCH_QUERYING;
+    strcpy(a->carrier_switch.name, name);
+    a->carrier_switch.mode = mode;
+    runtime_random_bytes(a->carrier_switch.nonce,
+                         sizeof(a->carrier_switch.nonce));
+    a->carrier_switch.deadline_ms = now_ms() + timeout_ms;
+    a->carrier_switch.next_retry_ms = now_ms();
+    a->carrier_switch.pre_local_conn = a->conn.local_conn_id;
+    a->carrier_switch.pre_peer_conn = a->conn.peer_conn_id;
+    a->carrier_switch.pre_established_count =
+        a->connection_established_count;
+    a->carrier_committed_but_down = 0;
+    a->carrier_last_error[0] = 0;
+    return 0;
+}
+
+static void carrier_switch_tick(struct v2_app *a, long long now)
+{
+    struct lmux_carrier_endpoint *ep;
+    char failure[96];
+    if (a->carrier_switch.phase == CARRIER_SWITCH_IDLE)
+        return;
+    if (a->carrier_switch.phase == CARRIER_SWITCH_CONVERGING &&
+        a->carrier_switch.target_committed && a->dirty_active &&
+        active_carrier_mode(a) == LMUX_CARRIER_MODE_DIRTY &&
+        lmux_dirty_failed(&a->dirty)) {
+        snprintf(failure, sizeof(failure), "dirty-%s",
+                 lmux_dirty_fail_reason_name(a->dirty.fail_reason));
+        finish_carrier_switch(a, 0, failure);
+        return;
+    }
+    if (now > a->carrier_switch.deadline_ms) {
+        finish_carrier_switch(a, 0,
+            a->carrier_switch.target_committed ? "convergence-timeout" :
+            (a->carrier_switch.old_outer_frozen ? "ambiguous-commit" :
+             "timeout"));
+        return;
+    }
+    ep = lmux_carrier_manager_find(&a->carriers, a->carrier_switch.name);
+    if (!ep) {
+        finish_carrier_switch(a, 0, "local-carrier-missing");
+        return;
+    }
+    if (a->carrier_switch.phase == CARRIER_SWITCH_CONVERGING &&
+        a->carrier_switch.target_committed &&
+        lmux_carrier_fd(&ep->carrier) < 0) {
+        finish_carrier_switch(a, 0, "candidate-lost");
+        return;
+    }
+    if (a->carrier_switch.phase == CARRIER_SWITCH_CONVERGING) {
+        if (a->outer.state == LMUX_LINK_ESTABLISHED &&
+            a->conn.state == LMUX2_CONN_ESTABLISHED &&
+            a->connection_established_count >
+                a->carrier_switch.pre_established_count &&
+            v2_host_desired_reconciled(&a->host))
+            finish_carrier_switch(a, 1, NULL);
+        return;
+    }
+    if (now < a->carrier_switch.next_retry_ms ||
+        lmux_carrier_fd(&ep->carrier) < 0)
+        return;
+    if (a->carrier_switch.phase == CARRIER_SWITCH_QUERYING ||
+        a->carrier_switch.phase == CARRIER_SWITCH_WAIT_QUERY) {
+        if (queue_switch_msg(a, LMUX_LMC1_QUERY) == 0) {
+            a->carrier_switch.phase = CARRIER_SWITCH_QUERYING;
+            a->carrier_switch.next_retry_ms = now + 500;
+        }
+    } else if (a->carrier_switch.phase == CARRIER_SWITCH_PREPARING ||
+               a->carrier_switch.phase == CARRIER_SWITCH_WAIT_READY) {
+        if (queue_switch_msg(a, LMUX_LMC1_PREPARE) == 0) {
+            a->carrier_switch.phase = CARRIER_SWITCH_PREPARING;
+            a->carrier_switch.next_retry_ms = now + 500;
+        }
+    } else if (a->carrier_switch.phase == CARRIER_SWITCH_RESOLVING) {
+        uint8_t type = (a->carrier_switch.resolve_attempt++ & 1) ?
+            LMUX_LMC1_QUERY : LMUX_LMC1_COMMIT;
+        if (queue_switch_msg(a, type) == 0)
+            a->carrier_switch.next_retry_ms = now + 500;
+    }
+}
+
+static void feed_outer_carrier(struct v2_app *a)
+{
+    feed_raw_endpoint(a, (unsigned)a->carriers.active_index,
+                      !a->carrier_switch.old_outer_frozen);
 }
 
 static void pump_lmux_output_to_outer(struct v2_app *a)
@@ -1433,13 +2224,74 @@ static void pump_lmux_output_to_outer(struct v2_app *a)
 
 static void flush_outer_carrier(struct v2_app *a)
 {
-    while (lmux_carrier_fd(&a->carrier) >= 0) {
+    if (active_carrier_mode(a) == LMUX_CARRIER_MODE_DIRTY) {
+        while (lmux_carrier_fd(active_carrier(a)) >= 0) {
+            const uint8_t *wire;
+            size_t wire_len;
+            struct lmux_carrier_io io;
+            unsigned events = 0;
+            int peek;
+            if (!a->dirty_active || lmux_dirty_failed(&a->dirty)) {
+                carrier_lost(a);
+                return;
+            }
+            if (a->dirty.output_pos == a->dirty.output_len &&
+                lmc_any_output(a, (unsigned)a->carriers.active_index))
+                return;
+            if (a->dirty.output_pos == a->dirty.output_len) {
+                if (!lmux_link_has_pending_output(&a->outer))
+                    (void)lmux_link_build_output(&a->outer);
+                if (lmux_link_has_pending_output(&a->outer)) {
+                    size_t n = lmux_link_output_len(&a->outer);
+                    if (n > LMUX_DIRTY_PACKET_MAX)
+                        n = LMUX_DIRTY_PACKET_MAX;
+                    if (lmux_dirty_submit(&a->dirty,
+                            lmux_link_output_ptr(&a->outer), n,
+                            (uint64_t)now_ms(), NULL) == 0) {
+                        lmux_link_output_consume_events(&a->outer, n, &events);
+                        handle_outer_events(a, events);
+                    } else if (errno != EAGAIN) {
+                        carrier_lost(a);
+                        return;
+                    }
+                }
+            }
+            peek = lmux_dirty_output_peek(&a->dirty, (uint64_t)now_ms(),
+                                          &wire, &wire_len);
+            if (peek < 0) {
+                carrier_lost(a);
+                return;
+            }
+            if (peek == 0)
+                return;
+            io = lmux_carrier_write(active_carrier(a), wire, wire_len);
+            if (io.status == LMUX_CARRIER_IO_PROGRESS) {
+                if (lmux_dirty_output_consume(&a->dirty,
+                                               (size_t)io.n) < 0) {
+                    carrier_lost(a);
+                    return;
+                }
+                continue;
+            }
+            if (io.status == LMUX_CARRIER_IO_WOULD_BLOCK)
+                return;
+            carrier_lost(a);
+            return;
+        }
+        return;
+    }
+    while (lmux_carrier_fd(active_carrier(a)) >= 0) {
         struct lmux_carrier_io io;
+        unsigned active = (unsigned)a->carriers.active_index;
+        if (!lmux_link_has_pending_output(&a->outer) &&
+            active < LMUX_CARRIER_MAX_ENDPOINTS &&
+            lmc_any_output(a, active))
+            return;
         if (!lmux_link_has_pending_output(&a->outer))
             (void)lmux_link_build_output(&a->outer);
         if (!lmux_link_has_pending_output(&a->outer))
             return;
-        io = lmux_carrier_write(&a->carrier,
+        io = lmux_carrier_write(active_carrier(a),
                                 lmux_link_output_ptr(&a->outer),
                                 lmux_link_output_len(&a->outer));
         if (io.status == LMUX_CARRIER_IO_PROGRESS) {
@@ -1474,7 +2326,8 @@ static void fill_host_status(struct v2_app *a, struct v2_host_status *st)
 {
     memset(st, 0, sizeof(*st));
     st->role = a->role;
-    st->carrier = &a->carrier;
+    st->carrier = active_carrier_const(a);
+    st->carriers = &a->carriers;
     st->outer = a->outer_enabled ? &a->outer : NULL;
     st->conn = &a->conn;
     st->target_services = a->target_status;
@@ -1484,6 +2337,39 @@ static void fill_host_status(struct v2_app *a, struct v2_host_status *st)
     st->stream_open_count = a->stream_open_count;
     st->stream_close_count = a->stream_close_count;
     st->stream_reset_count = a->stream_reset_count;
+    st->carrier_switch_phase =
+        carrier_switch_phase_name(a->carrier_switch.phase);
+    st->carrier_switch_name = a->carrier_switch.phase == CARRIER_SWITCH_IDLE ?
+        "-" : a->carrier_switch.name;
+    st->carrier_last_error = a->carrier_last_error[0] ?
+        a->carrier_last_error : "-";
+    st->carrier_committed_but_down = a->carrier_committed_but_down;
+    if (a->carrier_console.active) {
+        const struct lmux_carrier_endpoint *ep =
+            lmux_carrier_manager_at_const(&a->carriers,
+                                           a->carrier_console.endpoint);
+        st->carrier_console_state = "sending";
+        st->carrier_console_name = ep ? ep->name : "-";
+    } else if (a->carrier_console_hold_mask) {
+        unsigned i;
+        st->carrier_console_state = "released";
+        st->carrier_console_name = "-";
+        for (i = 0; i < LMUX_CARRIER_MAX_ENDPOINTS; i++) {
+            const struct lmux_carrier_endpoint *ep;
+            if (!(a->carrier_console_hold_mask & (1u << i)))
+                continue;
+            ep = lmux_carrier_manager_at_const(&a->carriers, i);
+            st->carrier_console_name = ep ? ep->name : "-";
+            break;
+        }
+    } else {
+        st->carrier_console_state = "idle";
+        st->carrier_console_name = "-";
+    }
+    st->carrier_console_hold_mask = a->carrier_console_hold_mask;
+    st->carrier_failure_hold_mask = a->carrier_failure_hold_mask;
+    st->dirty = a->dirty_active &&
+        active_carrier_mode(a) == LMUX_CARRIER_MODE_DIRTY ? &a->dirty : NULL;
 }
 
 static void fill_target_service_status(struct v2_app *a)
@@ -1527,10 +2413,27 @@ static void run_loop(struct v2_app *a)
         struct pollfd pfds[64];
         int kind[64], svc[64], bind[64];
         nfds_t n = 0, i;
+        int endpoint_id;
         long long now = now_ms();
         int timeout = 1000;
         if (!a->worker_mode)
             try_open_carrier(a);
+        if (a->role == LMUX2_ROLE_HOST)
+            carrier_console_tick(a, now);
+        if (a->role == LMUX2_ROLE_HOST && a->outer_enabled)
+            carrier_switch_tick(a, now);
+        if (a->outer_enabled && a->dirty_active &&
+            active_carrier_mode(a) == LMUX_CARRIER_MODE_DIRTY &&
+            !(a->carrier_failure_hold_mask &
+              (1u << (unsigned)a->carriers.active_index)) &&
+            lmux_carrier_fd(active_carrier(a)) >= 0) {
+            if (lmux_dirty_tick(&a->dirty, (uint64_t)now) < 0) {
+                carrier_lost(a);
+                continue;
+            }
+            if (timeout > 100)
+                timeout = 100;
+        }
         if (a->role == LMUX2_ROLE_HOST)
             v2_host_attach_pending_clients(a, &a->host, &a->conn);
         if (a->role == LMUX2_ROLE_HOST) {
@@ -1563,28 +2466,57 @@ static void run_loop(struct v2_app *a)
             pump_lmux_output_to_outer(a);
             (void)lmux_link_build_output(&a->outer);
         }
-        if (lmux_carrier_fd(&a->carrier) >= 0 &&
-            (!a->worker_mode || a->worker_link_active || a->worker_link_up_flush)) {
-            short ev = 0;
-            if (a->outer_enabled) {
-                if (lmux_link_can_accept_physical(&a->outer) &&
-                    lmux_link_transport_rx_space(&a->outer) > 0 &&
-                    lmux_link_boot_rx_space(&a->outer) > 0)
-                    ev |= POLLIN;
-                if (lmux_link_wants_physical_write(&a->outer))
+        for (endpoint_id = 0; endpoint_id < LMUX_CARRIER_MAX_ENDPOINTS;
+             endpoint_id++) {
+            struct lmux_carrier_endpoint *ep =
+                lmux_carrier_manager_at(&a->carriers,
+                                        (unsigned)endpoint_id);
+            if (!ep)
+                continue;
+            struct lmux_carrier *carrier = &ep->carrier;
+            int active = lmux_carrier_manager_is_active(&a->carriers, ep);
+            int data_active = active &&
+                !(a->carrier_failure_hold_mask & (1u << endpoint_id));
+            if (lmux_carrier_fd(carrier) >= 0 &&
+                (!active || !a->worker_mode || a->worker_link_active ||
+                 a->worker_link_up_flush)) {
+                short ev = 0;
+                if (a->carrier_console.active &&
+                    (unsigned)endpoint_id == a->carrier_console.endpoint) {
+                    add_poll(pfds, kind, svc, bind, &n,
+                             lmux_carrier_fd(carrier), POLLOUT, 13,
+                             endpoint_id, -1);
+                    continue;
+                }
+                if (!data_active) {
+                    ev = POLLIN;
+                } else if (a->outer_enabled) {
+                    if (a->carrier_switch.old_outer_frozen ||
+                        (lmux_link_can_accept_physical(&a->outer) &&
+                        lmux_link_transport_rx_space(&a->outer) > 0 &&
+                         lmux_link_boot_rx_space(&a->outer) > 0))
+                        ev |= POLLIN;
+                    if (lmux_link_wants_physical_write(&a->outer) ||
+                        (active && ep->mode == LMUX_CARRIER_MODE_DIRTY &&
+                         a->dirty_active &&
+                         dirty_has_work(&a->dirty)))
+                        ev |= POLLOUT;
+                } else {
+                    ev = a->worker_link_active || !a->worker_mode ? POLLIN : 0;
+                    if (a->out_pos < a->out_len)
+                        ev |= POLLOUT;
+                }
+                if (lmc_any_output(a, (unsigned)endpoint_id))
                     ev |= POLLOUT;
-            } else {
-                ev = a->worker_link_active || !a->worker_mode ? POLLIN : 0;
-                if (a->out_pos < a->out_len)
-                    ev |= POLLOUT;
+                add_poll(pfds, kind, svc, bind, &n, lmux_carrier_fd(carrier),
+                         ev, 1, endpoint_id, -1);
             }
-            add_poll(pfds, kind, svc, bind, &n, lmux_carrier_fd(&a->carrier),
-                     ev, 1, -1, -1);
+            if (lmux_carrier_listen_fd(carrier) >= 0 &&
+                lmux_carrier_fd(carrier) < 0)
+                add_poll(pfds, kind, svc, bind, &n,
+                         lmux_carrier_listen_fd(carrier), POLLIN, 8,
+                         endpoint_id, -1);
         }
-        if (lmux_carrier_listen_fd(&a->carrier) >= 0 &&
-            lmux_carrier_fd(&a->carrier) < 0)
-            add_poll(pfds, kind, svc, bind, &n,
-                     lmux_carrier_listen_fd(&a->carrier), POLLIN, 8, -1, -1);
         if (a->host.control_listen_fd >= 0)
             add_poll(pfds, kind, svc, bind, &n, a->host.control_listen_fd, POLLIN, 6, -1, -1);
         if (a->host.control_fd >= 0) {
@@ -1593,6 +2525,9 @@ static void run_loop(struct v2_app *a)
                 add_poll(pfds, kind, svc, bind, &n, a->host.control_fd,
                          ev, 7, -1, -1);
         }
+        if (a->host.carrier_control_fd >= 0)
+            add_poll(pfds, kind, svc, bind, &n,
+                     a->host.carrier_control_fd, POLLIN, 14, -1, -1);
         if (a->host.structured_listen_fd >= 0)
             add_poll(pfds, kind, svc, bind, &n, a->host.structured_listen_fd,
                      POLLIN, 11, -1, -1);
@@ -1689,18 +2624,54 @@ static void run_loop(struct v2_app *a)
             if (!pfds[i].revents)
                 continue;
             if (kind[i] == 1) {
-                if (a->outer_enabled) {
+                unsigned endpoint = (unsigned)svc[i];
+                struct lmux_carrier_endpoint *ep =
+                    lmux_carrier_manager_at(&a->carriers, endpoint);
+                if (!ep)
+                    continue;
+                if (!lmux_carrier_manager_is_active(&a->carriers, ep) ||
+                    (a->carrier_failure_hold_mask & (1u << endpoint))) {
+                    if (pfds[i].revents & POLLIN)
+                        drain_standby_carrier(a, endpoint);
+                    if (pfds[i].revents & POLLOUT)
+                        flush_raw_control(a, endpoint);
+                    if (ep && lmux_carrier_fd(&ep->carrier) >= 0 &&
+                        (pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL))) {
+                        log_msg(a, 1, "lmux2 %s standby carrier revents=0x%x",
+                                ep->name,
+                                pfds[i].revents);
+                        lmux_carrier_mark_lost(&ep->carrier, now_ms());
+                    }
+                } else if (a->outer_enabled) {
                     if (pfds[i].revents & POLLIN)
                         feed_outer_carrier(a);
-                    if (pfds[i].revents & POLLOUT)
-                        flush_outer_carrier(a);
+                    if (pfds[i].revents & POLLOUT) {
+                        if (ep->mode == LMUX_CARRIER_MODE_DIRTY &&
+                            a->dirty_active) {
+                            if (a->dirty.output_pos < a->dirty.output_len)
+                                flush_outer_carrier(a);
+                            else if (lmc_any_output(a, endpoint))
+                                flush_raw_control(a, endpoint);
+                            else if (!a->carrier_switch.old_outer_frozen)
+                                flush_outer_carrier(a);
+                        } else {
+                            if (lmux_link_has_pending_output(&a->outer))
+                                flush_outer_carrier(a);
+                            if (!lmux_link_has_pending_output(&a->outer))
+                                flush_raw_control(a, endpoint);
+                            if (!lmc_any_output(a, endpoint) &&
+                                !a->carrier_switch.old_outer_frozen)
+                                flush_outer_carrier(a);
+                        }
+                    }
                 } else {
                     if ((pfds[i].revents & POLLIN) && (!a->worker_mode || a->worker_link_active))
                         feed_carrier(a);
                     if (pfds[i].revents & POLLOUT)
                         flush_carrier(a);
                 }
-                if (pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL))
+                if (lmux_carrier_manager_is_active(&a->carriers, ep) &&
+                    (pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL)))
                     carrier_lost(a);
             } else if (kind[i] == 2) {
                 if (a->role == LMUX2_ROLE_HOST)
@@ -1752,7 +2723,19 @@ static void run_loop(struct v2_app *a)
                     v2_pty_deliver_stream_rx(&a->conn, s);
                 if (pfds[i].revents & POLLIN)
                     v2_pty_collect_tx(&a->conn, s);
-                if (pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL))
+                if (pfds[i].revents & POLLHUP) {
+                    /*
+                     * A PTY master reports HUP in the fork-to-open interval
+                     * before the supervised child opens its slave.  Reap
+                     * first and treat HUP as terminal only when the child
+                     * really exited; otherwise the accepted stream would be
+                     * detached nondeterministically during service startup.
+                     */
+                    v2_pty_supervise(a, a->services);
+                    if (s->child_pid <= 0)
+                        close_pty_attachment(a, s);
+                }
+                if (pfds[i].revents & (POLLERR | POLLNVAL))
                     close_pty_attachment(a, s);
             } else if (kind[i] == 6) {
                 if (pfds[i].revents & POLLIN)
@@ -1769,7 +2752,7 @@ static void run_loop(struct v2_app *a)
                     v2_host_control_on_hup(&a->host);
             } else if (kind[i] == 8) {
                 if (pfds[i].revents & POLLIN)
-                    accept_carrier(a);
+                    accept_carrier(a, (unsigned)svc[i]);
             } else if (kind[i] == 9) {
                 if (pfds[i].revents & POLLIN)
                     handle_supervisor_control(a);
@@ -1789,6 +2772,16 @@ static void run_loop(struct v2_app *a)
                 fill_target_service_status(a);
                 fill_host_status(a, &st);
                 v2_host_structured_service(a, &a->host, &st, pfds[i].revents);
+            } else if (kind[i] == 13) {
+                if (pfds[i].revents & POLLOUT)
+                    carrier_console_tick(a, now_ms());
+                if (pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL))
+                    carrier_console_finish(a, 0, "carrier-lost");
+            } else if (kind[i] == 14) {
+                if (pfds[i].revents &
+                    (POLLIN | POLLHUP | POLLERR | POLLNVAL))
+                    v2_host_control_carrier_service(&a->host,
+                                                    pfds[i].revents);
             }
         }
         v2_unix_pair_unbound_target_streams(a, &a->conn, a->services);
@@ -1804,7 +2797,8 @@ static void run_loop(struct v2_app *a)
                     a->services[i].type == V2_SERVICE_PTY)
                     v2_pty_collect_tx(&a->conn, &a->services[i]);
         }
-        if ((!a->worker_mode || a->worker_link_active || a->worker_link_up_flush) &&
+        if (!a->carrier_console.active &&
+            (!a->worker_mode || a->worker_link_active || a->worker_link_up_flush) &&
             (!a->outer_enabled || a->outer.state == LMUX_LINK_ESTABLISHED)) {
             build_next_output(a);
             if (a->outer_enabled) {
@@ -1825,7 +2819,7 @@ static void cleanup_app(struct v2_app *a)
         if (a->services[i].used)
             v2_service_cleanup(&a->services[i]);
     v2_host_cleanup(&a->host);
-    lmux_carrier_cleanup(&a->carrier);
+    lmux_carrier_manager_cleanup(&a->carriers);
 }
 
 static void on_signal(int sig)
@@ -1843,6 +2837,7 @@ static void usage(FILE *f)
             "       lmuxd --role host|target --carrier-fd FD [--control PATH] [--structured-control PATH] [--unix NAME:HOST_SOCKET:TARGET_SOCKET] [--pty NAME:HOST_SOCKET:ARGV] [--file NAME:HOST_SOCKET] [--verbose]\n"
             "       lmuxd --role host|target --carrier-listen PATH|--carrier-connect PATH [test carrier]\n"
             "       lmuxd --role host --outer --carrier PATH [host options]\n"
+            "       lmuxd --role host --outer --carrier PATH [--carrier-name NAME] [--standby-carrier NAME=PATH [--standby-baud N] [--standby-rtscts]] [host options]\n"
             "       lmuxd --worker --carrier-fd FD --supervisor-control-fd FD [--verbose]\n"
             "       lmuxd --help\n"
             "       lmuxd --version\n",
@@ -1852,9 +2847,19 @@ static void usage(FILE *f)
 int lmux2_runtime_main(int argc, char **argv)
 {
     struct v2_app a;
+    struct lmux_carrier_endpoint *primary_ep = NULL;
+    struct lmux_carrier_endpoint *standby_ep = NULL;
+    char primary_name[LMUX_CARRIER_NAME_MAX + 1] = "primary";
+    unsigned standby_baud = 115200;
+    int standby_baud_set = 0;
+    int standby_rtscts = 0;
     int i, have_role = 0, explicit_role = 0;
     memset(&a, 0, sizeof(a));
-    lmux_carrier_init(&a.carrier);
+    lmux_carrier_manager_init(&a.carriers);
+    for (i = 0; i < LMUX_CARRIER_MAX_ENDPOINTS; i++) {
+        lmux_lmc1_raw_init(&a.lmc_io[i]);
+        lmux_lmc1_dirty_init(&a.lmc_dirty_io[i]);
+    }
     v2_host_init(&a.host);
     lmux_link_endpoint_init(&a.outer, LMUX_LINK_ROLE_HOST);
     a.outer.local_caps |= LMUX_LINK_CAP_BOOT_INFO | LMUX_LINK_CAP_BOOT_UPLOAD |
@@ -1879,25 +2884,83 @@ int lmux2_runtime_main(int argc, char **argv)
         } else if (strcmp(argv[i], "--outer") == 0) {
             a.outer_enabled = 1;
         } else if (strcmp(argv[i], "--carrier") == 0) {
-            if (++i >= argc)
+            if (++i >= argc || primary_ep ||
+                lmux_carrier_manager_add(&a.carriers, primary_name, 1,
+                                         &primary_ep) < 0 ||
+                lmux_carrier_set_tty_path(&primary_ep->carrier, argv[i]) < 0)
                 return usage(stderr), 1;
-            if (lmux_carrier_set_tty_path(&a.carrier, argv[i]) < 0)
+        } else if (strcmp(argv[i], "--carrier-name") == 0) {
+            if (++i >= argc || !lmux_carrier_name_valid(argv[i]))
                 return usage(stderr), 1;
+            if (primary_ep) {
+                if (lmux_carrier_manager_rename(&a.carriers, primary_ep,
+                                                argv[i]) < 0)
+                    return usage(stderr), 1;
+            } else {
+                strcpy(primary_name, argv[i]);
+            }
         } else if (strcmp(argv[i], "--carrier-fd") == 0) {
-            if (++i >= argc)
-                return usage(stderr), 1;
-            if (lmux_carrier_set_fd(&a.carrier, atoi(argv[i])) < 0)
+            if (++i >= argc || primary_ep ||
+                lmux_carrier_manager_add(&a.carriers, primary_name, 1,
+                                         &primary_ep) < 0 ||
+                lmux_carrier_set_fd(&primary_ep->carrier, atoi(argv[i])) < 0)
                 return usage(stderr), 1;
         } else if (strcmp(argv[i], "--carrier-listen") == 0) {
-            if (++i >= argc)
-                return usage(stderr), 1;
-            if (lmux_carrier_set_unix_listen(&a.carrier, argv[i]) < 0)
+            if (++i >= argc || primary_ep ||
+                lmux_carrier_manager_add(&a.carriers, primary_name, 1,
+                                         &primary_ep) < 0 ||
+                lmux_carrier_set_unix_listen(&primary_ep->carrier,
+                                             argv[i]) < 0)
                 return usage(stderr), 1;
         } else if (strcmp(argv[i], "--carrier-connect") == 0) {
+            if (++i >= argc || primary_ep ||
+                lmux_carrier_manager_add(&a.carriers, primary_name, 1,
+                                         &primary_ep) < 0 ||
+                lmux_carrier_set_unix_connect(&primary_ep->carrier,
+                                              argv[i]) < 0)
+                return usage(stderr), 1;
+        } else if (strcmp(argv[i], "--standby-carrier") == 0 ||
+                   strcmp(argv[i], "--standby-carrier-fd") == 0 ||
+                   strcmp(argv[i], "--standby-carrier-listen") == 0 ||
+                   strcmp(argv[i], "--standby-carrier-connect") == 0) {
+            const char *option = argv[i];
+            const char *value;
+            char name[LMUX_CARRIER_NAME_MAX + 1];
+            if (++i >= argc || standby_ep ||
+                lmux_carrier_named_value_parse(argv[i], name, &value) < 0 ||
+                lmux_carrier_manager_add(&a.carriers, name, 0,
+                                         &standby_ep) < 0)
+                return usage(stderr), 1;
+            if (strcmp(option, "--standby-carrier") == 0) {
+                if (lmux_carrier_set_tty_path(&standby_ep->carrier, value) < 0)
+                    return usage(stderr), 1;
+                lmux_carrier_set_tty_policy(&standby_ep->carrier,
+                                            LMUX_TTY_POLICY_STRICT_UART);
+                lmux_carrier_set_exclusive(&standby_ep->carrier, 1);
+            } else if (strcmp(option, "--standby-carrier-fd") == 0) {
+                if (lmux_carrier_set_fd(&standby_ep->carrier,
+                                        atoi(value)) < 0)
+                    return usage(stderr), 1;
+            } else if (strcmp(option, "--standby-carrier-listen") == 0) {
+                if (lmux_carrier_set_unix_listen(&standby_ep->carrier,
+                                                 value) < 0)
+                    return usage(stderr), 1;
+            } else if (lmux_carrier_set_unix_connect(&standby_ep->carrier,
+                                                     value) < 0) {
+                return usage(stderr), 1;
+            }
+        } else if (strcmp(argv[i], "--standby-baud") == 0) {
+            char *end = NULL;
+            unsigned long baud;
             if (++i >= argc)
                 return usage(stderr), 1;
-            if (lmux_carrier_set_unix_connect(&a.carrier, argv[i]) < 0)
+            baud = strtoul(argv[i], &end, 10);
+            if (!end || *end || baud == 0 || baud > 0xffffffffUL)
                 return usage(stderr), 1;
+            standby_baud = (unsigned)baud;
+            standby_baud_set = 1;
+        } else if (strcmp(argv[i], "--standby-rtscts") == 0) {
+            standby_rtscts = 1;
         } else if (strcmp(argv[i], "--supervisor-control-fd") == 0) {
             if (++i >= argc)
                 return usage(stderr), 1;
@@ -1932,18 +2995,28 @@ int lmux2_runtime_main(int argc, char **argv)
             return 1;
         }
     }
-    if (!have_role || !lmux_carrier_is_configured(&a.carrier))
+    if (standby_ep) {
+        standby_ep->carrier.serial.baud = standby_baud;
+        if (standby_rtscts)
+            standby_ep->carrier.serial.flow = LMUX_SERIAL_FLOW_RTSCTS;
+    } else if (standby_baud_set || standby_rtscts) {
+        return usage(stderr), 1;
+    }
+    if (!have_role || !primary_ep ||
+        !lmux_carrier_is_configured(&primary_ep->carrier))
         return usage(stderr), 1;
     if (a.outer_enabled && (a.role != LMUX2_ROLE_HOST || a.worker_mode))
         return usage(stderr), 1;
     if (a.worker_mode &&
         (a.role != LMUX2_ROLE_TARGET || a.supervisor_ctrl_fd < 0 ||
-         a.carrier.kind != LMUX_CARRIER_FD))
+         primary_ep->carrier.kind != LMUX_CARRIER_FD || standby_ep))
+        return usage(stderr), 1;
+    if (!a.worker_mode && a.role != LMUX2_ROLE_HOST && standby_ep)
         return usage(stderr), 1;
     if (!a.worker_mode && a.supervisor_ctrl_fd >= 0)
         return usage(stderr), 1;
-    if (lmux_carrier_start(&a.carrier) < 0) {
-        perror(lmux_carrier_label(&a.carrier));
+    if (lmux_carrier_manager_start(&a.carriers) < 0) {
+        perror(lmux_carrier_label(active_carrier(&a)));
         return 1;
     }
     if (a.host.control_path) {
@@ -1972,10 +3045,9 @@ int lmux2_runtime_main(int argc, char **argv)
     lmux2_conn_init(&a.conn, a.role, make_conn_id());
     if (!a.worker_mode && !a.outer_enabled)
         (void)lmux2_conn_start(&a.conn);
-    if (lmux_carrier_fd(&a.carrier) < 0 &&
-        lmux_carrier_listen_fd(&a.carrier) < 0 && !a.worker_mode)
+    if (!a.worker_mode)
         try_open_carrier(&a);
-    if (a.outer_enabled && lmux_carrier_fd(&a.carrier) >= 0 &&
+    if (a.outer_enabled && lmux_carrier_fd(active_carrier(&a)) >= 0 &&
         a.outer.state == LMUX_LINK_DOWN)
         begin_outer(&a);
     fprintf(stderr, "lmuxd %s (%s) LMUX/2 role=%s%s%s\n", LMUX_BUILD_VERSION,

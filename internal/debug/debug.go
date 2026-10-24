@@ -599,7 +599,11 @@ func (s *Session) targetSelectFailure(err error, before rspSocketSnapshot) error
 	after := s.socketSnapshot("after")
 	if strings.Contains(err.Error(), "remote closed") {
 		s.mu.Lock()
-		if s.acceptSucceeded && s.rspLocalClose == "" {
+		/* The MI result is itself proof that GDB completed the local RSP
+		 * connect and observed its peer close.  Do not condition this
+		 * secondary diagnostic on acceptLoop winning a scheduler race after
+		 * the kernel has already completed connect(2). */
+		if s.rspLocalClose == "" {
 			s.rspLocalClose = "RSP_LOCAL_CLOSED: gdb unix socket closed"
 		}
 		s.mu.Unlock()

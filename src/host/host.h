@@ -2,9 +2,11 @@
 #define LMUX_HOST_H
 
 #include "carrier.h"
+#include "carrier_manager.h"
 #include "boot_protocol.h"
 #include "host_control_structured.h"
 #include "link_endpoint.h"
+#include "dirty.h"
 #include "lxf.h"
 #include "lmux2_core.h"
 #include "lmux2_service.h"
@@ -83,6 +85,7 @@ struct v2_target_service_status {
 
 #define V2_HOST_STRUCTURED_MAX_EXECS V2_EXEC_MAX_RUNNING
 #define V2_HOST_STRUCTURED_CTL_QUEUE_MAX 8
+#define V2_HOST_STRUCTURED_EXEC_POLL_MS 1000
 #define V2_HOST_STRUCTURED_FILE_HISTORY 8
 #define V2_HOST_STRUCTURED_FILE_ERROR_MAX 160
 #define V2_HOST_STRUCTURED_FILE_NAMESPACE_MAX 64
@@ -133,6 +136,8 @@ struct v2_host_structured_exec {
     uint64_t stdin_stream;
     uint64_t stdout_stream;
     uint64_t stderr_stream;
+    int stdout_stream_complete;
+    int stderr_stream_complete;
     uint8_t stdin_buf[4096];
     size_t stdin_len;
     size_t stdin_pos;
@@ -178,6 +183,8 @@ struct v2_host {
     const char *control_path;
     int control_listen_fd;
     int control_fd;
+    int carrier_control_fd;
+    int carrier_switch_waiting;
     char control_in[4096];
     size_t control_in_len;
     const char *structured_path;
@@ -197,6 +204,7 @@ struct v2_host {
     struct v2_host_structured_pending_frame structured_control_queue[V2_HOST_STRUCTURED_CTL_QUEUE_MAX];
     int structured_control_queue_head;
     int structured_control_queue_len;
+    int structured_exec_poll_next;
     struct v2_host_structured_exec structured_execs[V2_HOST_STRUCTURED_MAX_EXECS];
     uint64_t structured_next_file_op_id;
     struct v2_host_structured_file_operation
@@ -266,6 +274,12 @@ struct v2_host {
     uint64_t exec_service_id;
     uint64_t exec_id;
     uint64_t exec_control_stream;
+    uint64_t exec_retiring_control_stream;
+    unsigned long long structured_control_transactions;
+    unsigned long long structured_control_completions;
+    unsigned long long structured_control_autopolls;
+    unsigned long long structured_control_retirements;
+    unsigned long long structured_control_retire_wait_ticks;
     uint64_t exec_stdin_stream;
     uint64_t exec_stdout_stream;
     uint64_t exec_stderr_stream;
@@ -286,6 +300,7 @@ struct v2_host {
 struct v2_host_status {
     enum lmux2_role role;
     const struct lmux_carrier *carrier;
+    const struct lmux_carrier_manager *carriers;
     const struct lmux_link_endpoint *outer;
     const struct lmux2_conn *conn;
     const struct v2_target_service_status *target_services;
@@ -295,6 +310,15 @@ struct v2_host_status {
     unsigned long long stream_open_count;
     unsigned long long stream_close_count;
     unsigned long long stream_reset_count;
+    const char *carrier_switch_phase;
+    const char *carrier_switch_name;
+    const char *carrier_last_error;
+    int carrier_committed_but_down;
+    const char *carrier_console_state;
+    const char *carrier_console_name;
+    unsigned carrier_console_hold_mask;
+    unsigned carrier_failure_hold_mask;
+    const struct lmux_dirty *dirty;
 };
 
 size_t v2_host_link_push_lmux(struct lmux_link_endpoint *link,
@@ -320,6 +344,10 @@ void v2_runtime_lmux_marker(struct v2_app *a, uint64_t *local_conn,
                             uint64_t *established_count);
 int v2_runtime_lmux_established(struct v2_app *a);
 int v2_runtime_outer_enabled(struct v2_app *a);
+int v2_runtime_carrier_switch_start(struct v2_app *a, const char *name,
+                                    enum lmux_carrier_mode mode,
+                                    unsigned timeout_ms,
+                                    char *error, size_t error_cap);
 int v2_runtime_open_stream_token(struct v2_app *a, uint64_t service_id,
                                  uint64_t token, uint64_t *stream_id);
 int v2_runtime_stream_is_open(struct v2_app *a, uint64_t stream_id);
@@ -406,6 +434,11 @@ void v2_host_control_service(struct v2_app *a, struct v2_host *h,
 void v2_host_status_write(struct v2_app *a, struct v2_host *h,
                           const struct v2_host_status *st);
 void v2_host_control_on_hup(struct v2_host *h);
+void v2_host_control_carrier_service(struct v2_host *h, short revents);
+void v2_host_control_carrier_result(struct v2_host *h, const char *line);
+int v2_runtime_carrier_console_start(struct v2_app *a, const char *name,
+                                     char *error, size_t error_cap);
+int v2_host_desired_reconciled(const struct v2_host *h);
 void v2_host_control_outer_down(struct v2_host *h);
 void v2_host_control_check_timeout(struct v2_host *h);
 void v2_host_control_tick(struct v2_app *a, struct v2_host *h,

@@ -1,6 +1,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -12,11 +13,15 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include "boot_protocol.h"
+#include "carrier_manager.h"
+#include "dirty.h"
 #include "host_control_structured.h"
 #include "link_protocol.h"
+#include "lmc1.h"
 #include "lxf.h"
 #include "lmux.h"
 #include "services.h"
@@ -201,6 +206,27 @@ static int shell_cmd_expect(int fd, const char *cmd, const char *needle,
            read_until(fd, needle, out, cap, 7000) < 0 ? -1 : 0;
 }
 
+static int extract_cpid(const char *text, char *out, size_t cap)
+{
+    const char *start = strstr(text, "CPID:");
+    const char *end;
+    size_t len;
+    if (!start || !out || cap == 0)
+        return -1;
+    start += 5;
+    end = strstr(start, ":END");
+    if (!end || end == start)
+        return -1;
+    len = (size_t)(end - start);
+    if (len >= cap)
+        return -1;
+    memcpy(out, start, len);
+    out[len] = 0;
+    return 0;
+}
+
+static int make_file(const char *path, size_t len);
+
 static int read_exact_timeout(int fd, uint8_t *buf, size_t len, int timeout_ms)
 {
     size_t off = 0;
@@ -314,6 +340,46 @@ static int control_request_test(const char *control, const char *req,
     int fd = connect_unix_test(control);
     size_t len = 0;
     long long end = now_ms() + 5000;
+    if (fd < 0 || cap == 0)
+        return -1;
+    out[0] = 0;
+    if (write_all(fd, req, strlen(req)) < 0) {
+        close(fd);
+        return -1;
+    }
+    while (now_ms() < end && len + 1 < cap) {
+        int re = wait_fd_event(fd, POLLIN | POLLHUP | POLLERR | POLLNVAL, 100);
+        if (re & POLLIN) {
+            ssize_t r = read(fd, out + len, cap - len - 1);
+            if (r > 0) {
+                len += (size_t)r;
+                out[len] = 0;
+                continue;
+            }
+            if (r == 0) {
+                close(fd);
+                return len ? 0 : -1;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                continue;
+            close(fd);
+            return -1;
+        }
+        if (re & (POLLHUP | POLLERR | POLLNVAL)) {
+            close(fd);
+            return len ? 0 : -1;
+        }
+    }
+    close(fd);
+    return len ? 0 : -1;
+}
+
+static int control_request_timeout_test(const char *control, const char *req,
+                                        int timeout_ms, char *out, size_t cap)
+{
+    int fd = connect_unix_test(control);
+    size_t len = 0;
+    long long end = now_ms() + timeout_ms;
     if (fd < 0 || cap == 0)
         return -1;
     out[0] = 0;
@@ -1070,6 +1136,7 @@ static int hc2_run_echo(int fd, uint64_t req, const char *text)
     size_t seen_len = 0;
     int done = 0;
     int released = 0;
+    long long end;
     const char *argv[] = {"/bin/echo", text};
     if (snprintf(want, sizeof(want), "%s\n", text) <= 0 ||
         strlen(text) + 1 >= sizeof(want))
@@ -1077,8 +1144,10 @@ static int hc2_run_echo(int fd, uint64_t req, const char *text)
     memset(seen, 0, sizeof(seen));
     if (hc2_exec_start_ready_ref(fd, req, "", argv, 2, &ref) < 0 || !ref)
         return -1;
-    while (!done) {
-        if (hc2_read_frame(fd, &type, &got_req, payload, &len, 7000) < 0)
+    end = now_ms() + 7000;
+    while (!done && now_ms() < end) {
+        if (hc2_read_frame(fd, &type, &got_req, payload, &len,
+                           (int)(end - now_ms())) < 0)
             return -1;
         if (type == LMUX_HC2_EXEC_STDOUT && len >= 8 &&
             hc2_test_get_u64(payload) == ref) {
@@ -1099,14 +1168,18 @@ static int hc2_run_echo(int fd, uint64_t req, const char *text)
             return -1;
         }
     }
+    if (!done)
+        return -1;
     if (strcmp(seen, want) != 0)
         return -1;
     hc2_test_put_u64(payload, ref);
     if (hc2_send_frame(fd, LMUX_HC2_EXEC_RELEASE, req + 1000000,
                        payload, 8) < 0)
         return -1;
-    while (!released) {
-        if (hc2_read_frame(fd, &type, &got_req, payload, &len, 3000) < 0)
+    end = now_ms() + 3000;
+    while (!released && now_ms() < end) {
+        if (hc2_read_frame(fd, &type, &got_req, payload, &len,
+                           (int)(end - now_ms())) < 0)
             return -1;
         if (type == LMUX_HC2_EXEC_STATE && got_req == req + 1000000)
             released = 1;
@@ -1114,7 +1187,7 @@ static int hc2_run_echo(int fd, uint64_t req, const char *text)
                  len >= 4 && lmux_get_le32(payload) != LMUX_HC2_OK)
             return -1;
     }
-    return 0;
+    return released ? 0 : -1;
 }
 
 static int hc2_file_start(int fd, uint16_t type, uint64_t req,
@@ -2663,6 +2736,597 @@ static pid_t spawn_fault_proxy_fds(int host_fd, int target_fd,
     return pid;
 }
 
+struct lmc_proxy_record {
+    uint8_t buf[8192];
+    size_t len;
+    int discard;
+};
+
+static uint8_t lmc_proxy_record_type(const struct lmc_proxy_record *rec)
+{
+    uint8_t decoded[128];
+    size_t decoded_len = 0;
+    if (!rec || rec->len <= 1 ||
+        lmux_cobs_decode(rec->buf, rec->len - 1, decoded,
+                         sizeof(decoded), &decoded_len) < 0 ||
+        decoded_len < 6 || memcmp(decoded, "LMC1", 4) != 0)
+        return 0;
+    return decoded[5];
+}
+
+static int lmc_proxy_feed(int dst, struct lmc_proxy_record *rec,
+                          const uint8_t *buf, size_t len,
+                          uint8_t drop_type, int *dropped)
+{
+    size_t i;
+    for (i = 0; i < len; i++) {
+        if (rec->discard) {
+            if (buf[i] == 0)
+                rec->discard = 0;
+            continue;
+        }
+        if (rec->len == sizeof(rec->buf)) {
+            rec->len = 0;
+            rec->discard = 1;
+            continue;
+        }
+        rec->buf[rec->len++] = buf[i];
+        if (buf[i] == 0) {
+            uint8_t decoded[128];
+            size_t decoded_len = 0;
+            int drop = 0;
+            if (!*dropped && rec->len > 1 &&
+                lmux_cobs_decode(rec->buf, rec->len - 1, decoded,
+                                 sizeof(decoded), &decoded_len) == 0 &&
+                decoded_len >= 6 && memcmp(decoded, "LMC1", 4) == 0 &&
+                decoded[5] == drop_type) {
+                drop = 1;
+                *dropped = 1;
+            }
+            if (!drop && write_all(dst, rec->buf, rec->len) < 0)
+                return -1;
+            rec->len = 0;
+        }
+    }
+    return 0;
+}
+
+static pid_t spawn_lmc_drop_proxy(int host_fd, int target_fd,
+                                  int drop_host_to_target,
+                                  uint8_t drop_type, int note_fd)
+{
+    pid_t pid = fork();
+    if (pid != 0)
+        return pid;
+    {
+        struct lmc_proxy_record h2t, t2h;
+        int dropped = 0;
+        memset(&h2t, 0, sizeof(h2t));
+        memset(&t2h, 0, sizeof(t2h));
+        for (;;) {
+            struct pollfd p[2];
+            int pr;
+            p[0].fd = host_fd;
+            p[0].events = POLLIN;
+            p[0].revents = 0;
+            p[1].fd = target_fd;
+            p[1].events = POLLIN;
+            p[1].revents = 0;
+            pr = poll(p, 2, -1);
+            if (pr < 0 && errno == EINTR)
+                continue;
+            if (pr < 0)
+                _exit(2);
+            if (p[0].revents & POLLIN) {
+                uint8_t buf[512];
+                ssize_t r = read(host_fd, buf, sizeof(buf));
+                int before = dropped;
+                if (r <= 0 || lmc_proxy_feed(target_fd, &h2t, buf, (size_t)r,
+                        drop_host_to_target ? drop_type : 0, &dropped) < 0)
+                    _exit(0);
+                if (!before && dropped)
+                    (void)write(note_fd, "D", 1);
+            }
+            if (p[1].revents & POLLIN) {
+                uint8_t buf[512];
+                ssize_t r = read(target_fd, buf, sizeof(buf));
+                int before = dropped;
+                if (r <= 0 || lmc_proxy_feed(host_fd, &t2h, buf, (size_t)r,
+                        drop_host_to_target ? 0 : drop_type, &dropped) < 0)
+                    _exit(0);
+                if (!before && dropped)
+                    (void)write(note_fd, "D", 1);
+            }
+            if (p[0].revents & (POLLHUP | POLLERR | POLLNVAL))
+                _exit(0);
+            if (p[1].revents & (POLLHUP | POLLERR | POLLNVAL))
+                _exit(0);
+        }
+    }
+}
+
+/*
+ * Exercise the recovery path without timing sleeps: lose the original
+ * COMMITTED, two QUERY_REPLY records, and the duplicate-COMMIT replies that
+ * occur between them.  Resolving QUERY records are duplicated before OUTER
+ * establishment.  The parent can replay the last QUERY after reconciliation
+ * through replay_fd; an 'A' notification means its reply crossed the proxy.
+ */
+static pid_t spawn_lmc_query_recovery_proxy(int host_fd, int target_fd,
+                                            int note_fd, int replay_fd)
+{
+    pid_t pid = fork();
+    if (pid != 0)
+        return pid;
+    {
+        struct lmc_proxy_record h2t, t2h, last_query;
+        int recovery = 0, committed_drops = 3, query_reply_drops = 2;
+        int duplicate_queries = 2, late_pending = 0;
+        memset(&h2t, 0, sizeof(h2t));
+        memset(&t2h, 0, sizeof(t2h));
+        memset(&last_query, 0, sizeof(last_query));
+        for (;;) {
+            struct pollfd p[3];
+            int pr, which;
+            p[0].fd = host_fd;
+            p[0].events = POLLIN;
+            p[0].revents = 0;
+            p[1].fd = target_fd;
+            p[1].events = POLLIN;
+            p[1].revents = 0;
+            p[2].fd = replay_fd;
+            p[2].events = POLLIN;
+            p[2].revents = 0;
+            pr = poll(p, 3, -1);
+            if (pr < 0 && errno == EINTR)
+                continue;
+            if (pr < 0)
+                _exit(2);
+            for (which = 0; which < 2; which++) {
+                int src = which == 0 ? host_fd : target_fd;
+                int dst = which == 0 ? target_fd : host_fd;
+                struct lmc_proxy_record *rec = which == 0 ? &h2t : &t2h;
+                uint8_t buf[512];
+                ssize_t r;
+                size_t i;
+                if (!(p[which].revents & POLLIN))
+                    continue;
+                r = read(src, buf, sizeof(buf));
+                if (r <= 0)
+                    _exit(0);
+                for (i = 0; i < (size_t)r; i++) {
+                    uint8_t type;
+                    int drop = 0, copies = 1;
+                    if (rec->len == sizeof(rec->buf))
+                        _exit(3);
+                    rec->buf[rec->len++] = buf[i];
+                    if (buf[i] != 0)
+                        continue;
+                    type = lmc_proxy_record_type(rec);
+                    if (which == 0 && type == LMUX_LMC1_QUERY) {
+                        last_query = *rec;
+                        if (recovery && duplicate_queries > 0) {
+                            duplicate_queries--;
+                            copies = 2;
+                            (void)write(note_fd, "Q", 1);
+                        }
+                    } else if (which == 1 && type == LMUX_LMC1_COMMITTED &&
+                               committed_drops > 0) {
+                        recovery = 1;
+                        committed_drops--;
+                        drop = 1;
+                        (void)write(note_fd, "C", 1);
+                    } else if (which == 1 && recovery &&
+                               type == LMUX_LMC1_QUERY_REPLY &&
+                               query_reply_drops > 0) {
+                        query_reply_drops--;
+                        drop = 1;
+                        (void)write(note_fd, "R", 1);
+                    }
+                    if (!drop) {
+                        while (copies-- > 0)
+                            if (write_all(dst, rec->buf, rec->len) < 0)
+                                _exit(0);
+                        if (which == 1 && late_pending &&
+                            type == LMUX_LMC1_QUERY_REPLY) {
+                            late_pending = 0;
+                            (void)write(note_fd, "A", 1);
+                        }
+                    }
+                    rec->len = 0;
+                }
+            }
+            if (p[2].revents & POLLIN) {
+                uint8_t command;
+                if (read(replay_fd, &command, 1) != 1)
+                    _exit(0);
+                if (command == 'L' && last_query.len > 0) {
+                    if (write_all(target_fd, last_query.buf,
+                                  last_query.len) < 0)
+                        _exit(0);
+                    late_pending = 1;
+                }
+            }
+            if (p[0].revents & (POLLHUP | POLLERR | POLLNVAL))
+                _exit(0);
+            if (p[1].revents & (POLLHUP | POLLERR | POLLNVAL))
+                _exit(0);
+        }
+    }
+}
+
+static int wait_note_char(int fd, char wanted, int timeout_ms)
+{
+    long long end = now_ms() + timeout_ms;
+    while (now_ms() < end) {
+        int re = wait_fd_event(fd, POLLIN | POLLHUP | POLLERR | POLLNVAL,
+                               100);
+        if (re & POLLIN) {
+            char ch;
+            if (read(fd, &ch, 1) == 1 && ch == wanted)
+                return 0;
+        }
+        if (re & (POLLHUP | POLLERR | POLLNVAL))
+            return -1;
+    }
+    return -1;
+}
+
+struct dirty_fault_record {
+    uint8_t buf[LMUX_DIRTY_RECORD_MAX + 64];
+    size_t len;
+    int collecting;
+};
+
+struct dirty_bootstrap_capture {
+    int count;
+    uint8_t type;
+};
+
+static void dirty_bootstrap_capture_cb(void *opaque,
+                                       const struct lmux_lmc1_msg *msg)
+{
+    struct dirty_bootstrap_capture *capture = opaque;
+    capture->count++;
+    capture->type = msg->type;
+}
+
+static uint8_t dirty_bootstrap_record_type(const uint8_t *buf, size_t len)
+{
+    struct lmux_lmc1_dirty_io io;
+    struct dirty_bootstrap_capture capture;
+    memset(&capture, 0, sizeof(capture));
+    lmux_lmc1_dirty_init(&io);
+    if (lmux_lmc1_dirty_feed(&io, buf, len, dirty_bootstrap_capture_cb,
+                             &capture) < 0 || capture.count != 1)
+        return 0;
+    return capture.type;
+}
+
+static int dirty_fault_forward_record(int dst, struct dirty_fault_record *rec,
+                                      int host_to_target,
+                                      int *bootstrap_corrupted,
+                                      int *committed_dropped,
+                                      int *data_corrupted,
+                                      int *target_data_dropped,
+                                      int *target_data_corrupted,
+                                      int *ack_dropped)
+{
+    struct lmux_dirty_record decoded;
+    int is_bootstrap = rec->len >= LMUX_LMC1_DIRTY_PREFIX_LEN &&
+        memcmp(rec->buf, LMUX_LMC1_DIRTY_PREFIX,
+               LMUX_LMC1_DIRTY_PREFIX_LEN) == 0;
+    int is_dirty = rec->len >= LMUX_DIRTY_PREFIX_LEN &&
+        memcmp(rec->buf, LMUX_DIRTY_PREFIX, LMUX_DIRTY_PREFIX_LEN) == 0;
+    if (write_all(dst, (const uint8_t *)"console-noise\r\n", 15) < 0)
+        return -1;
+    if (host_to_target && is_bootstrap && !*bootstrap_corrupted) {
+        size_t half = rec->len / 2;
+        *bootstrap_corrupted = 1;
+        return write_all(dst, rec->buf, half) < 0 ||
+            write_all(dst, (const uint8_t *)"!", 1) < 0 ||
+            write_all(dst, rec->buf + half, rec->len - half) < 0 ? -1 : 0;
+    }
+    if (!host_to_target && is_bootstrap && !*committed_dropped &&
+        dirty_bootstrap_record_type(rec->buf, rec->len) ==
+            LMUX_LMC1_COMMITTED) {
+        *committed_dropped = 1;
+        return 0;
+    }
+    if (is_dirty &&
+        lmux_dirty_record_decode(rec->buf, rec->len, &decoded) == 0) {
+        if (host_to_target && decoded.type == LMUX_DIRTY_DATA &&
+            !*data_corrupted) {
+            size_t half = rec->len / 2;
+            *data_corrupted = 1;
+            return write_all(dst, rec->buf, half) < 0 ||
+                write_all(dst, (const uint8_t *)"!", 1) < 0 ||
+                write_all(dst, rec->buf + half, rec->len - half) < 0 ? -1 : 0;
+        }
+        if (!host_to_target && decoded.type == LMUX_DIRTY_DATA &&
+            !*target_data_dropped) {
+            *target_data_dropped = 1;
+            return 0;
+        }
+        if (!host_to_target && decoded.type == LMUX_DIRTY_DATA &&
+            !*target_data_corrupted) {
+            static const uint8_t console[] =
+                "kernel-console-inside-target-record";
+            size_t half = rec->len / 2;
+            *target_data_corrupted = 1;
+            return write_all(dst, rec->buf, half) < 0 ||
+                write_all(dst, console, sizeof(console) - 1) < 0 ||
+                write_all(dst, rec->buf + half, rec->len - half) < 0 ? -1 : 0;
+        }
+        if (!host_to_target && decoded.type == LMUX_DIRTY_ACK &&
+            !*ack_dropped) {
+            *ack_dropped = 1;
+            return 0;
+        }
+    }
+    return write_all(dst, rec->buf, rec->len);
+}
+
+static int dirty_fault_feed(int dst, struct dirty_fault_record *rec,
+                            const uint8_t *buf, size_t len,
+                            int host_to_target, int *bootstrap_corrupted,
+                            int *committed_dropped,
+                            int *data_corrupted, int *target_data_dropped,
+                            int *target_data_corrupted, int *ack_dropped)
+{
+    size_t i;
+    for (i = 0; i < len; i++) {
+        uint8_t ch = buf[i];
+        if (!rec->collecting) {
+            if (ch != '~') {
+                if (write_all(dst, &ch, 1) < 0)
+                    return -1;
+                continue;
+            }
+            rec->collecting = 1;
+            rec->len = 0;
+        }
+        if (rec->len == sizeof(rec->buf)) {
+            if (write_all(dst, rec->buf, rec->len) < 0)
+                return -1;
+            rec->collecting = 0;
+            rec->len = 0;
+            if (ch != '~' && write_all(dst, &ch, 1) < 0)
+                return -1;
+            continue;
+        }
+        rec->buf[rec->len++] = ch;
+        if (ch == '\n') {
+            if (dirty_fault_forward_record(dst, rec, host_to_target,
+                                           bootstrap_corrupted,
+                                           committed_dropped,
+                                           data_corrupted,
+                                           target_data_dropped,
+                                           target_data_corrupted,
+                                           ack_dropped) < 0)
+                return -1;
+            rec->collecting = 0;
+            rec->len = 0;
+        }
+    }
+    return 0;
+}
+
+static pid_t spawn_dirty_fault_proxy(int host_fd, int target_fd, int note_fd)
+{
+    pid_t pid = fork();
+    if (pid != 0)
+        return pid;
+    {
+        struct dirty_fault_record h2t, t2h;
+        int bootstrap_corrupted = 0, committed_dropped = 0;
+        int data_corrupted = 0, target_data_dropped = 0;
+        int target_data_corrupted = 0, ack_dropped = 0;
+        memset(&h2t, 0, sizeof(h2t));
+        memset(&t2h, 0, sizeof(t2h));
+        signal(SIGPIPE, SIG_IGN);
+        for (;;) {
+            struct pollfd p[2];
+            int pr;
+            p[0].fd = host_fd; p[0].events = POLLIN; p[0].revents = 0;
+            p[1].fd = target_fd; p[1].events = POLLIN; p[1].revents = 0;
+            pr = poll(p, 2, -1);
+            if (pr < 0 && errno == EINTR)
+                continue;
+            if (pr < 0)
+                _exit(2);
+            if (p[0].revents & POLLIN) {
+                uint8_t buf[512];
+                ssize_t r = read(host_fd, buf, sizeof(buf));
+                if (r <= 0 || dirty_fault_feed(target_fd, &h2t, buf,
+                        (size_t)r, 1, &bootstrap_corrupted,
+                        &committed_dropped,
+                        &data_corrupted, &target_data_dropped,
+                        &target_data_corrupted, &ack_dropped) < 0)
+                    _exit(0);
+            }
+            if (p[1].revents & POLLIN) {
+                uint8_t buf[512];
+                ssize_t r = read(target_fd, buf, sizeof(buf));
+                if (r <= 0 || dirty_fault_feed(host_fd, &t2h, buf,
+                        (size_t)r, 0, &bootstrap_corrupted,
+                        &committed_dropped,
+                        &data_corrupted, &target_data_dropped,
+                        &target_data_corrupted, &ack_dropped) < 0)
+                    _exit(0);
+            }
+            if (bootstrap_corrupted && committed_dropped &&
+                data_corrupted && target_data_dropped &&
+                target_data_corrupted && ack_dropped &&
+                note_fd >= 0) {
+                (void)write(note_fd, "F", 1);
+                note_fd = -1;
+            }
+            if ((p[0].revents | p[1].revents) &
+                (POLLHUP | POLLERR | POLLNVAL))
+                _exit(0);
+        }
+    }
+}
+
+/*
+ * A deterministic, bounded approximation of a full-duplex 115200 8N1 link.
+ * Eleven bytes per millisecond is 110 kbit/s on the wire.  The small chunks
+ * also exercise partial reads/writes without injecting corruption or loss.
+ */
+static pid_t spawn_dirty_baud_proxy(int host_fd, int target_fd)
+{
+    pid_t pid = fork();
+    if (pid != 0)
+        return pid;
+    {
+        struct test_ring to_host = {{0}, 0, 0, 0};
+        struct test_ring to_target = {{0}, 0, 0, 0};
+        long long host_due = 0, target_due = 0;
+        signal(SIGPIPE, SIG_IGN);
+        (void)test_set_nonblock(host_fd);
+        (void)test_set_nonblock(target_fd);
+        for (;;) {
+            struct pollfd p[2];
+            long long now = now_ms();
+            int pr, i;
+            p[0].fd = host_fd;
+            p[0].events = test_ring_space(&to_target) >= 256 ? POLLIN : 0;
+            if (to_host.len && now >= host_due)
+                p[0].events |= POLLOUT;
+            p[0].revents = 0;
+            p[1].fd = target_fd;
+            p[1].events = test_ring_space(&to_host) >= 256 ? POLLIN : 0;
+            if (to_target.len && now >= target_due)
+                p[1].events |= POLLOUT;
+            p[1].revents = 0;
+            pr = poll(p, 2, (to_host.len || to_target.len) ? 1 : 1000);
+            if (pr < 0 && errno == EINTR)
+                continue;
+            if (pr < 0)
+                _exit(127);
+            for (i = 0; i < 2; i++) {
+                int fd = p[i].fd;
+                struct test_ring *in = i == 0 ? &to_target : &to_host;
+                struct test_ring *out = i == 0 ? &to_host : &to_target;
+                long long *due = i == 0 ? &host_due : &target_due;
+                if (p[i].revents & POLLIN) {
+                    uint8_t buf[256];
+                    ssize_t r = read(fd, buf, sizeof(buf));
+                    if (r > 0) {
+                        if (test_ring_write(in, buf, (size_t)r) != (size_t)r)
+                            _exit(127);
+                    } else if (r == 0 || (r < 0 && errno != EAGAIN &&
+                                          errno != EWOULDBLOCK && errno != EINTR)) {
+                        _exit(0);
+                    }
+                }
+                if (p[i].revents & POLLOUT) {
+                    const unsigned char *buf;
+                    size_t n = test_ring_peek(out, &buf);
+                    ssize_t w;
+                    if (n > 11)
+                        n = 11;
+                    w = write(fd, buf, n);
+                    if (w > 0) {
+                        test_ring_consume(out, (size_t)w);
+                        *due = now_ms() + 1;
+                    } else if (w < 0 && errno != EAGAIN &&
+                               errno != EWOULDBLOCK && errno != EINTR) {
+                        _exit(0);
+                    }
+                }
+                if (p[i].revents & (POLLHUP | POLLERR | POLLNVAL))
+                    _exit(0);
+            }
+        }
+    }
+}
+
+static int dirty_blackhole_feed(int dst, struct dirty_fault_record *rec,
+                                const uint8_t *buf, size_t len,
+                                int *dropped, int note_fd)
+{
+    size_t i;
+    for (i = 0; i < len; i++) {
+        uint8_t ch = buf[i];
+        if (!rec->collecting) {
+            if (ch != '~') {
+                if (write_all(dst, &ch, 1) < 0)
+                    return -1;
+                continue;
+            }
+            rec->collecting = 1;
+            rec->len = 0;
+        }
+        if (rec->len == sizeof(rec->buf))
+            return -1;
+        rec->buf[rec->len++] = ch;
+        if (ch == '\n') {
+            int is_dirty = rec->len >= LMUX_DIRTY_PREFIX_LEN &&
+                memcmp(rec->buf, LMUX_DIRTY_PREFIX,
+                       LMUX_DIRTY_PREFIX_LEN) == 0;
+            if (is_dirty) {
+                if (!*dropped && note_fd >= 0)
+                    (void)write(note_fd, "X", 1);
+                *dropped = 1;
+            } else if (write_all(dst, rec->buf, rec->len) < 0) {
+                return -1;
+            }
+            rec->collecting = 0;
+            rec->len = 0;
+        }
+    }
+    return 0;
+}
+
+static pid_t spawn_dirty_blackhole_proxy(int host_fd, int target_fd,
+                                         int note_fd, int disappear)
+{
+    pid_t pid = fork();
+    if (pid != 0)
+        return pid;
+    {
+        struct dirty_fault_record h2t, t2h;
+        int dropped = 0;
+        memset(&h2t, 0, sizeof(h2t));
+        memset(&t2h, 0, sizeof(t2h));
+        signal(SIGPIPE, SIG_IGN);
+        for (;;) {
+            struct pollfd p[2];
+            int pr;
+            p[0].fd = host_fd; p[0].events = POLLIN; p[0].revents = 0;
+            p[1].fd = target_fd; p[1].events = POLLIN; p[1].revents = 0;
+            pr = poll(p, 2, -1);
+            if (pr < 0 && errno == EINTR) continue;
+            if (pr < 0) _exit(2);
+            if (p[0].revents & POLLIN) {
+                uint8_t buf[512];
+                int was_dropped = dropped;
+                ssize_t r = read(host_fd, buf, sizeof(buf));
+                if (r <= 0 || dirty_blackhole_feed(target_fd, &h2t, buf,
+                        (size_t)r, &dropped, note_fd) < 0)
+                    _exit(0);
+                if (disappear && !was_dropped && dropped)
+                    _exit(0);
+            }
+            if (p[1].revents & POLLIN) {
+                uint8_t buf[512];
+                int was_dropped = dropped;
+                ssize_t r = read(target_fd, buf, sizeof(buf));
+                if (r <= 0 || dirty_blackhole_feed(host_fd, &t2h, buf,
+                        (size_t)r, &dropped, note_fd) < 0)
+                    _exit(0);
+                if (disappear && !was_dropped && dropped)
+                    _exit(0);
+            }
+            if ((p[0].revents | p[1].revents) &
+                (POLLHUP | POLLERR | POLLNVAL))
+                _exit(0);
+        }
+    }
+}
+
 static int first_hello_truncate_feed(int *injected, uint8_t *rec,
                                      size_t *rec_len,
                                      const uint8_t *in, size_t in_len,
@@ -2767,6 +3431,85 @@ static pid_t spawn_truncate_first_hello_proxy(int host_fd, int target_fd,
         }
     }
     return pid;
+}
+
+static pid_t spawn_dirty_blackhole_reconnect_proxy(const char *path,
+                                                    int target_fd,
+                                                    int note_fd)
+{
+    pid_t pid = fork();
+    if (pid != 0)
+        return pid;
+    {
+        int lfd, host_fd = -1;
+        struct sockaddr_un sa;
+        struct dirty_fault_record h2t, t2h;
+        int dropped = 0;
+        memset(&h2t, 0, sizeof(h2t));
+        memset(&t2h, 0, sizeof(t2h));
+        signal(SIGPIPE, SIG_IGN);
+        unlink(path);
+        lfd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        if (lfd < 0)
+            _exit(127);
+        memset(&sa, 0, sizeof(sa));
+        sa.sun_family = AF_UNIX;
+        strcpy(sa.sun_path, path);
+        if (bind(lfd, (struct sockaddr *)&sa, sizeof(sa)) < 0 ||
+            listen(lfd, 4) < 0)
+            _exit(127);
+        for (;;) {
+            struct pollfd p[3];
+            nfds_t n = 0;
+            int pr;
+            p[n].fd = lfd; p[n].events = host_fd < 0 ? POLLIN : 0;
+            p[n++].revents = 0;
+            p[n].fd = target_fd; p[n].events = POLLIN; p[n++].revents = 0;
+            if (host_fd >= 0) {
+                p[n].fd = host_fd; p[n].events = POLLIN; p[n++].revents = 0;
+            }
+            pr = poll(p, n, -1);
+            if (pr < 0 && errno == EINTR)
+                continue;
+            if (pr < 0)
+                _exit(2);
+            if (p[0].revents & POLLIN) {
+                int fd = accept(lfd, NULL, NULL);
+                if (fd >= 0) {
+                    host_fd = fd;
+                    memset(&h2t, 0, sizeof(h2t));
+                    memset(&t2h, 0, sizeof(t2h));
+                }
+            }
+            if (p[1].revents & POLLIN) {
+                uint8_t buf[512];
+                ssize_t r = read(target_fd, buf, sizeof(buf));
+                if (r <= 0)
+                    _exit(0);
+                if (host_fd >= 0 && dirty_blackhole_feed(host_fd, &t2h,
+                        buf, (size_t)r, &dropped, note_fd) < 0) {
+                    close(host_fd);
+                    host_fd = -1;
+                }
+            }
+            if (host_fd >= 0 && n == 3 && (p[2].revents & POLLIN)) {
+                uint8_t buf[512];
+                ssize_t r = read(host_fd, buf, sizeof(buf));
+                if (r <= 0 || dirty_blackhole_feed(target_fd, &h2t, buf,
+                        (size_t)r, &dropped, note_fd) < 0) {
+                    close(host_fd);
+                    host_fd = -1;
+                }
+            }
+            if (p[1].revents & (POLLHUP | POLLERR | POLLNVAL))
+                _exit(0);
+            if (host_fd >= 0 && n == 3 &&
+                (p[2].revents & (POLLHUP | POLLERR | POLLNVAL))) {
+                close(host_fd);
+                host_fd = -1;
+            }
+        }
+    }
 }
 
 static int drop_first_ack_feed(int *dropped, char dir,
@@ -3147,6 +3890,2057 @@ static pid_t wait_child_pid(pid_t ppid, pid_t not_pid, int timeout_ms)
         usleep(20000);
     }
     return -1;
+}
+
+static int carrier_manager_standby_without_usb_test(void)
+{
+    char dir[] = "/tmp/lmux-carrier-manager-it-XXXXXX";
+    char usb[192], uart[192], control[192], console[192], file_sock[192];
+    char uart_spec[256], pty_arg[400], file_arg[400], out[8192];
+    pid_t sup = -1, host = -1, worker = -1;
+    int uart_fd = -1, rc = 1;
+    const char *why = "setup";
+    static const uint8_t noise[] = "boot console noise before LMC1\r\nlogin: ";
+
+    out[0] = '\0';
+    if (!mkdtemp(dir))
+        return fail("carrier manager mkdtemp");
+    snprintf(usb, sizeof(usb), "%s/usb.sock", dir);
+    snprintf(uart, sizeof(uart), "%s/uart.sock", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(console, sizeof(console), "%s/console.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(uart_spec, sizeof(uart_spec), "rescue=%s", uart);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+
+    sup = fork();
+    if (sup == 0) {
+        if (getenv("LMUX2_IT_VERBOSE"))
+            execl("build/host/lmuxd", "lmuxd", "--supervisor", "--outer",
+                  "--carrier-connect", usb, "--carrier-name", "main",
+                  "--standby-carrier-listen", uart_spec,
+                  "--verbose", (char *)NULL);
+        execl("build/host/lmuxd", "lmuxd", "--supervisor", "--outer",
+              "--carrier-connect", usb, "--carrier-name", "main",
+              "--standby-carrier-listen", uart_spec, (char *)NULL);
+        _exit(127);
+    }
+    if (sup < 0 || wait_path_exists(uart, 5000) < 0) {
+        why = "uart listener did not start";
+        goto out;
+    }
+    worker = wait_child_pid(sup, -1, 5000);
+    if (worker <= 0) {
+        why = "worker did not start";
+        goto out;
+    }
+
+    uart_fd = wait_connect(uart, 5000);
+    if (uart_fd < 0 || write_all(uart_fd, noise, sizeof(noise) - 1) < 0) {
+        why = "uart standby connect/write failed";
+        goto out;
+    }
+    {
+        long long end = now_ms() + 1000;
+        while (now_ms() < end) {
+            if (!pid_alive(sup) || !pid_alive(worker)) {
+                why = "supervisor or worker died under standby noise";
+                goto out;
+            }
+            if (poll(NULL, 0, 20) < 0 && errno != EINTR)
+                goto out;
+        }
+    }
+    close(uart_fd);
+    uart_fd = -1;
+
+    host = fork();
+    if (host == 0) {
+        if (getenv("LMUX2_IT_VERBOSE"))
+            execl("build/host/lmuxd", "lmuxd", "--role", "host",
+                  "--outer", "--carrier-listen", usb,
+                  "--carrier-name", "main", "--standby-carrier-connect",
+                  uart_spec, "--control", control, "--pty", pty_arg,
+                  "--file", file_arg, "--verbose", (char *)NULL);
+        execl("build/host/lmuxd", "lmuxd", "--role", "host",
+              "--outer", "--carrier-listen", usb,
+              "--carrier-name", "main", "--standby-carrier-connect",
+              uart_spec, "--control", control, "--pty", pty_arg,
+              "--file", file_arg, (char *)NULL);
+        _exit(127);
+    }
+    if (host < 0 || wait_ready_layers(control, 1, 15000,
+                                      out, sizeof(out)) < 0) {
+        why = "usb outer/lmux did not establish";
+        goto out;
+    }
+    if (!pid_alive(sup) || !pid_alive(worker) ||
+        find_child_pid(sup) != worker) {
+        why = "worker changed during usb establishment";
+        goto out;
+    }
+    if (!strstr(out, "connection: ESTABLISHED") ||
+        !strstr(out, "carrier_manager: active=main") ||
+        !strstr(out, "carrier_endpoint: name=main") ||
+        !strstr(out, "carrier_endpoint: name=rescue") ||
+        strstr(out, "carrier_endpoint: name=usb") ||
+        strstr(out, "carrier_endpoint: name=uart")) {
+        why = "status lacks named main/rescue endpoints";
+        goto out;
+    }
+    rc = 0;
+out:
+    if (rc != 0) {
+        fprintf(stderr, "carrier manager standby failure: %s\n", why);
+        dump_excerpt("carrier manager standby without usb", out);
+    }
+    if (uart_fd >= 0)
+        close(uart_fd);
+    stop_pid(host);
+    stop_pid(sup);
+    unlink(usb);
+    unlink(uart);
+    unlink(control);
+    unlink(console);
+    unlink(file_sock);
+    rmdir(dir);
+    return rc;
+}
+
+static int carrier_manager_usb_without_uart_test(void)
+{
+    char dir[] = "/tmp/lmux-carrier-missing-uart-it-XXXXXX";
+    char usb[192], uart[192], control[192], console[192], file_sock[192];
+    char uart_spec[256], pty_arg[400], file_arg[400], out[8192];
+    pid_t sup = -1, host = -1, worker = -1;
+    int rc = 1;
+    const char *why = "setup";
+
+    out[0] = '\0';
+    if (!mkdtemp(dir))
+        return fail("carrier manager missing uart mkdtemp");
+    snprintf(usb, sizeof(usb), "%s/usb.sock", dir);
+    snprintf(uart, sizeof(uart), "%s/missing-uart", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(console, sizeof(console), "%s/console.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(uart_spec, sizeof(uart_spec), "rescue=%s", uart);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+
+    sup = fork();
+    if (sup == 0) {
+        if (getenv("LMUX2_IT_VERBOSE"))
+            execl("build/host/lmuxd", "lmuxd", "--supervisor", "--outer",
+                  "--carrier-listen", usb, "--standby-carrier", uart_spec,
+                  "--verbose", (char *)NULL);
+        execl("build/host/lmuxd", "lmuxd", "--supervisor", "--outer",
+              "--carrier-listen", usb, "--standby-carrier", uart_spec,
+              (char *)NULL);
+        _exit(127);
+    }
+    if (sup < 0 || wait_path_exists(usb, 5000) < 0) {
+        why = "usb listener did not start";
+        goto out;
+    }
+    worker = wait_child_pid(sup, -1, 5000);
+    if (worker <= 0) {
+        why = "worker did not start";
+        goto out;
+    }
+
+    host = fork();
+    if (host == 0) {
+        if (getenv("LMUX2_IT_VERBOSE"))
+            execl("build/host/lmuxd", "lmuxd", "--role", "host",
+                  "--outer", "--carrier-connect", usb, "--control", control,
+                  "--pty", pty_arg, "--file", file_arg, "--verbose",
+                  (char *)NULL);
+        execl("build/host/lmuxd", "lmuxd", "--role", "host",
+              "--outer", "--carrier-connect", usb, "--control", control,
+              "--pty", pty_arg, "--file", file_arg, (char *)NULL);
+        _exit(127);
+    }
+    if (host < 0 || wait_ready_layers(control, 1, 15000,
+                                      out, sizeof(out)) < 0) {
+        why = "usb outer/lmux did not establish";
+        goto out;
+    }
+    if (!pid_alive(sup) || !pid_alive(worker) ||
+        find_child_pid(sup) != worker) {
+        why = "supervisor or worker changed";
+        goto out;
+    }
+    if (!strstr(out, "connection: ESTABLISHED") ||
+        !strstr(out, "carrier_manager: active=primary") ||
+        !strstr(out, "carrier_endpoint: name=primary")) {
+        why = "legacy status lacks active primary";
+        goto out;
+    }
+    rc = 0;
+out:
+    if (rc != 0) {
+        fprintf(stderr, "carrier manager missing uart failure: %s\n", why);
+        dump_excerpt("carrier manager usb without uart", out);
+    }
+    stop_pid(host);
+    stop_pid(sup);
+    unlink(usb);
+    unlink(control);
+    unlink(console);
+    unlink(file_sock);
+    rmdir(dir);
+    return rc;
+}
+
+static int run_lmux_carrier_cli_mode(const char *action, const char *name,
+                                     const char *mode, const char *control,
+                                     char *out, size_t cap)
+{
+    int p[2], st;
+    pid_t pid;
+    size_t len = 0;
+    if (!action || !control || !out || cap == 0 || pipe(p) < 0)
+        return -1;
+    out[0] = 0;
+    pid = fork();
+    if (pid == 0) {
+        close(p[0]);
+        if (dup2(p[1], STDOUT_FILENO) < 0)
+            _exit(127);
+        close(p[1]);
+        if (name && strcmp(action, "switch") == 0)
+            execl("build/host/lmux", "lmux", "carrier", action, name,
+                  "--mode", mode, "--timeout-ms", "15000",
+                  "--control", control, (char *)NULL);
+        else if (name)
+            execl("build/host/lmux", "lmux", "carrier", action, name,
+                  "--control", control, (char *)NULL);
+        else
+            execl("build/host/lmux", "lmux", "carrier", action,
+                  "--control", control, (char *)NULL);
+        _exit(127);
+    }
+    close(p[1]);
+    if (pid < 0) {
+        close(p[0]);
+        return -1;
+    }
+    while (len + 1 < cap) {
+        ssize_t n = read(p[0], out + len, cap - len - 1);
+        if (n > 0) {
+            len += (size_t)n;
+            out[len] = 0;
+        } else if (n == 0) {
+            break;
+        } else if (errno != EINTR) {
+            close(p[0]);
+            return -1;
+        }
+    }
+    close(p[0]);
+    if (waitpid(pid, &st, 0) != pid)
+        return -1;
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : -1;
+}
+
+static int run_lmux_carrier_cli(const char *action, const char *name,
+                                const char *control, char *out, size_t cap)
+{
+    return run_lmux_carrier_cli_mode(action, name, "raw", control, out, cap);
+}
+
+static int carrier_dispatcher_handover_console_test(void)
+{
+    char dir[] = "/tmp/lmux-dispatch-supervisor-it-XXXXXX";
+    char primary[192], control[192], dispatch_sock[192];
+    char rescue_fd_spec[64], rescue_dispatch_spec[256], out[8192];
+    char *slave_name;
+    struct termios tio;
+    pid_t dispatcher = -1, host = -1, sup = -1, worker = -1;
+    int master = -1, slave = -1, flags, status, rc = 1;
+    const char *why = "setup";
+
+    if (!mkdtemp(dir))
+        return fail("dispatcher handover mkdtemp");
+    snprintf(primary, sizeof(primary), "%s/primary.sock", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(dispatch_sock, sizeof(dispatch_sock), "%s/dispatch.sock", dir);
+    master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (master < 0 || grantpt(master) < 0 || unlockpt(master) < 0 ||
+        !(slave_name = ptsname(master))) {
+        why = "PTY allocation";
+        goto out;
+    }
+    slave = open(slave_name, O_RDWR | O_NOCTTY);
+    if (slave < 0 || tcgetattr(slave, &tio) < 0) {
+        why = "PTY slave";
+        goto out;
+    }
+    tio.c_oflag |= OPOST | ONLCR;
+    if (tcsetattr(slave, TCSANOW, &tio) < 0) {
+        why = "PTY termios";
+        goto out;
+    }
+    close(slave);
+    slave = -1;
+    dispatcher = fork();
+    if (dispatcher == 0) {
+        execl("build/host/lmux-uart-dispatch", "lmux-uart-dispatch",
+              "--tty", slave_name, "--ipc-listen", dispatch_sock,
+              "--console-exec", "/bin/true", (char *)NULL);
+        _exit(127);
+    }
+    if (dispatcher < 0 || wait_path_exists(dispatch_sock, 5000) < 0) {
+        why = "dispatcher startup";
+        goto out;
+    }
+    flags = fcntl(master, F_GETFD, 0);
+    if (flags < 0 || fcntl(master, F_SETFD, flags & ~FD_CLOEXEC) < 0) {
+        why = "master inheritance";
+        goto out;
+    }
+    snprintf(rescue_fd_spec, sizeof(rescue_fd_spec), "rescue=%d", master);
+    snprintf(rescue_dispatch_spec, sizeof(rescue_dispatch_spec),
+             "rescue=%s", dispatch_sock);
+    host = fork();
+    if (host == 0) {
+        if (getenv("LMUX2_IT_VERBOSE"))
+            execl("build/host/lmuxd", "lmuxd", "--role", "host", "--outer",
+                  "--carrier-listen", primary, "--carrier-name", "primary",
+                  "--standby-carrier-fd", rescue_fd_spec,
+                  "--control", control, "--verbose", (char *)NULL);
+        execl("build/host/lmuxd", "lmuxd", "--role", "host", "--outer",
+              "--carrier-listen", primary, "--carrier-name", "primary",
+              "--standby-carrier-fd", rescue_fd_spec,
+              "--control", control, (char *)NULL);
+        _exit(127);
+    }
+    if (host < 0 || wait_path_exists(primary, 5000) < 0) {
+        why = "host startup";
+        goto out;
+    }
+    close(master);
+    master = -1;
+    sup = fork();
+    if (sup == 0) {
+        if (getenv("LMUX2_IT_VERBOSE"))
+            execl("build/host/lmuxd", "lmuxd", "--supervisor", "--outer",
+                  "--carrier-connect", primary, "--carrier-name", "primary",
+                  "--standby-dispatch", rescue_dispatch_spec,
+                  "--verbose", (char *)NULL);
+        execl("build/host/lmuxd", "lmuxd", "--supervisor", "--outer",
+              "--carrier-connect", primary, "--carrier-name", "primary",
+              "--standby-dispatch", rescue_dispatch_spec, (char *)NULL);
+        _exit(127);
+    }
+    if (sup < 0 || wait_ready_layers(control, 1, 15000,
+                                     out, sizeof(out)) < 0) {
+        why = "initial establishment";
+        goto out;
+    }
+    worker = wait_child_pid(sup, -1, 5000);
+    if (worker <= 0) {
+        why = "worker PID";
+        goto out;
+    }
+    if (run_lmux_carrier_cli_mode("switch", "rescue", "dirty", control,
+                                  out, sizeof(out)) < 0 ||
+        !strstr(out, "OK CARRIER active=rescue mode=dirty") ||
+        read_status(control, out, sizeof(out)) < 0 ||
+        !strstr(out, "connection: ESTABLISHED") ||
+        find_child_pid(sup) != worker) {
+        why = "DIRTY dispatcher handover";
+        goto out;
+    }
+    if (run_lmux_carrier_cli("console", "rescue", control,
+                             out, sizeof(out)) < 0 ||
+        !strstr(out, "OK CARRIER CONSOLE name=rescue")) {
+        why = "emergency console CLI";
+        goto out;
+    }
+    if (waitpid(dispatcher, &status, 0) != dispatcher ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        why = "console exec outcome";
+        goto out;
+    }
+    dispatcher = -1;
+    if (read_status(control, out, sizeof(out)) < 0 ||
+        !strstr(out, "carrier: down") ||
+        !strstr(out,
+                "carrier_console: state=released endpoint=rescue held_mask=0x2")) {
+        why = "host UART release state";
+        goto out;
+    }
+    if (run_lmux_carrier_cli_mode("switch", "primary", "raw", control,
+                                  out, sizeof(out)) < 0 ||
+        !strstr(out, "OK CARRIER active=primary mode=raw") ||
+        read_status(control, out, sizeof(out)) < 0 ||
+        !strstr(out, "connection: ESTABLISHED") ||
+        !strstr(out,
+                "carrier_console: state=released endpoint=rescue held_mask=0x2")) {
+        why = "USB recovery with UART released";
+        goto out;
+    }
+    if (find_child_pid(sup) != worker) {
+        why = "worker replaced";
+        goto out;
+    }
+    rc = 0;
+out:
+    if (rc) {
+        fprintf(stderr, "dispatcher handover failure: %s\n", why);
+        dump_excerpt("dispatcher handover", out);
+    }
+    if (master >= 0) close(master);
+    if (slave >= 0) close(slave);
+    stop_pid(host);
+    stop_pid(sup);
+    stop_pid(dispatcher);
+    unlink(primary);
+    unlink(control);
+    unlink(dispatch_sock);
+    rmdir(dir);
+    return rc;
+}
+
+static int lmc_test_send(int fd, const struct lmux_lmc1_msg *msg,
+                         size_t split_at)
+{
+    uint8_t record[LMUX_LMC1_MAX_ENCODED];
+    size_t len = 0;
+    if (lmux_lmc1_encode(msg, record, sizeof(record), &len) < 0)
+        return -1;
+    if (split_at == 0 || split_at >= len)
+        return write_all(fd, record, len);
+    return write_all(fd, record, split_at) < 0 ||
+           write_all(fd, record + split_at, len - split_at) < 0 ? -1 : 0;
+}
+
+static int lmc_test_read(int fd, struct lmux_lmc1_msg *msg, int timeout_ms)
+{
+    uint8_t record[LMUX_LMC1_RAW_RECORD_MAX];
+    size_t len = 0;
+    long long end = now_ms() + timeout_ms;
+    while (now_ms() < end) {
+        uint8_t buf[256];
+        int re = wait_fd_event(fd, POLLIN | POLLHUP | POLLERR | POLLNVAL,
+                               100);
+        if (re & POLLIN) {
+            ssize_t n = read(fd, buf, sizeof(buf));
+            size_t i;
+            if (n <= 0)
+                return -1;
+            for (i = 0; i < (size_t)n; i++) {
+                if (buf[i] == 0) {
+                    int decoded = len ? lmux_lmc1_decode(record, len, msg) : 1;
+                    len = 0;
+                    if (decoded == 0)
+                        return 0;
+                } else if (len < sizeof(record)) {
+                    record[len++] = buf[i];
+                } else {
+                    len = 0;
+                }
+            }
+        }
+        if (re & (POLLHUP | POLLERR | POLLNVAL))
+            return -1;
+    }
+    return -1;
+}
+
+static int lmc_test_request(int fd, const struct lmux_lmc1_msg *request,
+                            struct lmux_lmc1_msg *reply)
+{
+    return lmc_test_send(fd, request, 0) < 0 ||
+        lmc_test_read(fd, reply, 5000) < 0 ||
+        !lmux_lmc1_nonce_equal(request->nonce, reply->nonce) ? -1 : 0;
+}
+
+static void lmc_test_nonce(uint8_t nonce[LMUX_LMC1_NONCE_LEN], uint8_t value)
+{
+    memset(nonce, value, LMUX_LMC1_NONCE_LEN);
+}
+
+static int carrier_lmc1_state_machine_test(void)
+{
+    char dir[] = "/tmp/lmux-lmc1-state-it-XXXXXX";
+    char primary[192], rescue[192], spec[256];
+    struct lmux_lmc1_msg query, prepare, ready, request, reply, commit;
+    pid_t sup = -1, worker = -1;
+    int fd = -1, rc = 1;
+    const char *why = "setup";
+
+    if (!mkdtemp(dir))
+        return fail("LMC1 state mkdtemp");
+    snprintf(primary, sizeof(primary), "%s/primary-missing", dir);
+    snprintf(rescue, sizeof(rescue), "%s/rescue.sock", dir);
+    snprintf(spec, sizeof(spec), "rescue=%s", rescue);
+    sup = fork();
+    if (sup == 0) {
+        execl("build/host/lmuxd", "lmuxd", "--supervisor", "--outer",
+              "--carrier-connect", primary,
+              "--standby-carrier-listen", spec, (char *)NULL);
+        _exit(127);
+    }
+    if (sup < 0 || wait_path_exists(rescue, 5000) < 0 ||
+        (worker = wait_child_pid(sup, -1, 5000)) <= 0 ||
+        (fd = wait_connect(rescue, 5000)) < 0) {
+        why = "target standby";
+        goto out;
+    }
+    memset(&query, 0, sizeof(query));
+    query.type = LMUX_LMC1_QUERY;
+    query.mode = LMUX_CARRIER_MODE_RAW;
+    strcpy(query.name, "rescue");
+    lmc_test_nonce(query.nonce, 1);
+    if (lmc_test_request(fd, &query, &reply) < 0 ||
+        reply.type != LMUX_LMC1_QUERY_REPLY || reply.generation != 1 ||
+        strcmp(reply.name, "primary") != 0) {
+        why = "initial QUERY";
+        goto out;
+    }
+    memset(&prepare, 0, sizeof(prepare));
+    prepare.type = LMUX_LMC1_PREPARE;
+    prepare.mode = LMUX_CARRIER_MODE_RAW;
+    prepare.generation = reply.generation;
+    memcpy(prepare.boot_id, reply.boot_id, sizeof(prepare.boot_id));
+    strcpy(prepare.name, "rescue");
+    lmc_test_nonce(prepare.nonce, 2);
+    {
+        uint8_t encoded[LMUX_LMC1_MAX_ENCODED];
+        size_t encoded_len = 0, half;
+        if (lmux_lmc1_encode(&prepare, encoded, sizeof(encoded),
+                             &encoded_len) < 0) {
+            why = "split PREPARE encode";
+            goto out;
+        }
+        half = encoded_len / 2;
+        if (write_all(fd, encoded, half) < 0 ||
+            (wait_fd_event(fd, POLLIN | POLLHUP | POLLERR, 100) & POLLIN) ||
+            write_all(fd, encoded + half, encoded_len - half) < 0 ||
+            lmc_test_read(fd, &ready, 5000) < 0 ||
+            ready.type != LMUX_LMC1_READY ||
+            !lmux_lmc1_nonce_equal(ready.nonce, prepare.nonce)) {
+            why = "split PREPARE/READY";
+            goto out;
+        }
+    }
+    if (lmc_test_request(fd, &prepare, &reply) < 0 ||
+        reply.type != LMUX_LMC1_READY ||
+        memcmp(reply.cookie, ready.cookie, sizeof(reply.cookie)) != 0) {
+        why = "duplicate PREPARE";
+        goto out;
+    }
+    request = prepare;
+    lmc_test_nonce(request.nonce, 3);
+    if (lmc_test_request(fd, &request, &reply) < 0 ||
+        reply.type != LMUX_LMC1_ERROR ||
+        reply.status != LMUX_LMC1_STATUS_BUSY) {
+        why = "competing PREPARE BUSY";
+        goto out;
+    }
+    request = prepare;
+    lmc_test_nonce(request.nonce, 4);
+    request.generation++;
+    if (lmc_test_request(fd, &request, &reply) < 0 ||
+        reply.type != LMUX_LMC1_ERROR ||
+        reply.status != LMUX_LMC1_STATUS_STALE) {
+        why = "stale generation";
+        goto out;
+    }
+    request = prepare;
+    lmc_test_nonce(request.nonce, 5);
+    request.boot_id[0] ^= 1;
+    if (lmc_test_request(fd, &request, &reply) < 0 ||
+        reply.type != LMUX_LMC1_ERROR ||
+        reply.status != LMUX_LMC1_STATUS_STALE) {
+        why = "stale boot ID";
+        goto out;
+    }
+    request = prepare;
+    lmc_test_nonce(request.nonce, 6);
+    strcpy(request.name, "unknown");
+    if (lmc_test_request(fd, &request, &reply) < 0 ||
+        reply.type != LMUX_LMC1_ERROR ||
+        reply.status != LMUX_LMC1_STATUS_UNKNOWN_CARRIER) {
+        why = "unknown carrier";
+        goto out;
+    }
+    commit = prepare;
+    commit.type = LMUX_LMC1_COMMIT;
+    memcpy(commit.cookie, ready.cookie, sizeof(commit.cookie));
+    request = commit;
+    request.cookie[0] ^= 1;
+    if (lmc_test_request(fd, &request, &reply) < 0 ||
+        reply.type != LMUX_LMC1_ERROR ||
+        reply.status != LMUX_LMC1_STATUS_BAD_COOKIE) {
+        why = "bad COMMIT cookie";
+        goto out;
+    }
+    if (lmc_test_request(fd, &commit, &reply) < 0 ||
+        reply.type != LMUX_LMC1_COMMITTED || reply.generation != 2 ||
+        strcmp(reply.name, "rescue") != 0) {
+        why = "COMMIT";
+        goto out;
+    }
+    if (lmc_test_request(fd, &commit, &reply) < 0 ||
+        reply.type != LMUX_LMC1_COMMITTED || reply.generation != 2) {
+        why = "duplicate COMMIT";
+        goto out;
+    }
+    query.generation = 0;
+    lmc_test_nonce(query.nonce, 7);
+    if (lmc_test_request(fd, &query, &reply) < 0 ||
+        reply.type != LMUX_LMC1_QUERY_REPLY || reply.generation != 2 ||
+        strcmp(reply.name, "rescue") != 0 ||
+        find_child_pid(sup) != worker) {
+        why = "post-COMMIT QUERY/worker";
+        goto out;
+    }
+    rc = 0;
+out:
+    if (rc != 0)
+        fprintf(stderr, "LMC1 state machine failure: %s\n", why);
+    if (fd >= 0) close(fd);
+    stop_pid(sup);
+    unlink(rescue);
+    rmdir(dir);
+    return rc;
+}
+
+static int carrier_raw_switch_roundtrip_test(void)
+{
+    char dir[] = "/tmp/lmux-carrier-switch-it-XXXXXX";
+    char primary[192], rescue[192], control[192], structured[192];
+    char console[192], file_sock[192], file_src[192], file_target[192];
+    char rescue_spec[256], pty_arg[400], file_arg[400], out[16384];
+    char pty_out[512], pid_before[64], pid_after[64];
+    pid_t host = -1, sup = -1, worker = -1;
+    uint8_t hc2_payload[LMUX_HC2_MAX_PAYLOAD];
+    uint16_t hc2_type = 0;
+    uint64_t hc2_req = 0, file_op = 0;
+    uint32_t hc2_len = 0;
+    int cfd = -1, sfd = -1, worker_stopped = 0, rc = 1;
+    const char *why = "setup";
+    unsigned long long old_local, old_peer;
+
+    if (!mkdtemp(dir))
+        return fail("carrier switch mkdtemp");
+    snprintf(primary, sizeof(primary), "%s/primary.sock", dir);
+    snprintf(rescue, sizeof(rescue), "%s/rescue.sock", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(structured, sizeof(structured), "%s/structured.sock", dir);
+    snprintf(console, sizeof(console), "%s/console.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(file_src, sizeof(file_src), "%s/file-busy-src", dir);
+    snprintf(file_target, sizeof(file_target), "%s/file-busy-target", dir);
+    snprintf(rescue_spec, sizeof(rescue_spec), "rescue=%s", rescue);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+
+    host = fork();
+    if (host == 0) {
+        if (getenv("LMUX2_IT_VERBOSE"))
+            execl("build/host/lmuxd", "lmuxd", "--role", "host", "--outer",
+                  "--carrier-listen", primary, "--carrier-name", "primary",
+                  "--standby-carrier-connect", rescue_spec,
+                  "--control", control, "--structured-control", structured,
+                  "--pty", pty_arg, "--file", file_arg,
+                  "--verbose", (char *)NULL);
+        execl("build/host/lmuxd", "lmuxd", "--role", "host", "--outer",
+              "--carrier-listen", primary, "--carrier-name", "primary",
+              "--standby-carrier-connect", rescue_spec,
+              "--control", control, "--structured-control", structured,
+              "--pty", pty_arg, "--file", file_arg,
+              (char *)NULL);
+        _exit(127);
+    }
+    if (host < 0 || wait_path_exists(primary, 5000) < 0) {
+        why = "host primary listener";
+        goto out;
+    }
+    sup = fork();
+    if (sup == 0) {
+        if (getenv("LMUX2_IT_VERBOSE"))
+            execl("build/host/lmuxd", "lmuxd", "--supervisor", "--outer",
+                  "--carrier-connect", primary, "--carrier-name", "primary",
+                  "--standby-carrier-listen", rescue_spec,
+                  "--verbose", (char *)NULL);
+        execl("build/host/lmuxd", "lmuxd", "--supervisor", "--outer",
+              "--carrier-connect", primary, "--carrier-name", "primary",
+              "--standby-carrier-listen", rescue_spec, (char *)NULL);
+        _exit(127);
+    }
+    if (sup < 0 || wait_ready_layers(control, 1, 15000,
+                                     out, sizeof(out)) < 0) {
+        why = "initial primary establishment";
+        goto out;
+    }
+    worker = wait_child_pid(sup, -1, 5000);
+    if (worker <= 0) {
+        why = "worker pid";
+        goto out;
+    }
+    old_local = status_value(out, "local_conn=");
+    old_peer = status_value(out, "peer_conn=");
+    if (control_request_test(control,
+            "CARRIER SWITCH missing raw 1000\n", out, sizeof(out)) < 0 ||
+        !strstr(out, "ERR CARRIER unknown-carrier")) {
+        why = "switch validation";
+        goto out;
+    }
+    sfd = hc2_connect_hello_retry(structured, 3000);
+    if (sfd < 0 || make_file(file_src, 1024 * 1024) < 0 ||
+        hc2_file_start(sfd, LMUX_HC2_FILE_PUT_START, 600,
+                       file_src, file_target) < 0) {
+        why = "FILE start";
+        goto out;
+    }
+    while (!file_op) {
+        if (hc2_read_frame(sfd, &hc2_type, &hc2_req, hc2_payload,
+                           &hc2_len, 5000) < 0 ||
+            hc2_type == LMUX_HC2_FILE_ERROR || hc2_type == LMUX_HC2_ERROR) {
+            why = "FILE started event";
+            goto out;
+        }
+        if (hc2_type == LMUX_HC2_FILE_STARTED && hc2_len >= 24)
+            file_op = hc2_test_get_u64(hc2_payload);
+    }
+    if (kill(worker, SIGSTOP) < 0) {
+        why = "FILE stop worker";
+        goto out;
+    }
+    worker_stopped = 1;
+    if (control_request_test(control,
+            "CARRIER SWITCH rescue raw 1000\n", out, sizeof(out)) < 0 ||
+        !strstr(out, "ERR CARRIER BUSY file-active")) {
+        why = "FILE switch BUSY";
+        goto out;
+    }
+    if (kill(worker, SIGCONT) < 0) {
+        why = "FILE resume worker";
+        goto out;
+    }
+    worker_stopped = 0;
+    for (;;) {
+        if (hc2_read_frame(sfd, &hc2_type, &hc2_req, hc2_payload,
+                           &hc2_len, 10000) < 0 ||
+            hc2_type == LMUX_HC2_FILE_ERROR || hc2_type == LMUX_HC2_ERROR) {
+            why = "FILE completion";
+            goto out;
+        }
+        if (hc2_type == LMUX_HC2_FILE_DONE && hc2_len >= 48 &&
+            hc2_test_get_u64(hc2_payload) == file_op)
+            break;
+    }
+    close(sfd);
+    sfd = -1;
+    cfd = wait_connect(console, 5000);
+    if (cfd < 0 ||
+        shell_cmd_expect(cfd, "printf '%s%s:%s:%s\\n' C PID \"$$\" END",
+                         ":END", pty_out, sizeof(pty_out)) < 0 ||
+        extract_cpid(pty_out, pid_before, sizeof(pid_before)) < 0) {
+        why = "initial PTY pid";
+        goto out;
+    }
+
+    if (run_lmux_carrier_cli("switch", "rescue", control,
+                             out, sizeof(out)) < 0 ||
+        !strstr(out, "OK CARRIER active=rescue mode=raw generation=2")) {
+        why = "primary to rescue";
+        goto out;
+    }
+    if (read_status(control, out, sizeof(out)) < 0 ||
+        !strstr(out, "carrier_manager: active=rescue generation=2") ||
+        !strstr(out, "connection: ESTABLISHED") ||
+        !strstr(out, "seq_errors=0") ||
+        status_value(out, "local_conn=") == old_local ||
+        status_value(out, "peer_conn=") == old_peer ||
+        find_child_pid(sup) != worker) {
+        why = "rescue observable state";
+        goto out;
+    }
+    if (run_lmux_carrier_cli("status", NULL, control,
+                             out, sizeof(out)) < 0 ||
+        !strstr(out, "carrier_manager: active=rescue generation=2") ||
+        !strstr(out, "carrier_switch: phase=idle")) {
+        why = "carrier CLI status";
+        goto out;
+    }
+    sfd = hc2_connect_hello_retry(structured, 3000);
+    if (sfd < 0 || hc2_run_echo(sfd, 700, "B2_STRUCTURED_EXEC") < 0) {
+        why = "structured EXEC after rescue";
+        goto out;
+    }
+    close(sfd);
+    sfd = -1;
+    if (run_lmux_carrier_cli_mode("switch", "rescue", "dirty", control,
+                                 out, sizeof(out)) < 0 ||
+        !strstr(out, "OK CARRIER active=rescue mode=dirty generation=3") ||
+        read_status(control, out, sizeof(out)) < 0 ||
+        !strstr(out, "carrier_manager: active=rescue generation=3 mode=dirty") ||
+        !strstr(out, "connection: ESTABLISHED") ||
+        find_child_pid(sup) != worker) {
+        why = "rescue raw to dirty";
+        goto out;
+    }
+    sfd = hc2_connect_hello_retry(structured, 3000);
+    if (sfd < 0 || hc2_run_echo(sfd, 701, "B4_DIRTY_EXEC") < 0) {
+        why = "structured EXEC after dirty";
+        goto out;
+    }
+    close(sfd);
+    sfd = -1;
+    if (control_request_timeout_test(control,
+            "CARRIER SWITCH rescue raw 15000\n", 18000,
+            out, sizeof(out)) < 0 ||
+        !strstr(out, "OK CARRIER active=rescue mode=raw generation=4") ||
+        find_child_pid(sup) != worker) {
+        why = "rescue dirty to raw";
+        goto out;
+    }
+    /* Keep the old local endpoint attached through retirement.  This makes
+     * LINK_DOWN, rather than an unrelated pre-switch STREAM_CLOSE race, the
+     * event that detaches the old stream. */
+    close(cfd);
+    cfd = -1;
+    cfd = wait_connect(console, 5000);
+    if (cfd < 0 ||
+        shell_cmd_expect(cfd, "printf '%s%s:%s:%s\\n' C PID \"$$\" END",
+                         ":END", pty_out, sizeof(pty_out)) < 0 ||
+        extract_cpid(pty_out, pid_after, sizeof(pid_after)) < 0 ||
+        strcmp(pid_before, pid_after) != 0) {
+        why = "PTY durable across rescue";
+        goto out;
+    }
+    close(cfd);
+    cfd = -1;
+
+    if (control_request_timeout_test(control,
+            "CARRIER SWITCH primary raw 15000\n", 18000,
+            out, sizeof(out)) < 0 ||
+        !strstr(out, "OK CARRIER active=primary mode=raw generation=5") ||
+        read_status(control, out, sizeof(out)) < 0 ||
+        !strstr(out, "carrier_manager: active=primary generation=5") ||
+        !strstr(out, "seq_errors=0") ||
+        find_child_pid(sup) != worker) {
+        why = "rescue to primary";
+        goto out;
+    }
+    rc = 0;
+out:
+    if (rc != 0) {
+        fprintf(stderr, "carrier raw switch failure: %s\n", why);
+        dump_excerpt("carrier raw switch", out);
+    }
+    if (cfd >= 0)
+        close(cfd);
+    if (sfd >= 0)
+        close(sfd);
+    if (worker_stopped && worker > 0)
+        (void)kill(worker, SIGCONT);
+    stop_pid(host);
+    stop_pid(sup);
+    unlink(primary);
+    unlink(rescue);
+    unlink(control);
+    unlink(structured);
+    unlink(console);
+    unlink(file_sock);
+    unlink(file_src);
+    unlink(file_target);
+    rmdir(dir);
+    return rc;
+}
+
+static int carrier_recovery_without_primary_one(const char *mode)
+{
+    char dir[] = "/tmp/lmux-carrier-recovery-it-XXXXXX";
+    char host_missing[192], target_missing[192], rescue[192];
+    char control[192], console[192], file_sock[192];
+    char rescue_spec[256], pty_arg[400], file_arg[400], out[16384];
+    char request[128], expected[128];
+    pid_t host = -1, sup = -1, worker = -1;
+    int rc = 1;
+    const char *why = "setup";
+
+    if (!mkdtemp(dir))
+        return fail("carrier recovery mkdtemp");
+    snprintf(host_missing, sizeof(host_missing), "%s/host-primary-missing", dir);
+    snprintf(target_missing, sizeof(target_missing), "%s/target-primary-missing", dir);
+    snprintf(rescue, sizeof(rescue), "%s/rescue.sock", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(console, sizeof(console), "%s/console.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(rescue_spec, sizeof(rescue_spec), "rescue=%s", rescue);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+    snprintf(request, sizeof(request),
+             "CARRIER SWITCH rescue %s 15000\n", mode);
+    snprintf(expected, sizeof(expected),
+             "OK CARRIER active=rescue mode=%s generation=2", mode);
+
+    sup = fork();
+    if (sup == 0) {
+        execl("build/host/lmuxd", "lmuxd", "--supervisor", "--outer",
+              "--carrier-connect", target_missing,
+              "--standby-carrier-listen", rescue_spec, (char *)NULL);
+        _exit(127);
+    }
+    if (sup < 0 || wait_path_exists(rescue, 5000) < 0) {
+        why = "target rescue standby";
+        goto out;
+    }
+    worker = wait_child_pid(sup, -1, 5000);
+    if (worker <= 0) {
+        why = "worker before recovery";
+        goto out;
+    }
+    host = fork();
+    if (host == 0) {
+        execl("build/host/lmuxd", "lmuxd", "--role", "host", "--outer",
+              "--carrier-connect", host_missing,
+              "--standby-carrier-connect", rescue_spec,
+              "--control", control, "--pty", pty_arg, "--file", file_arg,
+              (char *)NULL);
+        _exit(127);
+    }
+    if (host < 0 || wait_path_exists(control, 5000) < 0) {
+        why = "host control before recovery";
+        goto out;
+    }
+    if (control_request_timeout_test(control,
+            request, 18000,
+            out, sizeof(out)) < 0 ||
+        !strstr(out, expected) ||
+        wait_ready_layers(control, 1, 10000, out, sizeof(out)) < 0 ||
+        !strstr(out, "carrier_manager: active=rescue generation=2") ||
+        find_child_pid(sup) != worker) {
+        why = "standby recovery convergence";
+        goto out;
+    }
+    rc = 0;
+out:
+    if (rc != 0) {
+        fprintf(stderr, "carrier raw recovery failure: %s\n", why);
+        dump_excerpt("carrier raw recovery", out);
+    }
+    stop_pid(host);
+    stop_pid(sup);
+    unlink(host_missing);
+    unlink(target_missing);
+    unlink(rescue);
+    unlink(control);
+    unlink(console);
+    unlink(file_sock);
+    rmdir(dir);
+    return rc;
+}
+
+static int carrier_raw_recovery_without_primary_test(void)
+{
+    return carrier_recovery_without_primary_one("raw") ||
+        carrier_recovery_without_primary_one("dirty");
+}
+
+static int carrier_raw_ambiguous_fault_one(int drop_host_to_target,
+                                           uint8_t drop_type,
+                                           const char *label,
+                                           int query_recovery_stress)
+{
+    char dir[] = "/tmp/lmux-carrier-ambiguous-it-XXXXXX";
+    char control[192], console[192], file_sock[192];
+    char pty_arg[400], file_arg[400], hfd[32], tfd[32];
+    char hrescue[64], trescue[64], out[16384];
+    int primary[2] = { -1, -1 }, hc[2] = { -1, -1 }, tc[2] = { -1, -1 };
+    int note[2] = { -1, -1 }, rc = 1;
+    int replay[2] = { -1, -1 };
+    pid_t host = -1, sup = -1, proxy = -1, worker = -1;
+    const char *why = "setup";
+
+    if (!mkdtemp(dir) || socketpair(AF_UNIX, SOCK_STREAM, 0, primary) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, hc) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, tc) < 0 || pipe(note) < 0 ||
+        (query_recovery_stress && pipe(replay) < 0))
+        return fail("carrier ambiguous setup");
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(console, sizeof(console), "%s/console.sock", dir);
+    snprintf(file_sock, sizeof(file_sock), "%s/file.sock", dir);
+    snprintf(pty_arg, sizeof(pty_arg), "console1:%s:/bin/sh", console);
+    snprintf(file_arg, sizeof(file_arg), "files:%s", file_sock);
+    snprintf(hfd, sizeof(hfd), "%d", primary[0]);
+    snprintf(tfd, sizeof(tfd), "%d", primary[1]);
+    snprintf(hrescue, sizeof(hrescue), "rescue=%d", hc[1]);
+    snprintf(trescue, sizeof(trescue), "rescue=%d", tc[1]);
+    proxy = query_recovery_stress ?
+        spawn_lmc_query_recovery_proxy(hc[0], tc[0], note[1], replay[0]) :
+        spawn_lmc_drop_proxy(hc[0], tc[0], drop_host_to_target,
+                             drop_type, note[1]);
+    if (proxy < 0) {
+        why = "proxy";
+        goto out;
+    }
+    host = fork();
+    if (host == 0) {
+        if (getenv("LMUX2_IT_VERBOSE"))
+            execl("build/host/lmuxd", "lmuxd", "--role", "host", "--outer",
+                  "--carrier-fd", hfd, "--standby-carrier-fd", hrescue,
+                  "--control", control, "--pty", pty_arg, "--file", file_arg,
+                  "--verbose", (char *)NULL);
+        else
+            execl("build/host/lmuxd", "lmuxd", "--role", "host", "--outer",
+                  "--carrier-fd", hfd, "--standby-carrier-fd", hrescue,
+                  "--control", control, "--pty", pty_arg, "--file", file_arg,
+                  (char *)NULL);
+        _exit(127);
+    }
+    sup = fork();
+    if (sup == 0) {
+        if (getenv("LMUX2_IT_VERBOSE"))
+            execl("build/host/lmuxd", "lmuxd", "--supervisor", "--outer",
+                  "--carrier-fd", tfd, "--standby-carrier-fd", trescue,
+                  "--verbose", (char *)NULL);
+        else
+            execl("build/host/lmuxd", "lmuxd", "--supervisor", "--outer",
+                  "--carrier-fd", tfd, "--standby-carrier-fd", trescue,
+                  (char *)NULL);
+        _exit(127);
+    }
+    close(primary[0]); primary[0] = -1;
+    close(primary[1]); primary[1] = -1;
+    close(hc[0]); hc[0] = -1;
+    close(hc[1]); hc[1] = -1;
+    close(tc[0]); tc[0] = -1;
+    close(tc[1]); tc[1] = -1;
+    close(note[1]); note[1] = -1;
+    if (replay[0] >= 0) {
+        close(replay[0]);
+        replay[0] = -1;
+    }
+    if (host < 0 || sup < 0 ||
+        wait_ready_layers(control, 1, 15000, out, sizeof(out)) < 0) {
+        why = "initial establishment";
+        goto out;
+    }
+    worker = wait_child_pid(sup, -1, 5000);
+    if (worker <= 0) {
+        why = "worker";
+        goto out;
+    }
+    if (control_request_timeout_test(control,
+            "CARRIER SWITCH rescue raw 15000\n", 18000,
+            out, sizeof(out)) < 0 ||
+        !strstr(out, "OK CARRIER active=rescue mode=raw generation=2") ||
+        !(wait_fd_event(note[0], POLLIN, 2000) & POLLIN)) {
+        why = "fault recovery switch";
+        goto out;
+    }
+    {
+        char mark = 0;
+        ssize_t mark_read = read(note[0], &mark, 1);
+        int status_rc = read_status(control, out, sizeof(out));
+        pid_t current_worker = find_child_pid(sup);
+        if (mark_read != 1 ||
+            (!query_recovery_stress && mark != 'D') || status_rc < 0 ||
+            !strstr(out, "carrier_manager: active=rescue generation=2") ||
+            !strstr(out, "seq_errors=0") || current_worker != worker) {
+            fprintf(stderr,
+                    "carrier ambiguous observation mark_read=%ld mark=%d "
+                    "status_rc=%d worker=%ld current=%ld active=%d seq0=%d\n",
+                    (long)mark_read, (int)(unsigned char)mark, status_rc,
+                    (long)worker, (long)current_worker,
+                    strstr(out,
+                        "carrier_manager: active=rescue generation=2") != NULL,
+                    strstr(out, "seq_errors=0") != NULL);
+            why = "fault not observed or bad authority";
+            goto out;
+        }
+        if (query_recovery_stress) {
+            const char *connection = strstr(out, "connection: ESTABLISHED");
+            unsigned long long outer_local = status_value(
+                out, "outer: ESTABLISHED local_conn=");
+            unsigned long long outer_peer = status_value(
+                out, "peer_conn=");
+            unsigned long long lmux_local = connection ?
+                status_value(connection, "local_conn=") : 0;
+            unsigned long long lmux_peer = connection ?
+                status_value(connection, "peer_conn=") : 0;
+            unsigned long long established = connection ?
+                status_value(connection, "established=") : 0;
+            if (write_all(replay[1], (const uint8_t *)"L", 1) < 0 ||
+                wait_note_char(note[0], 'A', 5000) < 0 ||
+                read_status(control, out, sizeof(out)) < 0 ||
+                !strstr(out, "outer: ESTABLISHED") ||
+                !strstr(out, "connection: ESTABLISHED") ||
+                !strstr(out, "seq_errors=0") ||
+                status_value(out, "outer: ESTABLISHED local_conn=") !=
+                    outer_local ||
+                status_value(out, "peer_conn=") != outer_peer ||
+                status_value(strstr(out, "connection: ESTABLISHED"),
+                             "local_conn=") != lmux_local ||
+                status_value(strstr(out, "connection: ESTABLISHED"),
+                             "peer_conn=") != lmux_peer ||
+                status_value(strstr(out, "connection: ESTABLISHED"),
+                             "established=") != established ||
+                find_child_pid(sup) != worker) {
+                why = "late duplicate QUERY changed established session";
+                goto out;
+            }
+        }
+    }
+    rc = 0;
+out:
+    if (rc != 0) {
+        fprintf(stderr, "carrier ambiguous %s failure: %s\n", label, why);
+        dump_excerpt("carrier ambiguous", out);
+    }
+    stop_pid(host);
+    stop_pid(sup);
+    stop_pid(proxy);
+    if (primary[0] >= 0) close(primary[0]);
+    if (primary[1] >= 0) close(primary[1]);
+    if (hc[0] >= 0) close(hc[0]);
+    if (hc[1] >= 0) close(hc[1]);
+    if (tc[0] >= 0) close(tc[0]);
+    if (tc[1] >= 0) close(tc[1]);
+    if (note[0] >= 0) close(note[0]);
+    if (note[1] >= 0) close(note[1]);
+    if (replay[0] >= 0) close(replay[0]);
+    if (replay[1] >= 0) close(replay[1]);
+    unlink(control);
+    unlink(console);
+    unlink(file_sock);
+    rmdir(dir);
+    return rc;
+}
+
+static int carrier_raw_ambiguous_fault_test(void)
+{
+    return carrier_raw_ambiguous_fault_one(0, LMUX_LMC1_COMMITTED,
+                                            "lost-COMMITTED", 0) ||
+        carrier_raw_ambiguous_fault_one(0, LMUX_LMC1_COMMITTED,
+                                        "lost-COMMITTED-two-QUERY_REPLY",
+                                        1) ||
+        carrier_raw_ambiguous_fault_one(1, LMUX_LMC1_COMMIT,
+                                        "lost-COMMIT", 0);
+}
+
+static int carrier_dirty_fault_handover_test(void)
+{
+    char dir[] = "/tmp/lmux-carrier-dirty-fault-it-XXXXXX";
+    char control[192], structured[192], hfd[32], tfd[32];
+    char hrescue[64], trescue[64], out[16384];
+    int primary[2] = { -1, -1 }, hc[2] = { -1, -1 };
+    int tc[2] = { -1, -1 }, note[2] = { -1, -1 };
+    int sfd = -1, rc = 1;
+    pid_t host = -1, sup = -1, proxy = -1, worker = -1;
+    const char *why = "setup";
+    if (!mkdtemp(dir) || socketpair(AF_UNIX, SOCK_STREAM, 0, primary) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, hc) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, tc) < 0 || pipe(note) < 0)
+        return fail("carrier dirty fault setup");
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(structured, sizeof(structured), "%s/structured.sock", dir);
+    snprintf(hfd, sizeof(hfd), "%d", primary[0]);
+    snprintf(tfd, sizeof(tfd), "%d", primary[1]);
+    snprintf(hrescue, sizeof(hrescue), "rescue=%d", hc[1]);
+    snprintf(trescue, sizeof(trescue), "rescue=%d", tc[1]);
+    proxy = spawn_dirty_fault_proxy(hc[0], tc[0], note[1]);
+    host = fork();
+    if (host == 0) {
+        execl("build/host/lmuxd", "lmuxd", "--role", "host", "--outer",
+              "--carrier-fd", hfd, "--standby-carrier-fd", hrescue,
+              "--control", control, "--structured-control", structured,
+              (char *)NULL);
+        _exit(127);
+    }
+    sup = fork();
+    if (sup == 0) {
+        execl("build/host/lmuxd", "lmuxd", "--supervisor", "--outer",
+              "--carrier-fd", tfd, "--standby-carrier-fd", trescue,
+              (char *)NULL);
+        _exit(127);
+    }
+    close(primary[0]); primary[0] = -1;
+    close(primary[1]); primary[1] = -1;
+    close(hc[0]); hc[0] = -1;
+    close(hc[1]); hc[1] = -1;
+    close(tc[0]); tc[0] = -1;
+    close(tc[1]); tc[1] = -1;
+    close(note[1]); note[1] = -1;
+    if (host < 0 || sup < 0 || proxy < 0 ||
+        wait_ready_layers(control, 1, 15000, out, sizeof(out)) < 0) {
+        why = "initial establishment";
+        goto out;
+    }
+    worker = wait_child_pid(sup, -1, 5000);
+    if (worker <= 0) {
+        why = "worker";
+        goto out;
+    }
+    if (control_request_timeout_test(control,
+            "CARRIER SWITCH rescue dirty 30000\n", 34000,
+            out, sizeof(out)) < 0 ||
+        !strstr(out, "OK CARRIER active=rescue mode=dirty generation=2") ||
+        !(wait_fd_event(note[0], POLLIN, 5000) & POLLIN)) {
+        why = "faulted DIRTY convergence";
+        goto out;
+    }
+    {
+        char mark = 0;
+        if (read(note[0], &mark, 1) != 1 || mark != 'F') {
+            why = "fault injection not observed";
+            goto out;
+        }
+    }
+    if (read_status(control, out, sizeof(out)) < 0 ||
+        !strstr(out, "carrier_dirty: state=active") ||
+        !strstr(out, "carrier_dirty_rxdiag:") ||
+        status_value(out, "retransmitted_fragments=") == 0 ||
+        status_value(out, "foreign_bytes=") == 0 ||
+        status_value(out, "invalid_alphabet=") == 0 ||
+        find_child_pid(sup) != worker) {
+        fprintf(stderr,
+                "DIRTY status counters retransmit=%llu foreign=%llu alphabet=%llu worker=%ld expected=%ld\n",
+                status_value(out, "retransmitted_fragments="),
+                status_value(out, "foreign_bytes="),
+                status_value(out, "invalid_alphabet="),
+                (long)find_child_pid(sup), (long)worker);
+        {
+            const char *diag = strstr(out, "carrier_dirty_rxdiag:");
+            const char *end = diag ? strchr(diag, '\n') : NULL;
+            if (diag) {
+                size_t width = end ? (size_t)(end - diag) : strlen(diag);
+                fprintf(stderr, "DIRTY rxdiag %.*s\n",
+                        (int)width, diag);
+            }
+        }
+        why = "DIRTY counters/worker";
+        goto out;
+    }
+    sfd = hc2_connect_hello_retry(structured, 5000);
+    if (sfd < 0 || hc2_run_echo(sfd, 811, "B4_DIRTY_FAULT_EXEC") < 0) {
+        why = "EXEC after fault recovery";
+        goto out;
+    }
+    close(sfd); sfd = -1;
+    if (control_request_timeout_test(control,
+            "CARRIER SWITCH primary raw 15000\n", 18000,
+            out, sizeof(out)) < 0 ||
+        !strstr(out, "OK CARRIER active=primary mode=raw generation=3") ||
+        find_child_pid(sup) != worker) {
+        why = "DIRTY to primary RAW";
+        goto out;
+    }
+    rc = 0;
+out:
+    if (rc != 0) {
+        fprintf(stderr, "carrier DIRTY fault failure: %s\n", why);
+        dump_excerpt("carrier DIRTY fault", out);
+    }
+    if (sfd >= 0) close(sfd);
+    stop_pid(host); stop_pid(sup); stop_pid(proxy);
+    if (primary[0] >= 0) close(primary[0]);
+    if (primary[1] >= 0) close(primary[1]);
+    if (hc[0] >= 0) close(hc[0]);
+    if (hc[1] >= 0) close(hc[1]);
+    if (tc[0] >= 0) close(tc[0]);
+    if (tc[1] >= 0) close(tc[1]);
+    if (note[0] >= 0) close(note[0]);
+    if (note[1] >= 0) close(note[1]);
+    unlink(control); unlink(structured); rmdir(dir);
+    return rc;
+}
+
+static int carrier_dirty_structured_control_test(void)
+{
+    char dir[] = "/tmp/lmux-carrier-dirty-exec-it-XXXXXX";
+    char control[192], structured[192], hfd[32], tfd[32];
+    char hrescue[64], trescue[64], out[32768];
+    int primary[2] = { -1, -1 }, hc[2] = { -1, -1 };
+    int tc[2] = { -1, -1 }, fd = -1, rc = 1;
+    pid_t host = -1, sup = -1, proxy = -1, worker = -1;
+    uint8_t payload[LMUX_HC2_MAX_PAYLOAD];
+    uint16_t type = 0;
+    uint64_t req = 0, ref = 0;
+    uint32_t len = 0;
+    int heartbeat = 0, reattached = 0, signal_ok = 0, terminal = 0;
+    int local_closed = 0;
+    long long end;
+    const char *why = "setup";
+    const char *long_argv[] = {
+        "/bin/sh", "-c",
+        "trap 'exit 0' TERM; while :; do printf H; sleep 1; done"
+    };
+    const char *p;
+
+    if (!mkdtemp(dir) || socketpair(AF_UNIX, SOCK_STREAM, 0, primary) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, hc) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, tc) < 0)
+        return fail("carrier dirty structured setup");
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(structured, sizeof(structured), "%s/structured.sock", dir);
+    snprintf(hfd, sizeof(hfd), "%d", primary[0]);
+    snprintf(tfd, sizeof(tfd), "%d", primary[1]);
+    snprintf(hrescue, sizeof(hrescue), "rescue=%d", hc[1]);
+    snprintf(trescue, sizeof(trescue), "rescue=%d", tc[1]);
+    proxy = spawn_dirty_baud_proxy(hc[0], tc[0]);
+    host = fork();
+    if (host == 0) {
+        execl("build/host/lmuxd", "lmuxd", "--role", "host", "--outer",
+              "--carrier-fd", hfd, "--standby-carrier-fd", hrescue,
+              "--control", control, "--structured-control", structured,
+              (char *)NULL);
+        _exit(127);
+    }
+    sup = fork();
+    if (sup == 0) {
+        execl("build/host/lmuxd", "lmuxd", "--supervisor", "--outer",
+              "--carrier-fd", tfd, "--standby-carrier-fd", trescue,
+              (char *)NULL);
+        _exit(127);
+    }
+    close(primary[0]); primary[0] = -1;
+    close(primary[1]); primary[1] = -1;
+    close(hc[0]); hc[0] = -1;
+    close(hc[1]); hc[1] = -1;
+    close(tc[0]); tc[0] = -1;
+    close(tc[1]); tc[1] = -1;
+    if (host < 0 || sup < 0 || proxy < 0 ||
+        wait_ready_layers(control, 1, 15000, out, sizeof(out)) < 0 ||
+        wait_exec_service_ready(control, 15000, out, sizeof(out)) < 0) {
+        why = "initial establishment";
+        goto out;
+    }
+    worker = wait_child_pid(sup, -1, 5000);
+    if (worker <= 0) {
+        why = "worker";
+        goto out;
+    }
+    fd = hc2_connect_hello_retry(structured, 5000);
+    if (fd < 0 || hc2_exec_start_ready_ref(fd, 900, "", long_argv, 3,
+                                           &ref) < 0 || !ref) {
+        why = "long EXEC start";
+        goto out;
+    }
+    if (control_request_timeout_test(control,
+            "CARRIER SWITCH rescue dirty 30000\n", 34000,
+            out, sizeof(out)) < 0 ||
+        !strstr(out, "OK CARRIER active=rescue mode=dirty generation=2") ||
+        find_child_pid(sup) != worker) {
+        why = "RAW to throttled DIRTY";
+        goto out;
+    }
+
+    /* Use delivered heartbeat events, not a sleep, to age status polling. */
+    end = now_ms() + 15000;
+    while (now_ms() < end && (!reattached || heartbeat < 6)) {
+        int rr = hc2_read_frame(fd, &type, &req, payload, &len,
+                                (int)(end - now_ms()));
+        if (rr < 0)
+            break;
+        if (type == LMUX_HC2_EXEC_STATE && req == 0 && len >= 32 &&
+            hc2_test_get_u64(payload) == ref &&
+            payload[16] == V2_EXEC_STATUS_RUNNING)
+            reattached = 1;
+        else if (type == LMUX_HC2_EXEC_STDOUT && len >= 8 &&
+                 hc2_test_get_u64(payload) == ref)
+            heartbeat += (int)(len - 8);
+        else if (type == LMUX_HC2_EXEC_LOST ||
+                 (type == LMUX_HC2_ERROR && len >= 4 &&
+                  lmux_get_le32(payload) != LMUX_HC2_OK)) {
+            why = "reattach error";
+            goto out;
+        }
+    }
+    if (!reattached || heartbeat < 6) {
+        why = "reattach heartbeat";
+        goto out;
+    }
+    if (read_status(control, out, sizeof(out)) < 0) {
+        why = "status during DIRTY EXEC";
+        goto out;
+    }
+    for (p = out; (p = strstr(p, "state=LOCAL_CLOSED")) != NULL; p++)
+        local_closed++;
+    if (local_closed > 4) {
+        fprintf(stderr, "dirty structured LOCAL_CLOSED streams=%d\n",
+                local_closed);
+        why = "control stream retirement backlog";
+        goto out;
+    }
+    if (hc2_run_echo(fd, 901, "DIRTY_SHORT_EXEC") < 0) {
+        why = "short EXEC over DIRTY";
+        goto out;
+    }
+
+    hc2_test_put_u64(payload, ref);
+    payload[8] = LMUX_HC2_SIG_TERM;
+    if (hc2_send_frame(fd, LMUX_HC2_EXEC_SIGNAL, 902, payload, 9) < 0) {
+        why = "TERM send";
+        goto out;
+    }
+    end = now_ms() + 15000;
+    while (now_ms() < end && (!signal_ok || !terminal)) {
+        if (hc2_read_frame(fd, &type, &req, payload, &len,
+                           (int)(end - now_ms())) < 0)
+            break;
+        if (type == LMUX_HC2_ERROR && req == 902 && len >= 4) {
+            if (lmux_get_le32(payload) != LMUX_HC2_OK) {
+                why = "TERM reply error";
+                goto out;
+            }
+            signal_ok = 1;
+        } else if (type == LMUX_HC2_EXEC_STATE && len >= 32 &&
+                   hc2_test_get_u64(payload) == ref &&
+                   payload[16] == V2_EXEC_STATUS_DONE) {
+            terminal = 1;
+        } else if (type == LMUX_HC2_EXEC_LOST) {
+            why = "TERM lost EXEC";
+            goto out;
+        }
+    }
+    if (!signal_ok || !terminal) {
+        why = "TERM completion";
+        goto out;
+    }
+    hc2_test_put_u64(payload, ref);
+    if (hc2_send_frame(fd, LMUX_HC2_EXEC_RELEASE, 903, payload, 8) < 0) {
+        why = "release send";
+        goto out;
+    }
+    end = now_ms() + 10000;
+    while (now_ms() < end) {
+        if (hc2_read_frame(fd, &type, &req, payload, &len,
+                           (int)(end - now_ms())) < 0)
+            break;
+        if (type == LMUX_HC2_EXEC_STATE && req == 903) {
+            rc = 0;
+            break;
+        }
+        if (type == LMUX_HC2_ERROR && req == 903 && len >= 4 &&
+            lmux_get_le32(payload) != LMUX_HC2_OK) {
+            why = "release reply error";
+            goto out;
+        }
+    }
+    if (rc != 0)
+        why = "release completion";
+out:
+    if (rc != 0) {
+        fprintf(stderr,
+                "carrier DIRTY structured failure: %s ref=%llu heartbeat=%d reattached=%d local_closed=%d last=%s(%u) req=%llu len=%u\n",
+                why, (unsigned long long)ref, heartbeat, reattached,
+                local_closed, hc2_type_name(type), type,
+                (unsigned long long)req, len);
+        if (read_status(control, out, sizeof(out)) == 0)
+            dump_excerpt("carrier DIRTY structured", out);
+    }
+    if (fd >= 0) close(fd);
+    stop_pid(host); stop_pid(sup); stop_pid(proxy);
+    if (primary[0] >= 0) close(primary[0]);
+    if (primary[1] >= 0) close(primary[1]);
+    if (hc[0] >= 0) close(hc[0]);
+    if (hc[1] >= 0) close(hc[1]);
+    if (tc[0] >= 0) close(tc[0]);
+    if (tc[1] >= 0) close(tc[1]);
+    unlink(control); unlink(structured); rmdir(dir);
+    return rc;
+}
+
+static int carrier_dirty_explicit_failure_one(int disappear)
+{
+    char dir[] = "/tmp/lmux-carrier-dirty-fail-it-XXXXXX";
+    char control[192], hfd[32], tfd[32], hrescue[64], trescue[64];
+    char out[16384];
+    int primary[2] = { -1, -1 }, hc[2] = { -1, -1 };
+    int tc[2] = { -1, -1 }, note[2] = { -1, -1 };
+    pid_t host = -1, sup = -1, proxy = -1, worker = -1;
+    int rc = 1;
+    const char *why = "setup";
+    if (!mkdtemp(dir) || socketpair(AF_UNIX, SOCK_STREAM, 0, primary) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, hc) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, tc) < 0 || pipe(note) < 0)
+        return fail("carrier dirty failure setup");
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(hfd, sizeof(hfd), "%d", primary[0]);
+    snprintf(tfd, sizeof(tfd), "%d", primary[1]);
+    snprintf(hrescue, sizeof(hrescue), "rescue=%d", hc[1]);
+    snprintf(trescue, sizeof(trescue), "rescue=%d", tc[1]);
+    proxy = spawn_dirty_blackhole_proxy(hc[0], tc[0], note[1], disappear);
+    host = fork();
+    if (host == 0) {
+        execl("build/host/lmuxd", "lmuxd", "--role", "host", "--outer",
+              "--carrier-fd", hfd, "--standby-carrier-fd", hrescue,
+              "--control", control, (char *)NULL);
+        _exit(127);
+    }
+    sup = fork();
+    if (sup == 0) {
+        execl("build/host/lmuxd", "lmuxd", "--supervisor", "--outer",
+              "--carrier-fd", tfd, "--standby-carrier-fd", trescue,
+              (char *)NULL);
+        _exit(127);
+    }
+    close(primary[0]); primary[0] = -1;
+    close(primary[1]); primary[1] = -1;
+    close(hc[0]); hc[0] = -1;
+    close(hc[1]); hc[1] = -1;
+    close(tc[0]); tc[0] = -1;
+    close(tc[1]); tc[1] = -1;
+    close(note[1]); note[1] = -1;
+    if (host < 0 || sup < 0 || proxy < 0 ||
+        wait_ready_layers(control, 1, 15000, out, sizeof(out)) < 0) {
+        why = "initial establishment";
+        goto out;
+    }
+    worker = wait_child_pid(sup, -1, 5000);
+    if (worker <= 0) {
+        why = "worker";
+        goto out;
+    }
+    if (control_request_timeout_test(control,
+            "CARRIER SWITCH rescue dirty 5000\n", 9000,
+            out, sizeof(out)) < 0 ||
+        !strstr(out, "ERR CARRIER committed-but-down") ||
+        !(wait_fd_event(note[0], POLLIN, 2000) & POLLIN)) {
+        why = "explicit committed-but-down result";
+        goto out;
+    }
+    if (read_status(control, out, sizeof(out)) < 0 ||
+        !strstr(out, "carrier_manager: active=rescue generation=2 mode=dirty") ||
+        !strstr(out, "protocol_failed=yes") ||
+        !strstr(out, "carrier_switch: phase=idle") ||
+        !strstr(out, "committed_but_down=yes") ||
+        strstr(out, "connection: ESTABLISHED") ||
+        find_child_pid(sup) != worker) {
+        why = "explicit failure state/worker";
+        goto out;
+    }
+    rc = 0;
+out:
+    if (rc != 0) {
+        fprintf(stderr, "carrier DIRTY %s failure: %s\n",
+                disappear ? "candidate-disappearance" : "explicit", why);
+        dump_excerpt("carrier DIRTY failure", out);
+    }
+    stop_pid(host); stop_pid(sup); stop_pid(proxy);
+    if (primary[0] >= 0) close(primary[0]);
+    if (primary[1] >= 0) close(primary[1]);
+    if (hc[0] >= 0) close(hc[0]);
+    if (hc[1] >= 0) close(hc[1]);
+    if (tc[0] >= 0) close(tc[0]);
+    if (tc[1] >= 0) close(tc[1]);
+    if (note[0] >= 0) close(note[0]);
+    if (note[1] >= 0) close(note[1]);
+    unlink(control); rmdir(dir);
+    return rc;
+}
+
+static int carrier_dirty_explicit_failure_test(void)
+{
+    return carrier_dirty_explicit_failure_one(0) ||
+        carrier_dirty_explicit_failure_one(1);
+}
+
+static unsigned long long carrier_endpoint_counter(const char *status,
+                                                   const char *name,
+                                                   const char *field)
+{
+    char marker[64];
+    const char *line, *value;
+    snprintf(marker, sizeof(marker), "carrier_endpoint: name=%s ", name);
+    line = strstr(status, marker);
+    if (!line)
+        return ULLONG_MAX;
+    value = strstr(line, field);
+    if (!value || (strchr(line, '\n') && value > strchr(line, '\n')))
+        return ULLONG_MAX;
+    return strtoull(value + strlen(field), NULL, 10);
+}
+
+static int carrier_dirty_reopen_hold_test(void)
+{
+    char dir[] = "/tmp/lmux-carrier-dirty-reopen-it-XXXXXX";
+    char rescue[192], control[192], hfd[32], tfd[32];
+    char hrescue[256], trescue[64], out[16384];
+    int primary[2] = { -1, -1 }, tc[2] = { -1, -1 };
+    int note[2] = { -1, -1 };
+    pid_t host = -1, sup = -1, proxy = -1;
+    unsigned long long opens, lost, failed_session;
+    int rc = 1;
+    const char *why = "setup";
+    if (!mkdtemp(dir) || socketpair(AF_UNIX, SOCK_STREAM, 0, primary) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, tc) < 0 || pipe(note) < 0)
+        return fail("carrier dirty reopen setup");
+    snprintf(rescue, sizeof(rescue), "%s/rescue.sock", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(hfd, sizeof(hfd), "%d", primary[0]);
+    snprintf(tfd, sizeof(tfd), "%d", primary[1]);
+    snprintf(hrescue, sizeof(hrescue), "rescue=%s", rescue);
+    snprintf(trescue, sizeof(trescue), "rescue=%d", tc[1]);
+    proxy = spawn_dirty_blackhole_reconnect_proxy(rescue, tc[0], note[1]);
+    if (proxy < 0 || wait_path_exists(rescue, 3000) < 0) {
+        why = "proxy listener";
+        goto out;
+    }
+    host = fork();
+    if (host == 0) {
+        execl("build/host/lmuxd", "lmuxd", "--role", "host", "--outer",
+              "--carrier-fd", hfd, "--standby-carrier-connect", hrescue,
+              "--control", control, (char *)NULL);
+        _exit(127);
+    }
+    sup = fork();
+    if (sup == 0) {
+        execl("build/host/lmuxd", "lmuxd", "--supervisor", "--outer",
+              "--carrier-fd", tfd, "--standby-carrier-fd", trescue,
+              (char *)NULL);
+        _exit(127);
+    }
+    close(primary[0]); primary[0] = -1;
+    close(primary[1]); primary[1] = -1;
+    close(tc[0]); tc[0] = -1;
+    close(tc[1]); tc[1] = -1;
+    close(note[1]); note[1] = -1;
+    if (host < 0 || sup < 0 ||
+        wait_ready_layers(control, 1, 15000, out, sizeof(out)) < 0) {
+        why = "initial establishment";
+        goto out;
+    }
+    if (control_request_timeout_test(control,
+            "CARRIER SWITCH rescue dirty 5000\n", 9000,
+            out, sizeof(out)) < 0 ||
+        !strstr(out, "ERR CARRIER committed-but-down")) {
+        why = "explicit failure";
+        goto out;
+    }
+    {
+        long long end = now_ms() + 3000;
+        int held_open = 0;
+        while (now_ms() < end) {
+            if (read_status(control, out, sizeof(out)) == 0 &&
+                strstr(out, "name=rescue type=unix-connect-test") &&
+                strstr(out, "active=yes mode=dirty state=open") &&
+                strstr(out, "protocol_failed=yes")) {
+                held_open = 1;
+                break;
+            }
+            usleep(20000);
+        }
+        if (!held_open) {
+            why = "failed incarnation hold status";
+            goto out;
+        }
+    }
+    opens = carrier_endpoint_counter(out, "rescue", "opens=");
+    lost = carrier_endpoint_counter(out, "rescue", "lost=");
+    failed_session = status_value(out, "local_session=");
+    if (opens == ULLONG_MAX || lost == ULLONG_MAX || failed_session == 0) {
+        why = "failed incarnation counters";
+        goto out;
+    }
+    {
+        long long end = now_ms() + 1200;
+        while (now_ms() < end) {
+            if (read_status(control, out, sizeof(out)) < 0) {
+                why = "status during hold";
+                goto out;
+            }
+            if (carrier_endpoint_counter(out, "rescue", "opens=") != opens ||
+                carrier_endpoint_counter(out, "rescue", "lost=") != lost) {
+                why = "reopen storm after protocol failure";
+                goto out;
+            }
+            usleep(50000);
+        }
+    }
+    if (control_request_timeout_test(control,
+            "CARRIER SWITCH primary raw 15000\n", 18000,
+            out, sizeof(out)) < 0 ||
+        !strstr(out, "OK CARRIER active=primary mode=raw generation=3") ||
+        wait_ready_layers(control, 1, 5000, out, sizeof(out)) < 0) {
+        why = "return to primary after DIRTY failure";
+        goto out;
+    }
+    if (control_request_timeout_test(control,
+            "CARRIER SWITCH rescue dirty 5000\n", 9000,
+            out, sizeof(out)) < 0 ||
+        !strstr(out, "ERR CARRIER committed-but-down") ||
+        read_status(control, out, sizeof(out)) < 0 ||
+        !strstr(out, "carrier_manager: active=rescue generation=4") ||
+        !strstr(out, "protocol_failed=yes") ||
+        status_value(out, "local_session=") == 0 ||
+        status_value(out, "local_session=") == failed_session) {
+        why = "fresh DIRTY incarnation after new COMMIT";
+        goto out;
+    }
+    rc = 0;
+out:
+    if (rc != 0) {
+        fprintf(stderr, "carrier DIRTY reopen hold failure: %s\n", why);
+        dump_excerpt("carrier DIRTY reopen hold", out);
+    }
+    stop_pid(host); stop_pid(sup); stop_pid(proxy);
+    if (primary[0] >= 0) close(primary[0]);
+    if (primary[1] >= 0) close(primary[1]);
+    if (tc[0] >= 0) close(tc[0]);
+    if (tc[1] >= 0) close(tc[1]);
+    if (note[0] >= 0) close(note[0]);
+    if (note[1] >= 0) close(note[1]);
+    unlink(rescue); unlink(control); rmdir(dir);
+    return rc;
+}
+
+static int carrier_raw_old_loss_timing_one(int after_ready)
+{
+    char dir[] = "/tmp/lmux-carrier-old-loss-it-XXXXXX";
+    char primary_path[192], control[192], tprimary[32];
+    char hrescue[64], trescue[64], out[16384];
+    int tp[2] = { -1, -1 };
+    int hc[2] = { -1, -1 }, tc[2] = { -1, -1 };
+    int note[2] = { -1, -1 }, cfd = -1, rc = 1;
+    pid_t primary_proxy = -1, candidate_proxy = -1;
+    pid_t host = -1, sup = -1, worker = -1;
+    unsigned long long old_local = 0, old_peer = 0;
+    const char *why = "setup";
+
+    if (!mkdtemp(dir) || socketpair(AF_UNIX, SOCK_STREAM, 0, tp) < 0)
+        return fail("carrier old-loss primary setup");
+    snprintf(primary_path, sizeof(primary_path), "%s/primary.sock", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+
+    /* This proxy is the physical old carrier.  It is spawned before the
+     * candidate descriptors exist, so killing it closes every old-carrier
+     * peer without accidentally retaining the rescue link. */
+    primary_proxy = spawn_persistent_proxy(primary_path, tp[1]);
+    if (primary_proxy < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, hc) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, tc) < 0 || pipe(note) < 0) {
+        why = "carrier proxies";
+        goto out;
+    }
+    snprintf(tprimary, sizeof(tprimary), "%d", tp[0]);
+    snprintf(hrescue, sizeof(hrescue), "rescue=%d", hc[1]);
+    snprintf(trescue, sizeof(trescue), "rescue=%d", tc[1]);
+
+    host = fork();
+    if (host == 0) {
+        close(tp[0]); close(tp[1]);
+        close(hc[0]); close(tc[0]); close(tc[1]);
+        close(note[0]); close(note[1]);
+        execl("build/host/lmuxd", "lmuxd", "--role", "host", "--outer",
+              "--carrier-connect", primary_path,
+              "--standby-carrier-fd", hrescue,
+              "--control", control, (char *)NULL);
+        _exit(127);
+    }
+    sup = fork();
+    if (sup == 0) {
+        close(tp[1]);
+        close(hc[0]); close(hc[1]); close(tc[0]);
+        close(note[0]); close(note[1]);
+        execl("build/host/lmuxd", "lmuxd", "--supervisor", "--outer",
+              "--carrier-fd", tprimary,
+              "--standby-carrier-fd", trescue, (char *)NULL);
+        _exit(127);
+    }
+    close(tp[0]); tp[0] = -1;
+    close(tp[1]); tp[1] = -1;
+    close(hc[1]); hc[1] = -1;
+    close(tc[1]); tc[1] = -1;
+
+    /* In the after-READY case, dropping the first COMMIT proves READY was
+     * already accepted before the old physical carrier is removed. */
+    candidate_proxy = spawn_lmc_drop_proxy(hc[0], tc[0], 1,
+        after_ready ? LMUX_LMC1_COMMIT : 0, note[1]);
+    close(hc[0]); hc[0] = -1;
+    close(tc[0]); tc[0] = -1;
+    close(note[1]); note[1] = -1;
+    if (host < 0 || sup < 0 || candidate_proxy < 0 ||
+        wait_ready_layers(control, 1, 15000, out, sizeof(out)) < 0) {
+        why = "initial primary establishment";
+        goto out;
+    }
+    worker = wait_child_pid(sup, -1, 5000);
+    old_local = status_value(out, "local_conn=");
+    old_peer = status_value(out, "peer_conn=");
+    if (worker <= 0 || old_local == 0 || old_peer == 0) {
+        why = "initial observable state";
+        goto out;
+    }
+
+    cfd = wait_connect(control, 3000);
+    if (cfd < 0) {
+        why = "switch control connect";
+        goto out;
+    }
+    if (!after_ready) {
+        stop_pid(primary_proxy);
+        primary_proxy = -1;
+    }
+    if (write_all(cfd, "CARRIER SWITCH rescue raw 15000\n", 32) < 0) {
+        why = "switch request";
+        goto out;
+    }
+    if (after_ready) {
+        char mark = 0;
+        if (!(wait_fd_event(note[0], POLLIN, 7000) & POLLIN) ||
+            read(note[0], &mark, 1) != 1 || mark != 'D') {
+            why = "READY/first COMMIT boundary";
+            goto out;
+        }
+        stop_pid(primary_proxy);
+        primary_proxy = -1;
+    }
+    if (read_until(cfd, "OK CARRIER active=rescue mode=raw generation=2",
+                   out, sizeof(out), 18000) < 0) {
+        why = after_ready ? "switch after READY loss" :
+                            "switch after pre-PREPARE loss";
+        goto out;
+    }
+    close(cfd);
+    cfd = -1;
+    if (read_status(control, out, sizeof(out)) < 0 ||
+        !strstr(out, "carrier_manager: active=rescue generation=2") ||
+        !strstr(out, "connection: ESTABLISHED") ||
+        !strstr(out, "seq_errors=0") ||
+        status_value(out, "local_conn=") == old_local ||
+        status_value(out, "peer_conn=") == old_peer ||
+        find_child_pid(sup) != worker) {
+        why = "post-loss authority/reconciliation";
+        goto out;
+    }
+    rc = 0;
+out:
+    if (rc != 0) {
+        fprintf(stderr, "carrier old-loss %s failure: %s\n",
+                after_ready ? "after-READY" : "before-PREPARE", why);
+        dump_excerpt("carrier old-loss", out);
+    }
+    if (cfd >= 0) close(cfd);
+    stop_pid(host);
+    stop_pid(sup);
+    stop_pid(primary_proxy);
+    stop_pid(candidate_proxy);
+    if (tp[0] >= 0) close(tp[0]);
+    if (tp[1] >= 0) close(tp[1]);
+    if (hc[0] >= 0) close(hc[0]);
+    if (hc[1] >= 0) close(hc[1]);
+    if (tc[0] >= 0) close(tc[0]);
+    if (tc[1] >= 0) close(tc[1]);
+    if (note[0] >= 0) close(note[0]);
+    if (note[1] >= 0) close(note[1]);
+    unlink(primary_path);
+    unlink(control);
+    rmdir(dir);
+    return rc;
+}
+
+static int carrier_raw_old_loss_timing_test(void)
+{
+    return carrier_raw_old_loss_timing_one(0) ||
+        carrier_raw_old_loss_timing_one(1);
+}
+
+static int carrier_raw_unavailable_busy_test(void)
+{
+    char dir[] = "/tmp/lmux-carrier-unavailable-it-XXXXXX";
+    char primary[192], rescue[192], control[192], rescue_spec[256];
+    char first[8192] = { 0 }, second[512] = { 0 };
+    pid_t host = -1;
+    int fd1 = -1, fd2 = -1, peer = -1, rc = 1;
+    const char *why = "setup";
+
+    if (!mkdtemp(dir))
+        return fail("carrier unavailable mkdtemp");
+    snprintf(primary, sizeof(primary), "%s/primary-missing", dir);
+    snprintf(rescue, sizeof(rescue), "%s/rescue-missing", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(rescue_spec, sizeof(rescue_spec), "rescue=%s", rescue);
+    host = fork();
+    if (host == 0) {
+        execl("build/host/lmuxd", "lmuxd", "--role", "host", "--outer",
+              "--carrier-connect", primary,
+              "--standby-carrier-listen", rescue_spec,
+              "--control", control, (char *)NULL);
+        _exit(127);
+    }
+    if (host < 0 || wait_path_exists(control, 5000) < 0 ||
+        wait_path_exists(rescue, 5000) < 0) {
+        why = "host control/listener";
+        goto out;
+    }
+    fd1 = wait_connect(control, 3000);
+    if (fd1 < 0 ||
+        write_all(fd1, "CARRIER SWITCH rescue raw 1000\n", 31) < 0) {
+        why = "first request";
+        goto out;
+    }
+    peer = wait_connect(rescue, 3000);
+    if (peer < 0) {
+        why = "candidate accept";
+        goto out;
+    }
+    /* A complete QUERY record is the protocol event proving that the first
+     * request has entered the switch state machine. */
+    {
+        uint8_t record[LMUX_LMC1_MAX_ENCODED];
+        size_t have = 0;
+        long long end = now_ms() + 3000;
+        while (have < sizeof(record) && now_ms() < end) {
+            int re = wait_fd_event(peer, POLLIN | POLLHUP | POLLERR, 100);
+            if (re & POLLIN) {
+                ssize_t n = read(peer, record + have, sizeof(record) - have);
+                size_t i;
+                if (n <= 0)
+                    break;
+                for (i = 0; i < (size_t)n; i++)
+                    if (record[have + i] == 0) {
+                        have += i + 1;
+                        goto query_seen;
+                    }
+                have += (size_t)n;
+            }
+        }
+        why = "candidate QUERY";
+        goto out;
+query_seen:
+        ;
+    }
+    if (read_status(control, first, sizeof(first)) < 0 ||
+        !strstr(first, "carrier_switch: phase=") ||
+        strstr(first, "carrier_switch: phase=idle")) {
+        why = "read-only status during switch";
+        goto out;
+    }
+    fd2 = wait_connect(control, 3000);
+    if (fd2 < 0) {
+        why = "concurrent request";
+        goto out;
+    }
+    (void)write_all(fd2, "CARRIER SWITCH primary raw 1000\n", 32);
+    if (read_until(fd2, "ERR CARRIER BUSY switch-active", second,
+                   sizeof(second), 3000) < 0) {
+        why = "concurrent BUSY";
+        goto out;
+    }
+    close(fd1);
+    fd1 = -1;
+    {
+        long long end = now_ms() + 4000;
+        int finished = 0;
+        while (now_ms() < end) {
+            if (read_status(control, first, sizeof(first)) == 0 &&
+                strstr(first, "carrier_switch: phase=idle") &&
+                strstr(first, "last_error=timeout")) {
+                finished = 1;
+                break;
+            }
+            usleep(20000);
+        }
+        if (!finished) {
+            why = "daemon switch completion after CLI close";
+            goto out;
+        }
+    }
+    if (read_status(control, first, sizeof(first)) < 0) {
+        why = "read-only status after ambiguous CLI close";
+        goto out;
+    }
+    rc = 0;
+out:
+    if (rc != 0) {
+        fprintf(stderr, "carrier unavailable/BUSY failure: %s\n", why);
+        dump_excerpt("carrier unavailable first", first);
+        dump_excerpt("carrier unavailable second", second);
+    }
+    if (fd1 >= 0) close(fd1);
+    if (fd2 >= 0) close(fd2);
+    if (peer >= 0) close(peer);
+    stop_pid(host);
+    unlink(rescue);
+    unlink(control);
+    rmdir(dir);
+    return rc;
+}
+
+static int legacy_named_primary_status_test(void)
+{
+    char dir[] = "/tmp/lmux-carrier-legacy-it-XXXXXX";
+    char carrier[192], control[192], out[8192];
+    pid_t host = -1;
+    int rc = 1;
+    long long end;
+
+    out[0] = '\0';
+    if (!mkdtemp(dir))
+        return fail("legacy carrier mkdtemp");
+    snprintf(carrier, sizeof(carrier), "%s/missing-primary", dir);
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    host = fork();
+    if (host == 0) {
+        execl("build/host/lmuxd", "lmuxd", "--role", "host", "--outer",
+              "--carrier", carrier, "--control", control, (char *)NULL);
+        _exit(127);
+    }
+    if (host < 0 || wait_path_exists(control, 5000) < 0)
+        goto out;
+    end = now_ms() + 3000;
+    while (now_ms() < end) {
+        if (read_status(control, out, sizeof(out)) == 0 &&
+            strstr(out, "carrier_manager: active=primary") &&
+            strstr(out, "carrier_endpoint: name=primary type=tty") &&
+            strstr(out, "configured=yes active=yes mode=raw state=failed") &&
+            strstr(out, carrier)) {
+            rc = 0;
+            break;
+        }
+        usleep(20000);
+    }
+out:
+    if (rc != 0)
+        dump_excerpt("legacy named primary status", out);
+    stop_pid(host);
+    unlink(control);
+    rmdir(dir);
+    return rc;
+}
+
+static int named_carrier_cli_rejects(const char *spec)
+{
+    pid_t pid = fork();
+    int st;
+    if (pid == 0) {
+        int dn = open("/dev/null", O_WRONLY);
+        if (dn >= 0) {
+            dup2(dn, STDERR_FILENO);
+            close(dn);
+        }
+        execl("build/host/lmuxd", "lmuxd", "--supervisor",
+              "--carrier-connect", "/tmp/lmux-name-validation-unused",
+              "--standby-carrier", spec, "--version", (char *)NULL);
+        _exit(127);
+    }
+    if (pid < 0 || waitpid(pid, &st, 0) != pid)
+        return -1;
+    return WIFEXITED(st) && WEXITSTATUS(st) != 0 ? 0 : -1;
+}
+
+static int named_carrier_cli_validation_test(void)
+{
+    char long_spec[LMUX_CARRIER_NAME_MAX + 32];
+    memset(long_spec, 'a', LMUX_CARRIER_NAME_MAX + 1);
+    strcpy(long_spec + LMUX_CARRIER_NAME_MAX + 1, "=/tmp/unused");
+    if (named_carrier_cli_rejects("primary=/tmp/duplicate") < 0 ||
+        named_carrier_cli_rejects("=/tmp/empty") < 0 ||
+        named_carrier_cli_rejects("bad/name=/tmp/invalid") < 0 ||
+        named_carrier_cli_rejects(long_spec) < 0)
+        return fail("named carrier CLI validation");
+    return 0;
 }
 
 static int pid_exists(pid_t pid)
@@ -6976,6 +9770,10 @@ static int structured_control_test(void)
     int done = 0;
     int worker_stopped = 0;
     const char *where = "setup";
+    int file_disconnect_errno = 0;
+    int file_disconnect_state = -1;
+    uint64_t file_disconnect_expected_req = 0;
+    uint64_t file_disconnect_observed_op = 0;
 
     if (hc2_reader_fragmentation_selftest() < 0) {
         fprintf(stderr, "structured_control where=reader fragmentation\n");
@@ -7412,42 +10210,67 @@ static int structured_control_test(void)
             goto out;
     }
 
-    where = "structured file disconnect status";
+    where = "structured file disconnect start PUT";
     done = 0;
     if (make_file(file_src, 64u * 1024u * 1024u) < 0 ||
         hc2_file_start(fd, LMUX_HC2_FILE_PUT_START, 47,
-                       file_src, file_target) < 0)
+                       file_src, file_target) < 0) {
+        file_disconnect_errno = errno;
         goto out;
+    }
+    where = "structured file disconnect wait FILE_STARTED";
+    file_disconnect_expected_req = 47;
     file_op = 0;
     while (!file_op) {
-        if (hc2_read_frame(fd, &type, &req, payload, &len, 10000) < 0)
+        if (hc2_read_frame(fd, &type, &req, payload, &len, 10000) < 0) {
+            file_disconnect_errno = errno;
             goto out;
-        if (type == LMUX_HC2_FILE_STARTED && len >= 24)
+        }
+        if (type == LMUX_HC2_FILE_STARTED && req == 47 && len >= 24)
             file_op = hc2_test_get_u64(payload);
         else if (type == LMUX_HC2_FILE_ERROR || type == LMUX_HC2_ERROR)
             goto out;
     }
+    where = "structured file disconnect reconnect HC2";
     close(fd);
     fd = -1;
     fd = hc2_connect_hello(structured);
-    if (fd < 0)
+    if (fd < 0) {
+        file_disconnect_errno = errno;
         goto out;
+    }
+    where = "structured file disconnect send FILE_STATUS";
+    file_disconnect_expected_req = 48;
     hc2_test_put_u64(payload, file_op);
-    if (hc2_send_frame(fd, LMUX_HC2_FILE_STATUS, 48, payload, 8) < 0)
+    if (hc2_send_frame(fd, LMUX_HC2_FILE_STATUS, 48, payload, 8) < 0) {
+        file_disconnect_errno = errno;
         goto out;
+    }
+    where = "structured file disconnect wait FILE_STATE";
     for (;;) {
-        if (hc2_read_frame(fd, &type, &req, payload, &len, 10000) < 0)
+        if (hc2_read_frame(fd, &type, &req, payload, &len, 10000) < 0) {
+            file_disconnect_errno = errno;
             goto out;
-        if (type == LMUX_HC2_FILE_STATE && req == 48 && len >= 96) {
-            if (hc2_test_get_u64(payload) != file_op ||
-                (payload[53] != LMUX_HC2_FILE_RUNNING &&
-                 payload[53] != LMUX_HC2_FILE_DONE_STATE))
+        }
+        if (type == LMUX_HC2_FILE_STATE && req == 48) {
+            where = "structured file disconnect verify FILE_STATE";
+            if (len < 96)
                 goto out;
-            if (payload[53] == LMUX_HC2_FILE_RUNNING) {
+            file_disconnect_observed_op = hc2_test_get_u64(payload);
+            file_disconnect_state = payload[53];
+            if (file_disconnect_observed_op != file_op ||
+                (file_disconnect_state != LMUX_HC2_FILE_RUNNING &&
+                 file_disconnect_state != LMUX_HC2_FILE_DONE_STATE))
+                goto out;
+            if (file_disconnect_state == LMUX_HC2_FILE_RUNNING) {
+                where = "structured file disconnect send FILE_CANCEL";
+                file_disconnect_expected_req = 49;
                 hc2_test_put_u64(payload, file_op);
                 if (hc2_send_frame(fd, LMUX_HC2_FILE_CANCEL, 49,
-                                   payload, 8) < 0)
+                                   payload, 8) < 0) {
+                    file_disconnect_errno = errno;
                     goto out;
+                }
             } else {
                 done = 1;
             }
@@ -7457,11 +10280,22 @@ static int structured_control_test(void)
             goto out;
     }
     if (!done) {
+        where = "structured file disconnect wait CANCELLED";
+        file_disconnect_expected_req = 49;
+        file_disconnect_observed_op = 0;
+        file_disconnect_state = -1;
         for (;;) {
-            if (hc2_read_frame(fd, &type, &req, payload, &len, 10000) < 0)
+            if (hc2_read_frame(fd, &type, &req, payload, &len, 10000) < 0) {
+                file_disconnect_errno = errno;
                 goto out;
-            if (type == LMUX_HC2_FILE_STATE && req == 49 && len >= 96) {
-                if (payload[53] != LMUX_HC2_FILE_CANCELLED)
+            }
+            if (type == LMUX_HC2_FILE_STATE && req == 49) {
+                if (len < 96)
+                    goto out;
+                file_disconnect_observed_op = hc2_test_get_u64(payload);
+                file_disconnect_state = payload[53];
+                if (file_disconnect_observed_op != file_op ||
+                    file_disconnect_state != LMUX_HC2_FILE_CANCELLED)
                     goto out;
                 break;
             }
@@ -7662,6 +10496,22 @@ out:
         fprintf(stderr, "last=%s(%u) req=%llu len=%u err=%u\n",
                 hc2_type_name(type), type, (unsigned long long)req, len,
                 (type == LMUX_HC2_ERROR && len >= 4) ? lmux_get_le32(payload) : 0);
+        if (strncmp(where, "structured file disconnect", 26) == 0) {
+            fprintf(stderr,
+                    "file_disconnect errno=%d(%s) expected_req=%llu "
+                    "last_req=%llu op=%llu observed_op=%llu state=%d "
+                    "file_err=%u\n",
+                    file_disconnect_errno,
+                    file_disconnect_errno ? strerror(file_disconnect_errno) :
+                        "none",
+                    (unsigned long long)file_disconnect_expected_req,
+                    (unsigned long long)req,
+                    (unsigned long long)file_op,
+                    (unsigned long long)file_disconnect_observed_op,
+                    file_disconnect_state,
+                    (type == LMUX_HC2_FILE_ERROR && len >= 12) ?
+                        lmux_get_le32(payload + 8) : 0);
+        }
     }
     if (fd >= 0)
         close(fd);
@@ -10668,6 +13518,36 @@ int main(int argc, char **argv)
     if (argc >= 2 && strcmp(argv[1], "--exec-helper") == 0)
         return exec_helper_main(argc, argv);
     signal(SIGPIPE, SIG_IGN);
+    if (getenv("LMUX_SUP_IT_ONLY_CARRIER_B1"))
+        return carrier_manager_standby_without_usb_test() ||
+            carrier_manager_usb_without_uart_test() ||
+            legacy_named_primary_status_test() ||
+            named_carrier_cli_validation_test() ? 1 : 0;
+    if (getenv("LMUX_SUP_IT_ONLY_CARRIER_B2"))
+        return carrier_lmc1_state_machine_test() ||
+            carrier_raw_switch_roundtrip_test() ||
+            carrier_raw_recovery_without_primary_test() ||
+            carrier_raw_ambiguous_fault_test() ||
+            carrier_raw_old_loss_timing_test() ||
+            carrier_raw_unavailable_busy_test() ? 1 : 0;
+    if (getenv("LMUX_SUP_IT_ONLY_CARRIER_AMBIGUOUS"))
+        return carrier_raw_ambiguous_fault_test() ? 1 : 0;
+    if (getenv("LMUX_SUP_IT_ONLY_CARRIER_B4"))
+        return carrier_dirty_fault_handover_test() ||
+            carrier_dirty_explicit_failure_test() ||
+            carrier_dirty_reopen_hold_test() ? 1 : 0;
+    if (getenv("LMUX_SUP_IT_ONLY_STRUCTURED_DIRTY"))
+        return carrier_dirty_structured_control_test() ? 1 : 0;
+    if (getenv("LMUX_SUP_IT_ONLY_DISPATCHER"))
+        return carrier_dispatcher_handover_console_test() ? 1 : 0;
+    if (getenv("LMUX_SUP_IT_ONLY_USB_REGRESSION")) {
+        setenv("LMUX_SUP_IT_OUTER", "1", 1);
+        return outer_first_contact_lost_hello_test(1) ||
+            outer_first_contact_lost_hello_test(0) ||
+            outer_first_contact_truncated_hello_test() ||
+            outer_duplicate_hello_burst_test() ||
+            structured_lmux_reconnect_test() ? 1 : 0;
+    }
     if (getenv("LMUX_SUP_IT_ONLY_STRUCTURED_RECONNECT")) {
         setenv("LMUX_SUP_IT_OUTER", "1", 1);
         return structured_lmux_reconnect_test() ? 1 : 0;
@@ -10793,7 +13673,23 @@ int main(int argc, char **argv)
             structured_worker_replacement_test() ||
             supervisor_install_restart_shortcut_test() ? 1 : 0;
     }
-    if (invalid_storage_root_test())
+    if (getenv("LMUX_SUP_IT_ONLY_HOST_FIRST"))
+        return host_first_startup_test() ? 1 : 0;
+    if (carrier_manager_standby_without_usb_test() ||
+        carrier_manager_usb_without_uart_test() ||
+        legacy_named_primary_status_test() ||
+        named_carrier_cli_validation_test() ||
+        carrier_lmc1_state_machine_test() ||
+        carrier_raw_switch_roundtrip_test() ||
+        carrier_raw_recovery_without_primary_test() ||
+        carrier_raw_ambiguous_fault_test() ||
+        carrier_raw_old_loss_timing_test() ||
+        carrier_raw_unavailable_busy_test() ||
+        carrier_dirty_fault_handover_test() ||
+        carrier_dirty_structured_control_test() ||
+        carrier_dirty_explicit_failure_test() ||
+        carrier_dirty_reopen_hold_test() ||
+        invalid_storage_root_test())
         return 1;
     if (pending_abandon_test(0) || pending_abandon_test(1))
         return 1;

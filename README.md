@@ -204,6 +204,9 @@ make strip-target
 The usual host outputs are under `build/host/`; static target outputs are under
 `build/target/`.
 
+See [docs/testing.md](docs/testing.md) for focused development suites, soak
+tests, the unchanged `selftest` contract, and the release verification gate.
+
 ## Quick Start
 
 On the target, run the supervisor in OUTER mode:
@@ -439,5 +442,9 @@ dependencies remain subject to their respective licenses.
 - [docs/lmux-mcp.md](docs/lmux-mcp.md): MCP server, tools, runtime, and
   structured-control integration.
 - [docs/zeromux.md](docs/zeromux.md): experimental bootstrap/install subsystem.
+- [docs/uart-carrier.md](docs/uart-carrier.md): named RAW/DIRTY carrier and
+  switching design.
+- [docs/uart-dispatcher.md](docs/uart-dispatcher.md): generic sole-reader UART
+  console dispatcher, IPC contract, and platform integration examples.
 - [docs/release-1.0.md](docs/release-1.0.md): supported 1.0 contract,
   limitations, and release gate.

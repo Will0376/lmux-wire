@@ -390,8 +390,11 @@ static void hc2_close_client_runtime(struct v2_app *a, struct v2_host *h)
         if (h->structured_execs[i].used)
             hc2_exec_close_streams(a, &h->structured_execs[i]);
     if (h->exec_structured) {
-        if (h->exec_control_stream)
+        if (h->exec_control_stream) {
             (void)v2_runtime_close_stream(a, h->exec_control_stream);
+            h->exec_retiring_control_stream = h->exec_control_stream;
+            h->structured_control_retirements++;
+        }
         if (h->exec_stdin_stream)
             (void)v2_runtime_close_stream(a, h->exec_stdin_stream);
         if (h->exec_stdout_stream)
@@ -872,6 +875,7 @@ static void hc2_begin_control_op(struct v2_host *h,
                                  struct v2_host_structured_exec *e,
                                  int phase)
 {
+    h->structured_control_transactions++;
     h->exec_active = 1;
     h->exec_structured = 1;
     h->exec_phase = phase;
@@ -885,6 +889,7 @@ static void hc2_begin_control_op(struct v2_host *h,
 static int hc2_request_exec_info(struct v2_app *a, struct v2_host *h)
 {
     if (h->structured_exec_info_pending || h->exec_active ||
+        h->exec_retiring_control_stream ||
         !v2_runtime_lmux_established(a) || !hc2_exec_service(h))
         return 0;
     h->exec_active = 1;
@@ -895,6 +900,7 @@ static int hc2_request_exec_info(struct v2_app *a, struct v2_host *h)
     h->structured_control_op.request_id = 0;
     h->structured_control_op.ref = 0;
     h->structured_exec_info_pending = 1;
+    h->structured_control_transactions++;
     if (hc2_queue_exec_record(h, V2_EXEC_REC_INFO, 0, 0, NULL, 0) < 0) {
         h->exec_active = 0;
         h->exec_structured = 0;
@@ -983,7 +989,7 @@ static void hc2_handle_exec_start(struct v2_app *a, struct v2_host *h,
     e->active = 1;
     e->incarnation = h->structured_known_exec_incarnation;
     e->req_id = fr->request_id;
-    e->next_status_ms = v2_now_ms() + 100;
+    e->next_status_ms = v2_now_ms() + V2_HOST_STRUCTURED_EXEC_POLL_MS;
     hc2_begin_control_op(h, V2_HC2_CTL_START, fr->request_id, e, 1);
     if (hc2_queue_exec_record(h, V2_EXEC_REC_START, 0, 0,
                               payload, (uint16_t)out) < 0) {
@@ -1860,13 +1866,27 @@ static void hc2_exec_forget_dead_attachments(struct v2_app *a,
     }
     if (e->stdout_stream) {
         st = v2_runtime_stream_state(a, e->stdout_stream);
-        if (st == LMUX2_STREAM_RESET || st == LMUX2_STREAM_UNUSED)
+        if (st == LMUX2_STREAM_RESET) {
             e->stdout_stream = 0;
+            e->stdout_stream_complete = 0;
+        } else if (st == LMUX2_STREAM_UNUSED ||
+                   (st == LMUX2_STREAM_TERMINAL &&
+                    v2_runtime_stream_rx_len(a, e->stdout_stream) == 0)) {
+            e->stdout_stream = 0;
+            e->stdout_stream_complete = 1;
+        }
     }
     if (e->stderr_stream) {
         st = v2_runtime_stream_state(a, e->stderr_stream);
-        if (st == LMUX2_STREAM_RESET || st == LMUX2_STREAM_UNUSED)
+        if (st == LMUX2_STREAM_RESET) {
             e->stderr_stream = 0;
+            e->stderr_stream_complete = 0;
+        } else if (st == LMUX2_STREAM_UNUSED ||
+                   (st == LMUX2_STREAM_TERMINAL &&
+                    v2_runtime_stream_rx_len(a, e->stderr_stream) == 0)) {
+            e->stderr_stream = 0;
+            e->stderr_stream_complete = 1;
+        }
     }
 }
 
@@ -1902,14 +1922,16 @@ static void hc2_exec_start_status_tx(struct v2_host *h,
         memset(&h->structured_control_op, 0, sizeof(h->structured_control_op));
         return;
     }
+    h->exec_status_pending = 1;
     e->status_pending = 1;
-    e->next_status_ms = v2_now_ms() + 100;
+    h->structured_control_autopolls++;
+    e->next_status_ms = v2_now_ms() + V2_HOST_STRUCTURED_EXEC_POLL_MS;
 }
 
 static void hc2_exec_table_step(struct v2_app *a, struct v2_host *h)
 {
     struct v2_host_service *s = hc2_exec_service(h);
-    int i;
+    int i, n;
     if (!v2_runtime_lmux_established(a) || !s || !h->structured_ready)
         return;
     if (!h->structured_known_exec_incarnation) {
@@ -1918,7 +1940,9 @@ static void hc2_exec_table_step(struct v2_app *a, struct v2_host *h)
     }
     if (h->exec_active)
         return;
-    for (i = 0; i < V2_HOST_STRUCTURED_MAX_EXECS; i++) {
+    for (n = 0; n < V2_HOST_STRUCTURED_MAX_EXECS; n++) {
+        i = (h->structured_exec_poll_next + n) %
+            V2_HOST_STRUCTURED_MAX_EXECS;
         struct v2_host_structured_exec *e = &h->structured_execs[i];
         if (!e->used || !e->active || e->lost || !e->exec_id)
             continue;
@@ -1935,11 +1959,11 @@ static void hc2_exec_table_step(struct v2_app *a, struct v2_host *h)
                 continue;
             e->auto_reattach = 0;
         }
-        if (!e->stdout_stream)
+        if (!e->stdout_stream && !e->stdout_stream_complete)
             (void)v2_runtime_open_stream_token(a, s->id,
                 v2_exec_stream_token(e->exec_id, V2_EXEC_ROLE_STDOUT),
                 &e->stdout_stream);
-        if (!e->stderr_stream)
+        if (!e->stderr_stream && !e->stderr_stream_complete)
             (void)v2_runtime_open_stream_token(a, s->id,
                 v2_exec_stream_token(e->exec_id, V2_EXEC_ROLE_STDERR),
                 &e->stderr_stream);
@@ -1958,8 +1982,12 @@ static void hc2_exec_table_step(struct v2_app *a, struct v2_host *h)
         hc2_exec_pump_stdin_entry(a, h, e);
         hc2_exec_queue_final_if_ready(a, h, e);
         if (!e->done && !e->final_pending && !e->status_pending &&
-            !h->exec_active && v2_now_ms() >= e->next_status_ms)
+            !h->exec_active && !h->exec_retiring_control_stream &&
+            v2_now_ms() >= e->next_status_ms) {
             hc2_exec_start_status_tx(h, e);
+            h->structured_exec_poll_next =
+                (i + 1) % V2_HOST_STRUCTURED_MAX_EXECS;
+        }
     }
 }
 
@@ -1993,7 +2021,8 @@ static void hc2_handle_frame(struct v2_app *a, struct v2_host *h,
         if (hc2_queue_server_hello(h, fr->request_id) < 0)
             hc2_close_client(h);
         else if (v2_runtime_lmux_established(a) && hc2_exec_service(h) &&
-                 !h->structured_known_exec_incarnation && !h->exec_active)
+                 !h->structured_known_exec_incarnation && !h->exec_active &&
+                 !h->exec_retiring_control_stream)
             (void)hc2_request_exec_info(a, h);
         break;
     case LMUX_HC2_STATUS_REQUEST:
@@ -2052,6 +2081,7 @@ static void hc2_drain_control_queue(struct v2_app *a, struct v2_host *h,
                                     const struct v2_host_status *st)
 {
     while (h->structured_control_queue_len > 0 && !h->exec_active &&
+           !h->exec_retiring_control_stream &&
            h->structured_fd >= 0) {
         struct v2_host_structured_pending_frame *q =
             &h->structured_control_queue[h->structured_control_queue_head];
@@ -2236,7 +2266,8 @@ void v2_host_structured_tick(struct v2_app *a, struct v2_host *h,
     (void)st;
     if (h->structured_fd >= 0 && h->structured_ready &&
         v2_runtime_lmux_established(a) && hc2_exec_service(h) &&
-        !h->structured_known_exec_incarnation && !h->exec_active)
+        !h->structured_known_exec_incarnation && !h->exec_active &&
+        !h->exec_retiring_control_stream)
         (void)hc2_request_exec_info(a, h);
     if (h->structured_known_exec_incarnation)
         v2_host_structured_check_exec_incarnation(h);
@@ -2282,6 +2313,7 @@ void v2_host_structured_on_exec_clear(struct v2_host *h)
     struct v2_host_structured_exec *e = hc2_exec_by_ref(h, h->structured_control_op.ref);
     if (!h->exec_structured)
         return;
+    h->structured_control_completions++;
     if (h->exec_phase == HC2_EXEC_MODE_INFO_ONCE)
         h->structured_exec_info_pending = 0;
     h->exec_structured = 0;
@@ -2338,12 +2370,15 @@ void v2_host_structured_on_outer_down(struct v2_host *h)
         e->stdin_stream = 0;
         e->stdout_stream = 0;
         e->stderr_stream = 0;
+        e->stdout_stream_complete = 0;
+        e->stderr_stream_complete = 0;
         e->stdin_stream_opened = 0;
         e->stdin_close_committed = 0;
         e->stdin_close_pending = 0;
         e->status_pending = 0;
     }
     hc2_retire_exec_lmux_attachment(h);
+    h->exec_retiring_control_stream = 0;
     h->structured_known_exec_incarnation = 0;
     h->structured_exec_info_pending = 0;
 }

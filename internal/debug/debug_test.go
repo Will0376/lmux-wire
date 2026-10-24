@@ -638,6 +638,11 @@ func TestDebugSocketPathLifetimeAndEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitSessionState(t, s, "STOPPED")
+	select {
+	case <-s.connReady:
+	case <-ctx.Done():
+		t.Fatal("RSP accept did not become ready before the test context expired")
+	}
 	assertSocketPath(t, s.socketPath)
 	logBytes, err := os.ReadFile(filepath.Join(dir, "gdb.commands"))
 	if err != nil {

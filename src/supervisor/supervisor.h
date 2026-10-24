@@ -34,6 +34,7 @@ struct lmux_proxy_ring {
 };
 
 int lmux_supervisor_main(int argc, char **argv);
+size_t lmux_supervisor_memory_footprint(void);
 
 int lmux_supervisor_msg_encode(uint8_t out[LMUX_SUP_MSG_LEN],
                                const struct lmux_supervisor_msg *msg);

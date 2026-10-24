@@ -1,4 +1,5 @@
 #include "lxf.h"
+#include "carrier_manager.h"
 #include "host_control_structured.h"
 #include "services.h"
 #include "zeromux/zeromux.h"
@@ -372,6 +373,9 @@ static void usage(FILE *f)
         "Usage:\n"
         "  lmux connect SOCKET\n"
         "  lmux status [--control SOCKET]\n"
+        "  lmux carrier status [--control SOCKET]\n"
+        "  lmux carrier switch NAME [--mode raw|dirty] [--timeout-ms N] [--control SOCKET]\n"
+        "  lmux carrier console NAME [--control SOCKET]\n"
         "  lmux deploy FILE [--restart-supervisor] [--timeout-ms N] [--control SOCKET]\n"
         "  lmux deploy --restart-supervisor [--control SOCKET]\n"
         "  lmux boot info [--control SOCKET]\n"
@@ -819,6 +823,13 @@ static void term_print_attached(const char *label)
     fflush(stderr);
 }
 
+static void term_print_waiting(const char *label)
+{
+    /* A local Unix socket accept is not proof of a remote LMUX stream. */
+    fprintf(stderr, "[waiting: %s]\r\n", label ? label : "console1");
+    fflush(stderr);
+}
+
 static void term_print_detached(const char *label)
 {
     fprintf(stderr, "\r\n[detached: %s]\r\n", label ? label : "console1");
@@ -983,6 +994,7 @@ static int term_bridge_loop(int sock, const char *remote_dir, int channel,
     struct pipebuf a, b;
     int stdin_open = 1, sock_open = 1, stdout_open = 1;
     int prefix = 0;
+    int remote_attached = 0;
 
     memset(&a, 0, sizeof(a));
     memset(&b, 0, sizeof(b));
@@ -990,6 +1002,7 @@ static int term_bridge_loop(int sock, const char *remote_dir, int channel,
     term_modal = 0;
     term_label = label;
     term_winch_pending = 1;
+    term_print_waiting(label);
     if (set_nonblock(STDIN_FILENO) < 0 || set_nonblock(STDOUT_FILENO) < 0 || set_nonblock(sock) < 0) {
         perror("fcntl");
         return 1;
@@ -1069,9 +1082,13 @@ static int term_bridge_loop(int sock, const char *remote_dir, int channel,
         if (sock_idx >= 0 && (pfds[sock_idx].revents & (POLLIN | POLLHUP)) && b.len < sizeof(b.buf)) {
             compact_pipebuf(&b);
             ssize_t r = read(sock, b.buf + b.off + b.len, sizeof(b.buf) - b.off - b.len);
-            if (r > 0)
+            if (r > 0) {
+                if (!remote_attached) {
+                    term_print_attached(label);
+                    remote_attached = 1;
+                }
                 b.len += (size_t)r;
-            else if (r == 0)
+            } else if (r == 0)
                 sock_open = 0;
             else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
                 sock_open = 0;
@@ -1119,7 +1136,6 @@ static int cmd_connect(const char *path, int raw_term, const char *remote_dir,
         }
     }
     if (raw_term) {
-        term_print_attached(label ? label : path);
         return term_bridge_loop(fd, remote_dir, channel, verbose, label ? label : path);
     }
     return bridge_loop(fd);
@@ -2455,6 +2471,110 @@ static int cmd_status(int argc, char **argv)
     return control_request(control, "STATUS\n", 1, 0) < 0 ? 1 : 0;
 }
 
+static int carrier_control_request(const char *control, const char *request)
+{
+    int fd = connect_unix(control);
+    int saw_error = 0;
+    uint8_t prefix[4];
+    size_t prefix_len = 0;
+    if (fd < 0)
+        return 1;
+    if (full_write(fd, (const uint8_t *)request, strlen(request)) < 0) {
+        perror("carrier control write");
+        close(fd);
+        return 1;
+    }
+    for (;;) {
+        uint8_t buf[512];
+        ssize_t r = read(fd, buf, sizeof(buf));
+        if (r > 0) {
+            size_t take = (size_t)r;
+            if (take > sizeof(prefix) - prefix_len)
+                take = sizeof(prefix) - prefix_len;
+            if (take != 0) {
+                memcpy(prefix + prefix_len, buf, take);
+                prefix_len += take;
+                if (prefix_len == sizeof(prefix) &&
+                    memcmp(prefix, "ERR ", sizeof(prefix)) == 0)
+                    saw_error = 1;
+            }
+            if (full_write(STDOUT_FILENO, buf, (size_t)r) < 0) {
+                close(fd);
+                return 1;
+            }
+            continue;
+        }
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r < 0)
+            saw_error = 1;
+        break;
+    }
+    close(fd);
+    return saw_error;
+}
+
+static int cmd_carrier(int argc, char **argv)
+{
+    const char *control = LMUX_DEFAULT_CONTROL_SOCKET;
+    const char *mode = "raw";
+    const char *name = NULL;
+    const char *action;
+    unsigned timeout_ms = 30000;
+    char request[160];
+    if (argc < 1)
+        return usage(stderr), 1;
+    action = argv[0];
+    argv++;
+    argc--;
+    if (strcmp(action, "switch") == 0 || strcmp(action, "console") == 0) {
+        if (argc < 1)
+            return usage(stderr), 1;
+        name = argv[0];
+        argv++;
+        argc--;
+    } else if (strcmp(action, "status") != 0) {
+        return usage(stderr), 1;
+    }
+    while (argc > 0) {
+        if (strcmp(argv[0], "--control") == 0 && argc >= 2) {
+            control = argv[1];
+            argv += 2;
+            argc -= 2;
+        } else if (strcmp(action, "switch") == 0 &&
+                   strcmp(argv[0], "--mode") == 0 && argc >= 2) {
+            mode = argv[1];
+            argv += 2;
+            argc -= 2;
+        } else if (strcmp(action, "switch") == 0 &&
+                   strcmp(argv[0], "--timeout-ms") == 0 && argc >= 2) {
+            char *end = NULL;
+            unsigned long v = strtoul(argv[1], &end, 10);
+            if (!end || *end || v < 1000 || v > 120000)
+                return usage(stderr), 1;
+            timeout_ms = (unsigned)v;
+            argv += 2;
+            argc -= 2;
+        } else {
+            return usage(stderr), 1;
+        }
+    }
+    if (strcmp(action, "status") == 0)
+        return carrier_control_request(control, "CARRIER STATUS\n");
+    if (strcmp(action, "console") == 0) {
+        if (strlen(name) > LMUX_CARRIER_NAME_MAX)
+            return usage(stderr), 1;
+        snprintf(request, sizeof(request), "CARRIER CONSOLE %s\n", name);
+        return carrier_control_request(control, request);
+    }
+    if (strlen(name) > LMUX_CARRIER_NAME_MAX ||
+        (strcmp(mode, "raw") != 0 && strcmp(mode, "dirty") != 0))
+        return usage(stderr), 1;
+    snprintf(request, sizeof(request), "CARRIER SWITCH %s %s %u\n",
+             name, mode, timeout_ms);
+    return carrier_control_request(control, request);
+}
+
 static int cmd_deploy(int argc, char **argv)
 {
     const char *control = LMUX_DEFAULT_CONTROL_SOCKET;
@@ -2634,6 +2754,8 @@ int main(int argc, char **argv)
     }
     if (strcmp(argv[1], "status") == 0)
         return cmd_status(argc - 2, argv + 2);
+    if (strcmp(argv[1], "carrier") == 0)
+        return cmd_carrier(argc - 2, argv + 2);
     if (strcmp(argv[1], "deploy") == 0)
         return cmd_deploy(argc - 2, argv + 2);
     if (strcmp(argv[1], "boot") == 0)

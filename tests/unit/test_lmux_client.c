@@ -159,7 +159,52 @@ static int test_term_disconnected_loop(void)
     if (en < 0 || on < 0)
         return -1;
     ebuf[en] = 0;
-    return rc == 0 && on == 0 && strstr(ebuf, "[disconnected: console1]") != NULL ? 0 : -1;
+    return rc == 0 && on == 0 &&
+        strstr(ebuf, "[waiting: console1]") != NULL &&
+        strstr(ebuf, "[attached: console1]") == NULL &&
+        strstr(ebuf, "[disconnected: console1]") != NULL ? 0 : -1;
+}
+
+static int test_term_attached_after_remote_data(void)
+{
+    int sv[2], in[2], out[2], err[2];
+    int save_in, save_out, save_err, rc;
+    char ebuf[256], obuf[16];
+    ssize_t en, on;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0 ||
+        pipe(in) < 0 || pipe(out) < 0 || pipe(err) < 0)
+        return -1;
+    save_in = dup(STDIN_FILENO);
+    save_out = dup(STDOUT_FILENO);
+    save_err = dup(STDERR_FILENO);
+    if (save_in < 0 || save_out < 0 || save_err < 0)
+        return -1;
+    if (write(sv[1], "R", 1) != 1)
+        return -1;
+    close(sv[1]);
+    if (dup2(in[0], STDIN_FILENO) < 0 ||
+        dup2(out[1], STDOUT_FILENO) < 0 ||
+        dup2(err[1], STDERR_FILENO) < 0)
+        return -1;
+    close(in[0]);
+    close(out[1]);
+    close(err[1]);
+    rc = term_bridge_loop(sv[0], NULL, 1, 0, "console1");
+    fflush(stderr);
+    (void)dup2(save_in, STDIN_FILENO);
+    (void)dup2(save_out, STDOUT_FILENO);
+    (void)dup2(save_err, STDERR_FILENO);
+    close(save_in); close(save_out); close(save_err);
+    close(in[1]); close(sv[0]);
+    en = read(err[0], ebuf, sizeof(ebuf) - 1);
+    on = read(out[0], obuf, sizeof(obuf));
+    close(err[0]); close(out[0]);
+    if (en < 0 || on < 0)
+        return -1;
+    ebuf[en] = 0;
+    return rc == 0 && on == 1 && obuf[0] == 'R' &&
+        strstr(ebuf, "[waiting: console1]") != NULL &&
+        strstr(ebuf, "[attached: console1]") != NULL ? 0 : -1;
 }
 
 static int check_filter(const uint8_t *in, size_t in_len, const uint8_t *want, size_t want_len, int want_detach)
@@ -228,6 +273,11 @@ static int test_progress_helpers(void)
     char out[64], bar[40];
     struct progress_state p;
     double eta;
+    int stderr_saved = -1, progress_pipe[2] = {-1, -1};
+    int master = -1, slave = -1;
+    char *slave_path;
+    char captured[64];
+    ssize_t captured_len;
 
     if (progress_percent(0, 100, 1) != 0 ||
         progress_percent(50, 100, 1) != 50 ||
@@ -270,10 +320,64 @@ static int test_progress_helpers(void)
         return fail("known-size ETA");
     if (progress_eta_seconds(50, 100, 0.0, &eta) == 0)
         return fail("unknown ETA unavailable");
+    if (pipe(progress_pipe) < 0)
+        return fail("non-TTY progress pipe");
+    stderr_saved = dup(STDERR_FILENO);
+    if (stderr_saved < 0 || dup2(progress_pipe[1], STDERR_FILENO) < 0)
+        goto progress_setup_failed;
+    close(progress_pipe[1]);
+    progress_pipe[1] = -1;
     progress_init(&p, "PUT", 1, 100, 0);
-    if (p.tty)
-        return fail("non-TTY progress should not animate in selftest");
+    progress_update(&p, 50, 1);
+    fflush(stderr);
+    if (dup2(stderr_saved, STDERR_FILENO) < 0)
+        goto progress_setup_failed;
+    close(stderr_saved);
+    stderr_saved = -1;
+    captured_len = read(progress_pipe[0], captured, sizeof(captured));
+    close(progress_pipe[0]);
+    progress_pipe[0] = -1;
+    if (p.tty || captured_len != 0)
+        return fail("non-TTY progress should not animate");
+
+    master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (master < 0 || grantpt(master) < 0 || unlockpt(master) < 0)
+        goto progress_setup_failed;
+    slave_path = ptsname(master);
+    if (!slave_path)
+        goto progress_setup_failed;
+    slave = open(slave_path, O_RDWR | O_NOCTTY);
+    stderr_saved = dup(STDERR_FILENO);
+    if (slave < 0 || stderr_saved < 0 ||
+        dup2(slave, STDERR_FILENO) < 0)
+        goto progress_setup_failed;
+    progress_init(&p, "PUT", 1, 100, 0);
+    if (dup2(stderr_saved, STDERR_FILENO) < 0)
+        goto progress_setup_failed;
+    close(stderr_saved);
+    stderr_saved = -1;
+    close(slave);
+    slave = -1;
+    close(master);
+    master = -1;
+    if (!p.tty)
+        return fail("TTY progress output not detected");
     return 0;
+
+progress_setup_failed:
+    if (stderr_saved >= 0) {
+        (void)dup2(stderr_saved, STDERR_FILENO);
+        close(stderr_saved);
+    }
+    if (progress_pipe[0] >= 0)
+        close(progress_pipe[0]);
+    if (progress_pipe[1] >= 0)
+        close(progress_pipe[1]);
+    if (slave >= 0)
+        close(slave);
+    if (master >= 0)
+        close(master);
+    return fail("progress fd setup");
 }
 
 int main(void)
@@ -327,10 +431,14 @@ int main(void)
         return fail("attached console label");
     if (capture_stderr(term_print_attached, "/tmp/x.sock", "[attached: /tmp/x.sock]\r\n") < 0)
         return fail("attached socket label");
+    if (capture_stderr(term_print_waiting, "console1", "[waiting: console1]\r\n") < 0)
+        return fail("waiting console label");
     if (capture_stderr(term_print_disconnected, "console1", "[disconnected: console1]") < 0)
         return fail("disconnected console label");
     if (test_term_disconnected_loop() < 0)
         return fail("term EOF disconnected label");
+    if (test_term_attached_after_remote_data() < 0)
+        return fail("term remote attachment evidence");
     if (capture_cmd_connect_failure("/tmp/lmux-client-test-no-such.sock",
                                     "lmux term: /tmp/lmux-client-test-no-such.sock: connect:") < 0)
         return fail("term connect failure identity");

@@ -45,6 +45,21 @@ static const char *yesno(int v)
     return v ? "yes" : "no";
 }
 
+static void bounded_hex(char *out, size_t out_cap,
+                        const uint8_t *data, size_t len)
+{
+    static const char hex[] = "0123456789abcdef";
+    size_t i, max = out_cap ? (out_cap - 1) / 2 : 0;
+    if (len > max)
+        len = max;
+    for (i = 0; i < len; i++) {
+        out[i * 2] = hex[data[i] >> 4];
+        out[i * 2 + 1] = hex[data[i] & 15];
+    }
+    if (out_cap)
+        out[len * 2] = '\0';
+}
+
 static void control_write_all(int fd, const char *buf, size_t len);
 static void control_printf(struct v2_host *h, const char *fmt, ...);
 static int exec_queue_record(struct v2_host *h, uint8_t type, uint8_t status,
@@ -414,7 +429,7 @@ static int queue_rollback_deploy(struct v2_app *a, struct v2_host *h)
     return queue_boot_request_body(a, h, LMUX_BOOT_ROLLBACK, body, len);
 }
 
-static int desired_reconciled(const struct v2_host *h)
+int v2_host_desired_reconciled(const struct v2_host *h)
 {
     int i;
     if (!h->desired_sent)
@@ -537,6 +552,42 @@ void v2_host_control_accept(struct v2_host *h)
     h->control_in_len = 0;
 }
 
+void v2_host_control_carrier_result(struct v2_host *h, const char *line)
+{
+    if (h->carrier_control_fd >= 0 && line)
+        control_write_all(h->carrier_control_fd, line, strlen(line));
+    v2_host_close_fd(&h->carrier_control_fd);
+    h->carrier_switch_waiting = 0;
+}
+
+static void control_detach_carrier_client(struct v2_host *h, int waiting)
+{
+    v2_host_close_fd(&h->carrier_control_fd);
+    h->carrier_control_fd = h->control_fd;
+    h->control_fd = -1;
+    h->control_in_len = 0;
+    h->carrier_switch_waiting = waiting;
+}
+
+void v2_host_control_carrier_service(struct v2_host *h, short revents)
+{
+    uint8_t discard[64];
+    ssize_t r;
+    if (h->carrier_control_fd < 0)
+        return;
+    r = read(h->carrier_control_fd, discard, sizeof(discard));
+    if (r < 0 && errno == EINTR)
+        return;
+    if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
+        !(revents & (POLLHUP | POLLERR | POLLNVAL)))
+        return;
+    /* The request line is complete before this fd is detached.  Further
+     * input is invalid, and EOF means the waiting CLI went away; neither
+     * event cancels the daemon-owned handover state machine. */
+    v2_host_close_fd(&h->carrier_control_fd);
+    h->carrier_switch_waiting = 2;
+}
+
 static void write_host_services(struct v2_host *h)
 {
     int i, j;
@@ -618,6 +669,150 @@ void v2_host_status_write(struct v2_app *a, struct v2_host *h,
                    st->carrier->open_count, st->carrier->lost_count,
                    st->carrier->open_fail_count, st->carrier->rx_bytes,
                    st->carrier->tx_bytes);
+    if (st->carriers) {
+        int endpoint_id;
+        const struct lmux_carrier_endpoint *active =
+            lmux_carrier_manager_active_endpoint_const(st->carriers);
+        control_printf(h, "carrier_manager: active=%s generation=%llu mode=%s max_endpoints=%u\n",
+                       active ? active->name : "-",
+                       (unsigned long long)st->carriers->generation,
+                       active ? lmux_carrier_mode_name(active->mode) : "-",
+                       (unsigned)LMUX_CARRIER_MAX_ENDPOINTS);
+        for (endpoint_id = 0;
+             endpoint_id < LMUX_CARRIER_MAX_ENDPOINTS; endpoint_id++) {
+            const struct lmux_carrier_endpoint *ep =
+                lmux_carrier_manager_at_const(st->carriers,
+                                              (unsigned)endpoint_id);
+            if (!ep)
+                continue;
+            const struct lmux_carrier *c = &ep->carrier;
+            control_printf(h,
+                           "carrier_endpoint: name=%s type=%s configured=%s active=%s mode=%s state=%s console_released=%s protocol_failed=%s fd=%d path=%s baud=%u rtscts=%s tty_policy=%s opens=%llu lost=%llu open_fail=%llu last_errno=%d tty_error_stage=%s tty_syscall_errno=%d tty_validation_mismatch=0x%x exclusive_requested=%s exclusive_acquired=%s standby_rx_bytes=%llu standby_discard_events=%llu\n",
+                           ep->name, lmux_carrier_type_name(ep),
+                           yesno(ep->configured &&
+                                 lmux_carrier_is_configured(c)),
+                           yesno(lmux_carrier_manager_is_active(st->carriers,
+                                                                ep)),
+                           lmux_carrier_mode_name(ep->mode),
+                           lmux_carrier_endpoint_state_name(
+                               lmux_carrier_endpoint_state(ep)),
+                           yesno(st->carrier_console_hold_mask &
+                                 (1u << endpoint_id)),
+                           yesno(st->carrier_failure_hold_mask &
+                                 (1u << endpoint_id)),
+                           lmux_carrier_fd(c),
+                           c->path ? c->path : "-",
+                           c->serial.baud,
+                           yesno(c->serial.flow == LMUX_SERIAL_FLOW_RTSCTS),
+                           lmux_tty_policy_name(c->tty_policy),
+                           c->open_count, c->lost_count, c->open_fail_count,
+                           c->last_errno,
+                           lmux_tty_config_stage_name(
+                               c->tty_diagnostic.stage),
+                           c->tty_diagnostic.syscall_errno,
+                           c->tty_diagnostic.validation_mismatch,
+                           yesno(c->exclusive_requested),
+                           yesno(c->exclusive_acquired),
+                           ep->standby_rx_bytes,
+                           ep->standby_discard_events);
+        }
+    }
+    control_printf(h,
+                   "carrier_switch: phase=%s pending=%s committed_but_down=%s last_error=%s\n",
+                   st->carrier_switch_phase ? st->carrier_switch_phase : "idle",
+                   st->carrier_switch_name ? st->carrier_switch_name : "-",
+                   yesno(st->carrier_committed_but_down),
+                   st->carrier_last_error ? st->carrier_last_error : "-");
+    control_printf(h, "carrier_console: state=%s endpoint=%s held_mask=0x%x\n",
+                   st->carrier_console_state ? st->carrier_console_state : "idle",
+                   st->carrier_console_name ? st->carrier_console_name : "-",
+                   st->carrier_console_hold_mask);
+    if (st->dirty) {
+        const struct lmux_dirty *d = st->dirty;
+        char invalid_hex[LMUX_DIRTY_DIAG_SAMPLE_MAX * 2 + 1];
+        char foreign_hex[LMUX_DIRTY_DIAG_SAMPLE_MAX * 2 + 1];
+        bounded_hex(invalid_hex, sizeof(invalid_hex),
+                    d->diagnostic.last_invalid_sample,
+                    d->diagnostic.last_invalid_sample_len);
+        bounded_hex(foreign_hex, sizeof(foreign_hex),
+                    d->diagnostic.last_foreign_sample,
+                    d->diagnostic.last_foreign_sample_len);
+        control_printf(h,
+            "carrier_dirty: state=%s local_session=%llu peer_session=%llu tx_next=%u rx_next=%u valid_records=%llu invalid_records=%llu foreign_bytes=%llu data_fragments=%llu delivered_packets=%llu packet_crc_failures=%llu retransmitted_fragments=%llu ack_sent=%llu ack_received=%llu nack_sent=%llu nack_received=%llu duplicate_drops=%llu stale_drops=%llu retry_failures=%llu deadline_failures=%llu last_failure=%s\n",
+            lmux_dirty_failed(d) ? "failed" : "active",
+            (unsigned long long)d->local_session_id,
+            (unsigned long long)d->peer_session_id,
+            d->tx_next_seq, d->rx_next_seq,
+            (unsigned long long)d->stats.valid_records,
+            (unsigned long long)d->stats.invalid_records,
+            (unsigned long long)d->stats.foreign_bytes,
+            (unsigned long long)d->stats.data_fragments,
+            (unsigned long long)d->stats.delivered_packets,
+            (unsigned long long)d->stats.packet_crc_failures,
+            (unsigned long long)d->stats.retransmitted_fragments,
+            (unsigned long long)d->stats.ack_sent,
+            (unsigned long long)d->stats.ack_received,
+            (unsigned long long)d->stats.nack_sent,
+            (unsigned long long)d->stats.nack_received,
+            (unsigned long long)d->stats.duplicate_fragments,
+            (unsigned long long)d->stats.stale_records,
+            (unsigned long long)d->stats.retry_failures,
+            (unsigned long long)d->stats.deadline_failures,
+            lmux_dirty_fail_reason_name(d->fail_reason));
+        control_printf(h,
+            "carrier_dirty_rxdiag: parser=%s partial_len=%u saw_cr=%s foreign_runs=%llu last_foreign_ms=%llu foreign_sample=%s last_valid_ms=%llu last_valid_type=%u last_valid_session=%llu last_valid_seq=%u last_valid_frag=%u/%u last_valid_wire_len=%u last_valid_hash=%08x\n",
+            d->parser.in_record ? "record" :
+                (d->parser.prefix_match ? "prefix" : "outside"),
+            (unsigned)d->parser.body_len, yesno(d->parser.saw_cr),
+            (unsigned long long)d->diagnostic.foreign_runs,
+            (unsigned long long)d->diagnostic.last_foreign_ms,
+            foreign_hex[0] ? foreign_hex : "-",
+            (unsigned long long)d->diagnostic.last_valid_ms,
+            (unsigned)d->diagnostic.last_valid_type,
+            (unsigned long long)d->diagnostic.last_valid_session_id,
+            d->diagnostic.last_valid_packet_seq,
+            (unsigned)d->diagnostic.last_valid_fragment_index,
+            (unsigned)d->diagnostic.last_valid_fragment_count,
+            (unsigned)d->diagnostic.last_valid_wire_len,
+            d->diagnostic.last_valid_wire_hash);
+        control_printf(h,
+            "carrier_dirty_invalid: last_ms=%llu reason=%s wire_len=%u offset=%u hash=%08x sample=%s\n",
+            (unsigned long long)d->diagnostic.last_invalid_ms,
+            lmux_dirty_parse_reason_name(
+                d->diagnostic.last_invalid_reason),
+            (unsigned)d->diagnostic.last_invalid_wire_len,
+            (unsigned)d->diagnostic.last_invalid_offset,
+            d->diagnostic.last_invalid_wire_hash,
+            invalid_hex[0] ? invalid_hex : "-");
+        control_printf(h,
+            "carrier_dirty_invalid_counts: invalid_restart=%llu invalid_terminator=%llu invalid_early_lf=%llu invalid_alphabet=%llu invalid_oversize=%llu invalid_base64=%llu\n",
+            (unsigned long long)d->diagnostic.invalid_reason[
+                LMUX_DIRTY_PARSE_RESTART_PREFIX],
+            (unsigned long long)d->diagnostic.invalid_reason[
+                LMUX_DIRTY_PARSE_BAD_TERMINATOR],
+            (unsigned long long)d->diagnostic.invalid_reason[
+                LMUX_DIRTY_PARSE_EARLY_LF],
+            (unsigned long long)d->diagnostic.invalid_reason[
+                LMUX_DIRTY_PARSE_BAD_ALPHABET],
+            (unsigned long long)d->diagnostic.invalid_reason[
+                LMUX_DIRTY_PARSE_OVERSIZE],
+            (unsigned long long)d->diagnostic.invalid_reason[
+                LMUX_DIRTY_PARSE_BASE64]);
+        control_printf(h,
+            "carrier_dirty_invalid_counts_more: invalid_canonical=%llu invalid_header=%llu invalid_length=%llu invalid_record_crc=%llu invalid_semantic=%llu invalid_fragment_crc=%llu\n",
+            (unsigned long long)d->diagnostic.invalid_reason[
+                LMUX_DIRTY_PARSE_CANONICAL],
+            (unsigned long long)d->diagnostic.invalid_reason[
+                LMUX_DIRTY_PARSE_HEADER],
+            (unsigned long long)d->diagnostic.invalid_reason[
+                LMUX_DIRTY_PARSE_LENGTH],
+            (unsigned long long)d->diagnostic.invalid_reason[
+                LMUX_DIRTY_PARSE_RECORD_CRC],
+            (unsigned long long)d->diagnostic.invalid_reason[
+                LMUX_DIRTY_PARSE_SEMANTIC],
+            (unsigned long long)d->diagnostic.invalid_reason[
+                LMUX_DIRTY_PARSE_FRAGMENT_CRC]);
+    }
     if (st->outer) {
         control_printf(h, "outer: %s local_conn=%llu peer_conn=%llu tx_seq=%llu rx_expected_seq=%llu tx_frames=%llu rx_frames=%llu crc_errors=%llu seq_errors=%llu resync_drops=%llu protocol_errors=%llu tx_payload_max=%u transport_tx_bytes=%llu transport_rx_bytes=%llu last_error=%s\n",
                        lmux_link_state_name(st->outer->state),
@@ -674,6 +869,19 @@ void v2_host_status_write(struct v2_app *a, struct v2_host *h,
     control_printf(h, "stream_counters: opens=%llu closes=%llu resets=%llu\n",
                    st->stream_open_count, st->stream_close_count,
                    st->stream_reset_count);
+    control_printf(h,
+                   "structured_exec_control: active=%s phase=%d op=%u queue=%d poll_next=%d stream=%llu retiring_stream=%llu transactions=%llu completions=%llu auto_status=%llu retirements=%llu retire_wait_ticks=%llu\n",
+                   yesno(h->exec_active), h->exec_phase,
+                   (unsigned)h->structured_control_op.kind,
+                   h->structured_control_queue_len,
+                   h->structured_exec_poll_next,
+                   (unsigned long long)h->exec_control_stream,
+                   (unsigned long long)h->exec_retiring_control_stream,
+                   h->structured_control_transactions,
+                   h->structured_control_completions,
+                   h->structured_control_autopolls,
+                   h->structured_control_retirements,
+                   h->structured_control_retire_wait_ticks);
     control_printf(h, "flow: conn_tx=%llu peer_max_data=%llu conn_rx=%llu conn_consumed=%llu local_max_data=%llu last_max_data_sent=%llu dirty=%s outq=%zu\n",
                    (unsigned long long)st->conn->conn_send_offset,
                    (unsigned long long)st->conn->peer_max_data,
@@ -733,9 +941,94 @@ static void control_handle_line(struct v2_app *a, struct v2_host *h,
     struct v2_host_service *s;
     if (sscanf(line, "%15s", cmd) != 1)
         return;
+    if (h->carrier_switch_waiting != 0 && strcmp(cmd, "STATUS") != 0 &&
+        strcmp(cmd, "CARRIER") != 0) {
+        (void)write(h->control_fd, "ERR busy\n", 9);
+        v2_host_close_fd(&h->control_fd);
+        return;
+    }
     if (strcmp(cmd, "STATUS") == 0) {
         v2_host_status_write(a, h, st);
         v2_host_close_fd(&h->control_fd);
+    } else if (strcmp(cmd, "CARRIER") == 0) {
+        char action[16], carrier[LMUX_CARRIER_NAME_MAX + 1], mode[16];
+        unsigned timeout_ms = 30000;
+        int parsed = sscanf(line, "%*s %15s %31s %15s %u",
+                            action, carrier, mode, &timeout_ms);
+        int file_busy = h->structured_file_active;
+        int i;
+        if (parsed >= 1 && strcmp(action, "STATUS") == 0) {
+            v2_host_status_write(a, h, st);
+            v2_host_close_fd(&h->control_fd);
+            return;
+        }
+        if (h->carrier_switch_waiting) {
+            (void)write(h->control_fd, "ERR CARRIER BUSY switch-active\n", 31);
+            v2_host_close_fd(&h->control_fd);
+            return;
+        }
+        if (parsed == 2 && strcmp(action, "CONSOLE") == 0) {
+            char error[64];
+            int rc = v2_runtime_carrier_console_start(a, carrier, error,
+                                                       sizeof(error));
+            if (rc < 0) {
+                control_printf(h, "ERR CARRIER CONSOLE %s\n", error);
+                v2_host_close_fd(&h->control_fd);
+            } else {
+                control_detach_carrier_client(h, 3);
+            }
+            return;
+        }
+        for (i = 0; i < V2_MAX_SERVICES; i++) {
+            const struct v2_host_service *hs = &h->services[i];
+            if (hs->used && hs->type == V2_SERVICE_FILE &&
+                (hs->pending_fd >= 0 ||
+                 v2_host_service_has_active_binding(hs)))
+                file_busy = 1;
+        }
+        if (parsed < 3 || strcmp(action, "SWITCH") != 0 ||
+            timeout_ms < 1000 || timeout_ms > 120000) {
+            (void)write(h->control_fd, "ERR CARRIER bad-request\n", 24);
+            v2_host_close_fd(&h->control_fd);
+            return;
+        }
+        if (strcmp(mode, "raw") != 0 && strcmp(mode, "dirty") != 0) {
+            (void)write(h->control_fd, "ERR CARRIER bad-mode\n", 21);
+            v2_host_close_fd(&h->control_fd);
+            return;
+        }
+        if (h->boot_pending || h->boot_upload_active || h->deploy_active) {
+            (void)write(h->control_fd, "ERR CARRIER BUSY boot-or-deploy\n", 32);
+            v2_host_close_fd(&h->control_fd);
+            return;
+        }
+        if (file_busy) {
+            (void)write(h->control_fd, "ERR CARRIER BUSY file-active\n", 29);
+            v2_host_close_fd(&h->control_fd);
+            return;
+        }
+        {
+            char error[64];
+            enum lmux_carrier_mode requested =
+                strcmp(mode, "dirty") == 0 ? LMUX_CARRIER_MODE_DIRTY :
+                LMUX_CARRIER_MODE_RAW;
+            int rc = v2_runtime_carrier_switch_start(a, carrier,
+                                                      requested,
+                                                      timeout_ms, error,
+                                                      sizeof(error));
+            if (rc > 0) {
+                control_printf(h,
+                               "OK CARRIER active=%s mode=%s generation=%llu\n",
+                               carrier, mode,
+                               (unsigned long long)st->carriers->generation);
+                v2_host_close_fd(&h->control_fd);
+            } else if (rc < 0) {
+                control_printf(h, "ERR CARRIER %s\n", error);
+                v2_host_close_fd(&h->control_fd);
+            } else {
+                control_detach_carrier_client(h, 1);
+            }
+        }
     } else if (strcmp(cmd, "WINSIZE") == 0) {
         if (sscanf(line, "%*s %31s %u %u %u %u", name, &rows, &cols, &xp, &yp) < 3) {
             (void)write(h->control_fd, "ERR bad WINSIZE\n", 16);
@@ -1433,8 +1726,11 @@ static void exec_finish_done(struct v2_host *h)
 
 static void exec_close_lmux_streams(struct v2_app *a, struct v2_host *h)
 {
-    if (h->exec_control_stream)
+    if (h->exec_control_stream) {
         (void)v2_runtime_close_stream(a, h->exec_control_stream);
+        h->exec_retiring_control_stream = h->exec_control_stream;
+        h->structured_control_retirements++;
+    }
     if (h->exec_stdin_stream)
         (void)v2_runtime_close_stream(a, h->exec_stdin_stream);
     if (h->exec_stdout_stream)
@@ -1629,7 +1925,8 @@ static void exec_handle_record(struct v2_app *a, struct v2_host *h,
             if (se) {
                 se->exec_id = r->exec_id;
                 se->status_pending = 0;
-                se->next_status_ms = v2_now_ms() + 100;
+                se->next_status_ms = v2_now_ms() +
+                    V2_HOST_STRUCTURED_EXEC_POLL_MS;
             }
             if (h->exec_structured) {
                 (void)exec_queue_structured_state(h, LMUX_HC2_EXEC_STARTED,
@@ -1852,6 +2149,17 @@ static void exec_tick(struct v2_app *a, struct v2_host *h,
 {
     struct v2_host_service *s;
     (void)st;
+    if (h->exec_retiring_control_stream) {
+        int cs = v2_runtime_stream_state(a,
+                                         h->exec_retiring_control_stream);
+        if (cs == LMUX2_STREAM_TERMINAL || cs == LMUX2_STREAM_RESET ||
+            cs == LMUX2_STREAM_UNUSED) {
+            h->exec_retiring_control_stream = 0;
+        } else {
+            h->structured_control_retire_wait_ticks++;
+            return;
+        }
+    }
     if (!h->exec_active)
         return;
     if (!v2_runtime_lmux_established(a)) {
@@ -2037,7 +2345,7 @@ void v2_host_control_tick(struct v2_app *a, struct v2_host *h,
             control_printf(h, "fresh LMUX established\n");
     }
     if (h->deploy_phase == DEPLOY_WAIT_RECONCILIATION) {
-        if (!desired_reconciled(h))
+        if (!v2_host_desired_reconciled(h))
             return;
         h->deploy_phase = DEPLOY_VERIFY_TESTING;
         if (!h->deploy_reported_reconciled &&
@@ -2059,7 +2367,7 @@ void v2_host_control_tick(struct v2_app *a, struct v2_host *h,
             control_printf(h, "fresh supervisor LMUX established\n");
     }
     if (h->deploy_phase == DEPLOY_WAIT_RESTART_RECONCILIATION) {
-        if (!desired_reconciled(h))
+        if (!v2_host_desired_reconciled(h))
             return;
         h->deploy_phase = DEPLOY_VERIFY_POST_RESTART;
         if (h->control_fd >= 0 && !h->boot_control_gone)

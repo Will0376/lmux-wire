@@ -265,6 +265,7 @@ void v2_host_init(struct v2_host *h)
     memset(h, 0, sizeof(*h));
     h->control_listen_fd = -1;
     h->control_fd = -1;
+    h->carrier_control_fd = -1;
     h->structured_listen_fd = -1;
     h->structured_fd = -1;
     h->structured_next_ref = 1;
@@ -317,6 +318,7 @@ void v2_host_cleanup(struct v2_host *h)
         if (h->services[i].used)
             v2_host_service_cleanup(&h->services[i]);
     v2_host_close_fd(&h->control_fd);
+    v2_host_close_fd(&h->carrier_control_fd);
     v2_host_close_fd(&h->control_listen_fd);
     if (h->control_path)
         unlink(h->control_path);

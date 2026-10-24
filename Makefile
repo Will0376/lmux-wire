@@ -34,14 +34,15 @@ LXF_HDR := $(SRC_DIR)/lxf.h
 LMUXD := $(RUNTIME_DIR)/lmuxd.c
 COMMON_SRC := $(TRANSPORT_DIR)/protocol.c $(LXF_SRC)
 LMUX2_SRC := $(TRANSPORT_DIR)/lmux2_protocol.c $(TRANSPORT_DIR)/lmux2_core.c $(TRANSPORT_DIR)/lmux2_control.c
-CARRIER_SRC := $(CARRIER_DIR)/carrier.c $(CARRIER_DIR)/carrier_tty.c $(CARRIER_DIR)/carrier_fd.c $(CARRIER_DIR)/carrier_unix.c
+CARRIER_SRC := $(CARRIER_DIR)/carrier.c $(CARRIER_DIR)/carrier_tty.c $(CARRIER_DIR)/carrier_fd.c $(CARRIER_DIR)/carrier_unix.c $(CARRIER_DIR)/carrier_dispatch.c $(CARRIER_DIR)/dispatch_ipc.c $(CARRIER_DIR)/carrier_manager.c $(CARRIER_DIR)/lmc1.c $(CARRIER_DIR)/dirty.c
+DISPATCHER_SRC := $(RUNTIME_DIR)/lmux_uart_dispatch.c $(CARRIER_DIR)/dispatcher.c $(CARRIER_DIR)/dispatch_ipc.c $(CARRIER_DIR)/dirty.c $(TRANSPORT_DIR)/protocol.c $(LINK_DIR)/link_protocol.c
 SERVICES_SRC := $(SERVICES_DIR)/services.c $(SERVICES_DIR)/service_pty.c $(SERVICES_DIR)/service_unix.c $(SERVICES_DIR)/service_file.c $(SERVICES_DIR)/service_exec.c
 HOST_SUBSYS_SRC := $(HOST_SUBSYS_DIR)/host_services.c $(HOST_SUBSYS_DIR)/host_endpoints.c $(HOST_SUBSYS_DIR)/host_control.c $(HOST_SUBSYS_DIR)/host_control_structured.c $(HOST_SUBSYS_DIR)/host_link.c
 ZEROMUX_SRC := $(ZEROMUX_DIR)/zeromux.c $(ZEROMUX_DIR)/session.c $(ZEROMUX_DIR)/probe.c $(ZEROMUX_DIR)/sender.c $(ZEROMUX_DIR)/sender_uudecode.c $(ZEROMUX_DIR)/install.c
 SUPERVISOR_SRC := $(SUPERVISOR_DIR)/supervisor.c $(SUPERVISOR_DIR)/supervisor_worker.c $(SUPERVISOR_DIR)/supervisor_proxy.c $(SUPERVISOR_DIR)/supervisor_link.c $(SUPERVISOR_DIR)/supervisor_storage.c
 LINK_SRC := $(LINK_DIR)/link_protocol.c $(LINK_DIR)/link_endpoint.c $(LINK_DIR)/boot_protocol.c
 LMUX2_RUNTIME_SRC := $(RUNTIME_DIR)/lmux2_runtime.c
-CARRIER_HDRS := $(CARRIER_DIR)/carrier.h
+CARRIER_HDRS := $(CARRIER_DIR)/carrier.h $(CARRIER_DIR)/carrier_manager.h $(CARRIER_DIR)/lmc1.h $(CARRIER_DIR)/dirty.h $(CARRIER_DIR)/dispatch_ipc.h $(CARRIER_DIR)/dispatcher.h
 TRANSPORT_HDRS := $(TRANSPORT_DIR)/lmux.h $(TRANSPORT_DIR)/lmux2_protocol.h $(TRANSPORT_DIR)/lmux2_core.h $(TRANSPORT_DIR)/lmux2_control.h $(TRANSPORT_DIR)/lmux2_service.h
 SERVICES_HDRS := $(SERVICES_DIR)/services.h
 HOST_SUBSYS_HDRS := $(HOST_SUBSYS_DIR)/host.h $(HOST_SUBSYS_DIR)/host_control_structured.h
@@ -53,6 +54,8 @@ TEST_PROTOCOL := $(UNIT_TEST_DIR)/test_protocol.c
 TEST_LMUX2 := $(UNIT_TEST_DIR)/test_lmux2.c
 TEST_LMUX_CLIENT := $(UNIT_TEST_DIR)/test_lmux_client.c
 TEST_CARRIER := $(UNIT_TEST_DIR)/test_carrier.c
+TEST_DIRTY := $(UNIT_TEST_DIR)/test_dirty.c
+TEST_DISPATCHER := $(UNIT_TEST_DIR)/test_dispatcher.c
 TEST_SUPERVISOR := $(UNIT_TEST_DIR)/test_supervisor.c
 TEST_LINK := $(UNIT_TEST_DIR)/test_link.c
 TEST_ZEROMUX := $(UNIT_TEST_DIR)/test_zeromux.c
@@ -60,21 +63,126 @@ TEST_LMUX2_INTEGRATION := $(INTEGRATION_TEST_DIR)/test_lmux2_integration.c
 TEST_LMUX2_PTY_INTEGRATION := $(INTEGRATION_TEST_DIR)/test_lmux2_pty_integration.c
 TEST_LMUX2_FILE_INTEGRATION := $(INTEGRATION_TEST_DIR)/test_lmux2_file_integration.c
 TEST_SUPERVISOR_INTEGRATION := $(INTEGRATION_TEST_DIR)/test_supervisor_integration.c
+TEST_DIRTY_INTEGRATION := $(INTEGRATION_TEST_DIR)/test_dirty_integration.c
+TEST_DISPATCHER_INTEGRATION := $(INTEGRATION_TEST_DIR)/test_dispatcher_integration.c
 GO_SRC := go.mod $(shell find cmd internal -name '*.go' 2>/dev/null)
-VERSION_INPUTS := VERSION Makefile $(LMUX) $(LMUXD) $(TRANSPORT_HDRS) $(CARRIER_HDRS) $(SERVICES_HDRS) $(HOST_SUBSYS_HDRS) $(ZEROMUX_HDRS) $(SUPERVISOR_HDRS) $(LINK_HDRS) $(LXF_SRC) $(LXF_HDR) $(COMMON_SRC) $(LMUX2_SRC) $(CARRIER_SRC) $(SERVICES_SRC) $(HOST_SUBSYS_SRC) $(ZEROMUX_SRC) $(SUPERVISOR_SRC) $(LINK_SRC) $(LMUX2_RUNTIME_SRC) $(RUNTIME_HDRS) $(TEST_PROTOCOL) $(TEST_LMUX2) $(TEST_CARRIER) $(TEST_SUPERVISOR) $(TEST_LINK) $(TEST_ZEROMUX) $(TEST_LMUX2_INTEGRATION) $(TEST_LMUX2_PTY_INTEGRATION) $(TEST_LMUX2_FILE_INTEGRATION) $(TEST_SUPERVISOR_INTEGRATION) $(TEST_LMUX_CLIENT)
+VERSION_INPUTS := VERSION Makefile $(LMUX) $(LMUXD) $(DISPATCHER_SRC) $(TRANSPORT_HDRS) $(CARRIER_HDRS) $(SERVICES_HDRS) $(HOST_SUBSYS_HDRS) $(ZEROMUX_HDRS) $(SUPERVISOR_HDRS) $(LINK_HDRS) $(LXF_SRC) $(LXF_HDR) $(COMMON_SRC) $(LMUX2_SRC) $(CARRIER_SRC) $(SERVICES_SRC) $(HOST_SUBSYS_SRC) $(ZEROMUX_SRC) $(SUPERVISOR_SRC) $(LINK_SRC) $(LMUX2_RUNTIME_SRC) $(RUNTIME_HDRS) $(TEST_PROTOCOL) $(TEST_LMUX2) $(TEST_CARRIER) $(TEST_DIRTY) $(TEST_DISPATCHER) $(TEST_SUPERVISOR) $(TEST_LINK) $(TEST_ZEROMUX) $(TEST_LMUX2_INTEGRATION) $(TEST_LMUX2_PTY_INTEGRATION) $(TEST_LMUX2_FILE_INTEGRATION) $(TEST_SUPERVISOR_INTEGRATION) $(TEST_DIRTY_INTEGRATION) $(TEST_DISPATCHER_INTEGRATION) $(TEST_LMUX_CLIENT)
 
-.PHONY: all host target strip-target clean selftest new-build bump-version go-test
+UNIT_TEST_BINS := $(HOST_DIR)/test_protocol $(HOST_DIR)/test_lmux2 $(HOST_DIR)/test_carrier $(HOST_DIR)/test_dirty $(HOST_DIR)/test_dispatcher $(HOST_DIR)/test_supervisor $(HOST_DIR)/test_link $(HOST_DIR)/test_zeromux $(HOST_DIR)/test_lmux_client
+PROCESS_TEST_BINS := $(HOST_DIR)/test_lmux2_integration $(HOST_DIR)/test_lmux2_pty_integration $(HOST_DIR)/test_lmux2_file_integration $(HOST_DIR)/test_supervisor_integration $(HOST_DIR)/test_dirty_integration $(HOST_DIR)/test_dispatcher_integration
+CARRIER_PROCESS_DEPS := $(HOST_DIR)/lmuxd $(HOST_DIR)/lmux $(HOST_DIR)/test_supervisor_integration $(HOST_DIR)/test_dirty_integration
+
+SOAK_RUNS ?= 1
+CARRIER_SOAK_RUNS ?= 5
+
+.PHONY: all host target strip-target clean selftest new-build bump-version go-test test-unit test-dirty test-dispatcher test-carrier test-carrier-switch test-structured-dirty test-carrier-soak test-usb-regression test-lifecycle test-services test-soak verify-release
 
 all: host target
 
-host: $(HOST_DIR)/lmuxd $(HOST_DIR)/lmux $(HOST_DIR)/lmux-mcp $(HOST_DIR)/test_protocol $(HOST_DIR)/test_lmux2 $(HOST_DIR)/test_carrier $(HOST_DIR)/test_supervisor $(HOST_DIR)/test_link $(HOST_DIR)/test_zeromux $(HOST_DIR)/test_lmux2_integration $(HOST_DIR)/test_lmux2_pty_integration $(HOST_DIR)/test_lmux2_file_integration $(HOST_DIR)/test_supervisor_integration $(HOST_DIR)/test_lmux_client
+host: $(HOST_DIR)/lmuxd $(HOST_DIR)/lmux $(HOST_DIR)/lmux-uart-dispatch $(HOST_DIR)/lmux-mcp $(HOST_DIR)/test_protocol $(HOST_DIR)/test_lmux2 $(HOST_DIR)/test_carrier $(HOST_DIR)/test_dirty $(HOST_DIR)/test_dispatcher $(HOST_DIR)/test_supervisor $(HOST_DIR)/test_link $(HOST_DIR)/test_zeromux $(HOST_DIR)/test_lmux2_integration $(HOST_DIR)/test_lmux2_pty_integration $(HOST_DIR)/test_lmux2_file_integration $(HOST_DIR)/test_supervisor_integration $(HOST_DIR)/test_dirty_integration $(HOST_DIR)/test_dispatcher_integration $(HOST_DIR)/test_lmux_client
 
-target: $(TARGET_DIR)/lmuxd $(TARGET_DIR)/lmux $(TARGET_DIR)/test_lmux2
+target: $(TARGET_DIR)/lmuxd $(TARGET_DIR)/lmux $(TARGET_DIR)/lmux-uart-dispatch $(TARGET_DIR)/test_lmux2
 
-selftest: $(HOST_DIR)/lmuxd $(HOST_DIR)/lmux $(HOST_DIR)/lmux-mcp $(HOST_DIR)/test_protocol $(HOST_DIR)/test_lmux2 $(HOST_DIR)/test_carrier $(HOST_DIR)/test_supervisor $(HOST_DIR)/test_link $(HOST_DIR)/test_zeromux $(HOST_DIR)/test_lmux2_integration $(HOST_DIR)/test_lmux2_pty_integration $(HOST_DIR)/test_lmux2_file_integration $(HOST_DIR)/test_supervisor_integration $(HOST_DIR)/test_lmux_client go-test
+test-unit: $(UNIT_TEST_BINS) go-test
 	$(HOST_DIR)/test_protocol
 	$(HOST_DIR)/test_lmux2
 	$(HOST_DIR)/test_carrier
+	$(HOST_DIR)/test_dirty
+	$(HOST_DIR)/test_dispatcher
+	$(HOST_DIR)/test_supervisor
+	$(HOST_DIR)/test_link
+	$(HOST_DIR)/test_zeromux
+	$(HOST_DIR)/test_lmux_client
+
+test-dirty: $(HOST_DIR)/test_dirty $(HOST_DIR)/test_dirty_integration
+	$(HOST_DIR)/test_dirty
+	$(HOST_DIR)/test_dirty_integration
+
+test-dispatcher: $(HOST_DIR)/lmuxd $(HOST_DIR)/lmux $(HOST_DIR)/lmux-uart-dispatch $(HOST_DIR)/test_dispatcher $(HOST_DIR)/test_dispatcher_integration $(HOST_DIR)/test_supervisor_integration
+	$(HOST_DIR)/test_dispatcher
+	$(HOST_DIR)/test_dispatcher_integration
+	env LMUX_SUP_IT_ONLY_DISPATCHER=1 $(HOST_DIR)/test_supervisor_integration
+
+test-carrier: $(HOST_DIR)/test_carrier $(HOST_DIR)/test_dirty $(HOST_DIR)/test_dispatcher $(HOST_DIR)/test_dispatcher_integration $(CARRIER_PROCESS_DEPS)
+	$(HOST_DIR)/test_carrier
+	$(HOST_DIR)/test_dirty
+	$(HOST_DIR)/test_dispatcher
+	$(HOST_DIR)/test_dispatcher_integration
+	env LMUX_SUP_IT_ONLY_DISPATCHER=1 $(HOST_DIR)/test_supervisor_integration
+	$(HOST_DIR)/test_dirty_integration
+	env LMUX_SUP_IT_ONLY_CARRIER_B1=1 $(HOST_DIR)/test_supervisor_integration
+	env LMUX_SUP_IT_ONLY_CARRIER_B2=1 $(HOST_DIR)/test_supervisor_integration
+	env LMUX_SUP_IT_ONLY_CARRIER_B4=1 $(HOST_DIR)/test_supervisor_integration
+	env LMUX_SUP_IT_ONLY_STRUCTURED_DIRTY=1 $(HOST_DIR)/test_supervisor_integration
+
+test-carrier-switch: $(CARRIER_PROCESS_DEPS)
+	env LMUX_SUP_IT_ONLY_CARRIER_B2=1 $(HOST_DIR)/test_supervisor_integration
+	env LMUX_SUP_IT_ONLY_CARRIER_B4=1 $(HOST_DIR)/test_supervisor_integration
+	env LMUX_SUP_IT_ONLY_STRUCTURED_DIRTY=1 $(HOST_DIR)/test_supervisor_integration
+
+test-structured-dirty: $(CARRIER_PROCESS_DEPS)
+	env LMUX_SUP_IT_ONLY_STRUCTURED_DIRTY=1 $(HOST_DIR)/test_supervisor_integration
+
+test-usb-regression: $(CARRIER_PROCESS_DEPS)
+	env LMUX_SUP_IT_ONLY_USB_REGRESSION=1 $(HOST_DIR)/test_supervisor_integration
+
+test-carrier-soak: $(CARRIER_PROCESS_DEPS)
+	@test "$(CARRIER_SOAK_RUNS)" -ge 1 2>/dev/null || { echo "CARRIER_SOAK_RUNS must be a positive integer" >&2; exit 2; }
+	@set -eu; i=1; while [ $$i -le "$(CARRIER_SOAK_RUNS)" ]; do \
+		echo "carrier switch soak $$i/$(CARRIER_SOAK_RUNS)"; \
+		$(HOST_DIR)/test_dirty_integration; \
+		env LMUX_SUP_IT_ONLY_CARRIER_B2=1 $(HOST_DIR)/test_supervisor_integration; \
+		env LMUX_SUP_IT_ONLY_CARRIER_B4=1 $(HOST_DIR)/test_supervisor_integration; \
+		i=$$((i + 1)); \
+	done
+
+test-lifecycle: $(HOST_DIR)/test_supervisor $(CARRIER_PROCESS_DEPS)
+	$(HOST_DIR)/test_supervisor
+	env LMUX_SUP_IT_ONLY_OUTER_FIRST_CONTACT_LOST_HELLO=1 LMUX_SUP_IT_OUTER_FIRST_CONTACT_TARGET_FIRST=1 $(HOST_DIR)/test_supervisor_integration
+	env LMUX_SUP_IT_ONLY_OUTER_FIRST_CONTACT_LOST_HELLO=1 LMUX_SUP_IT_OUTER_FIRST_CONTACT_TARGET_FIRST=0 $(HOST_DIR)/test_supervisor_integration
+	env LMUX_SUP_IT_ONLY_OUTER_FIRST_CONTACT_LOST_ACK=1 $(HOST_DIR)/test_supervisor_integration
+	env LMUX_SUP_IT_ONLY_OUTER_FAULT_SEQ_H2T=1 $(HOST_DIR)/test_supervisor_integration
+	env LMUX_SUP_IT_ONLY_STRUCTURED_RECONNECT=1 $(HOST_DIR)/test_supervisor_integration
+	env LMUX_SUP_IT_ONLY_STRUCTURED_WORKER=1 $(HOST_DIR)/test_supervisor_integration
+	env LMUX_SUP_IT_ONLY_STRUCTURED_DEPLOY=1 $(HOST_DIR)/test_supervisor_integration
+	env LMUX_SUP_IT_ONLY_INSTALL_RESTART_SHORTCUT=1 $(HOST_DIR)/test_supervisor_integration
+
+test-services: $(HOST_DIR)/lmuxd $(HOST_DIR)/lmux $(HOST_DIR)/lmux-mcp $(PROCESS_TEST_BINS) $(HOST_DIR)/test_lmux_client
+	$(HOST_DIR)/test_lmux_client
+	env LMUX_SUP_IT_ONLY_STREAM_BASIC=1 $(HOST_DIR)/test_supervisor_integration
+	env LMUX_SUP_IT_ONLY_STREAM_CLEANUP=1 $(HOST_DIR)/test_supervisor_integration
+	$(HOST_DIR)/test_lmux2_integration
+	$(HOST_DIR)/test_lmux2_pty_integration
+	$(HOST_DIR)/test_lmux2_file_integration
+	env LMUX_SUP_IT_ONLY_PRIVATE_EXEC=1 $(HOST_DIR)/test_supervisor_integration
+	env LMUX_SUP_IT_ONLY_STRUCTURED_CONTROL=1 $(HOST_DIR)/test_supervisor_integration
+	GOCACHE=$(GO_CACHE) $(GO) test ./internal/debug ./internal/gdbmi ./internal/hc2 ./internal/mcpapp
+	LMUX_MCP_IT=1 GOCACHE=$(GO_CACHE) $(GO) test ./cmd/lmux-mcp
+
+test-soak: test-carrier-soak $(CARRIER_PROCESS_DEPS)
+	@test "$(SOAK_RUNS)" -ge 1 2>/dev/null || { echo "SOAK_RUNS must be a positive integer" >&2; exit 2; }
+	@set -eu; i=1; while [ $$i -le "$(SOAK_RUNS)" ]; do \
+		echo "supervisor soak group $$i/$(SOAK_RUNS)"; \
+		env LMUX_SUP_IT_ONLY_PRIVATE_EXEC_EPIPE=1 $(HOST_DIR)/test_supervisor_integration; \
+		env LMUX_SUP_IT_ONLY_STRUCTURED_CONCURRENT=1 $(HOST_DIR)/test_supervisor_integration; \
+		env LMUX_SUP_IT_ONLY_STRUCTURED_MULTI_RECONNECT=1 $(HOST_DIR)/test_supervisor_integration; \
+		env LMUX_SUP_IT_ONLY_STRUCTURED_MULTI_WORKER=1 $(HOST_DIR)/test_supervisor_integration; \
+		env LMUX_SUP_IT_ONLY_LIFECYCLE_LOOP=1 $(HOST_DIR)/test_supervisor_integration; \
+		env LMUX_SUP_IT_ONLY_EXEC_LIFECYCLE=1 $(HOST_DIR)/test_supervisor_integration; \
+		env LMUX_SUP_IT_ONLY_FILE_WORKER=1 $(HOST_DIR)/test_supervisor_integration; \
+		env LMUX_SUP_IT_ONLY_MIXED_SOAK=1 $(HOST_DIR)/test_supervisor_integration; \
+		i=$$((i + 1)); \
+	done
+	GOCACHE=$(GO_CACHE) $(GO) test ./internal/debug -run 'TestRSPBridgeRepeatedBackpressureCycles|TestRSPBridgeFullDuplexBackpressureStress|TestDebugStartHeavyRSPBackpressureSucceeds' -count=1
+
+selftest: $(HOST_DIR)/lmuxd $(HOST_DIR)/lmux $(HOST_DIR)/lmux-uart-dispatch $(HOST_DIR)/lmux-mcp $(HOST_DIR)/test_protocol $(HOST_DIR)/test_lmux2 $(HOST_DIR)/test_carrier $(HOST_DIR)/test_dirty $(HOST_DIR)/test_dispatcher $(HOST_DIR)/test_supervisor $(HOST_DIR)/test_link $(HOST_DIR)/test_zeromux $(HOST_DIR)/test_lmux2_integration $(HOST_DIR)/test_lmux2_pty_integration $(HOST_DIR)/test_lmux2_file_integration $(HOST_DIR)/test_supervisor_integration $(HOST_DIR)/test_dirty_integration $(HOST_DIR)/test_dispatcher_integration $(HOST_DIR)/test_lmux_client go-test
+	$(HOST_DIR)/test_protocol
+	$(HOST_DIR)/test_lmux2
+	$(HOST_DIR)/test_carrier
+	$(HOST_DIR)/test_dirty
+	$(HOST_DIR)/test_dispatcher
+	$(HOST_DIR)/test_dispatcher_integration
+	$(HOST_DIR)/test_dirty_integration
 	$(HOST_DIR)/test_supervisor
 	$(HOST_DIR)/test_link
 	$(HOST_DIR)/test_zeromux
@@ -87,6 +195,19 @@ selftest: $(HOST_DIR)/lmuxd $(HOST_DIR)/lmux $(HOST_DIR)/lmux-mcp $(HOST_DIR)/te
 	grep -F -q "$$($(HOST_DIR)/lmux --version | sed 's/^lmux //' | sed 's/ (LMUX Wire)//')" $(GEN_DIR)/version.h
 	test "$$($(HOST_DIR)/lmux 2>&1 | sed -n '1p')" = "$$($(HOST_DIR)/lmux --version)"
 	test "$$($(HOST_DIR)/lmuxd 2>&1 | sed -n '1p')" = "$$($(HOST_DIR)/lmuxd --version)"
+
+verify-release:
+	@sh scripts/with-elapsed.sh verify-release sh -ec '\
+		sh -n start-host.sh; \
+		sh -n lmux-start-target.sh; \
+		sh -n scripts/gen-version.sh; \
+		git diff --check; \
+		$(MAKE) clean; \
+		$(MAKE) host; \
+		$(MAKE) selftest; \
+		GOCACHE=$(GO_CACHE) $(GO) test ./...; \
+		$(MAKE) target; \
+		$(MAKE) strip-target'
 
 $(HOST_DIR) $(TARGET_DIR) $(GEN_DIR):
 	mkdir -p $@
@@ -104,6 +225,9 @@ $(HOST_DIR)/lmuxd: $(LMUXD) $(COMMON_SRC) $(LMUX2_SRC) $(CARRIER_SRC) $(SERVICES
 $(HOST_DIR)/lmux: $(LMUX) $(COMMON_SRC) $(ZEROMUX_SRC) $(CARRIER_DIR)/carrier_tty.c $(TRANSPORT_DIR)/lmux.h $(LXF_HDR) $(ZEROMUX_HDRS) $(CARRIER_HDRS) $(GEN_VERSION) | $(HOST_DIR)
 	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(LMUX) $(COMMON_SRC) $(ZEROMUX_SRC) $(CARRIER_DIR)/carrier_tty.c
 
+$(HOST_DIR)/lmux-uart-dispatch: $(DISPATCHER_SRC) $(CARRIER_HDRS) $(GEN_VERSION) | $(HOST_DIR)
+	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(DISPATCHER_SRC)
+
 $(HOST_DIR)/lmux-mcp: $(GO_SRC) | $(HOST_DIR)
 	GOCACHE=$(GO_CACHE) $(GO) build -o $@ ./cmd/lmux-mcp
 
@@ -117,7 +241,13 @@ $(HOST_DIR)/test_lmux2: $(TEST_LMUX2) $(COMMON_SRC) $(LMUX2_SRC) $(TRANSPORT_HDR
 	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_LMUX2) $(COMMON_SRC) $(LMUX2_SRC)
 
 $(HOST_DIR)/test_carrier: $(TEST_CARRIER) $(CARRIER_SRC) $(CARRIER_HDRS) $(GEN_VERSION) | $(HOST_DIR)
-	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_CARRIER) $(CARRIER_SRC)
+	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_CARRIER) $(CARRIER_SRC) $(TRANSPORT_DIR)/protocol.c $(LINK_DIR)/link_protocol.c
+
+$(HOST_DIR)/test_dirty: $(TEST_DIRTY) $(CARRIER_DIR)/dirty.c $(CARRIER_DIR)/dirty.h $(GEN_VERSION) | $(HOST_DIR)
+	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_DIRTY) $(CARRIER_DIR)/dirty.c $(TRANSPORT_DIR)/protocol.c $(LINK_DIR)/link_protocol.c
+
+$(HOST_DIR)/test_dispatcher: $(TEST_DISPATCHER) $(CARRIER_DIR)/dispatcher.c $(CARRIER_DIR)/dispatch_ipc.c $(CARRIER_HDRS) $(GEN_VERSION) | $(HOST_DIR)
+	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_DISPATCHER) $(CARRIER_DIR)/dispatcher.c $(CARRIER_DIR)/dispatch_ipc.c
 
 $(HOST_DIR)/test_supervisor: $(TEST_SUPERVISOR) $(SUPERVISOR_DIR)/supervisor_proxy.c $(SUPERVISOR_DIR)/supervisor_worker.c $(SUPERVISOR_DIR)/supervisor_storage.c $(SUPERVISOR_HDRS) $(GEN_VERSION) | $(HOST_DIR)
 	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_SUPERVISOR) $(SUPERVISOR_DIR)/supervisor_proxy.c $(SUPERVISOR_DIR)/supervisor_worker.c $(SUPERVISOR_DIR)/supervisor_storage.c
@@ -137,8 +267,14 @@ $(HOST_DIR)/test_lmux2_pty_integration: $(TEST_LMUX2_PTY_INTEGRATION) $(GEN_VERS
 $(HOST_DIR)/test_lmux2_file_integration: $(TEST_LMUX2_FILE_INTEGRATION) $(COMMON_SRC) $(TRANSPORT_DIR)/lmux.h $(LXF_HDR) $(GEN_VERSION) | $(HOST_DIR)
 	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_LMUX2_FILE_INTEGRATION) $(COMMON_SRC)
 
-$(HOST_DIR)/test_supervisor_integration: $(TEST_SUPERVISOR_INTEGRATION) $(COMMON_SRC) $(TRANSPORT_DIR)/lmux.h $(LXF_HDR) $(LINK_DIR)/link_protocol.c $(LINK_HDRS) $(GEN_VERSION) | $(HOST_DIR)
-	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_SUPERVISOR_INTEGRATION) $(COMMON_SRC) $(LINK_DIR)/link_protocol.c
+$(HOST_DIR)/test_supervisor_integration: $(TEST_SUPERVISOR_INTEGRATION) $(COMMON_SRC) $(CARRIER_SRC) $(TRANSPORT_DIR)/lmux.h $(LXF_HDR) $(LINK_DIR)/link_protocol.c $(LINK_HDRS) $(GEN_VERSION) | $(HOST_DIR)
+	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_SUPERVISOR_INTEGRATION) $(COMMON_SRC) $(CARRIER_SRC) $(LINK_DIR)/link_protocol.c
+
+$(HOST_DIR)/test_dirty_integration: $(TEST_DIRTY_INTEGRATION) $(CARRIER_DIR)/dirty.c $(CARRIER_DIR)/dirty.h $(GEN_VERSION) | $(HOST_DIR)
+	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_DIRTY_INTEGRATION) $(CARRIER_DIR)/dirty.c $(TRANSPORT_DIR)/protocol.c $(LINK_DIR)/link_protocol.c
+
+$(HOST_DIR)/test_dispatcher_integration: $(TEST_DISPATCHER_INTEGRATION) $(CARRIER_DIR)/dispatch_ipc.c $(CARRIER_DIR)/dispatch_ipc.h $(CARRIER_DIR)/dirty.c $(CARRIER_DIR)/dirty.h $(GEN_VERSION) | $(HOST_DIR)
+	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_DISPATCHER_INTEGRATION) $(CARRIER_DIR)/dispatch_ipc.c $(CARRIER_DIR)/dirty.c $(TRANSPORT_DIR)/protocol.c $(LINK_DIR)/link_protocol.c
 
 $(HOST_DIR)/test_lmux_client: $(TEST_LMUX_CLIENT) $(LMUX) $(COMMON_SRC) $(TRANSPORT_DIR)/lmux.h $(LXF_HDR) $(GEN_VERSION) | $(HOST_DIR)
 	$(HOST_CC) $(COMMON_CFLAGS) $(HOST_CFLAGS) -o $@ $(TEST_LMUX_CLIENT) $(COMMON_SRC)
@@ -149,11 +285,14 @@ $(TARGET_DIR)/lmuxd: $(LMUXD) $(COMMON_SRC) $(LMUX2_SRC) $(CARRIER_SRC) $(SERVIC
 $(TARGET_DIR)/lmux: $(LMUX) $(COMMON_SRC) $(ZEROMUX_SRC) $(CARRIER_DIR)/carrier_tty.c $(TRANSPORT_DIR)/lmux.h $(LXF_HDR) $(ZEROMUX_HDRS) $(CARRIER_HDRS) $(GEN_VERSION) | $(TARGET_DIR)
 	$(TARGET_CC) $(COMMON_CFLAGS) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) -o $@ $(LMUX) $(COMMON_SRC) $(ZEROMUX_SRC) $(CARRIER_DIR)/carrier_tty.c
 
+$(TARGET_DIR)/lmux-uart-dispatch: $(DISPATCHER_SRC) $(CARRIER_HDRS) $(GEN_VERSION) | $(TARGET_DIR)
+	$(TARGET_CC) $(COMMON_CFLAGS) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) -o $@ $(DISPATCHER_SRC)
+
 $(TARGET_DIR)/test_lmux2: $(TEST_LMUX2) $(COMMON_SRC) $(LMUX2_SRC) $(TRANSPORT_HDRS) $(LXF_HDR) $(GEN_VERSION) | $(TARGET_DIR)
 	$(TARGET_CC) $(COMMON_CFLAGS) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) -o $@ $(TEST_LMUX2) $(COMMON_SRC) $(LMUX2_SRC)
 
 strip-target: target
-	$(TARGET_STRIP) $(TARGET_DIR)/lmuxd $(TARGET_DIR)/lmux
+	$(TARGET_STRIP) $(TARGET_DIR)/lmuxd $(TARGET_DIR)/lmux $(TARGET_DIR)/lmux-uart-dispatch
 
 clean:
 	rm -rf build
