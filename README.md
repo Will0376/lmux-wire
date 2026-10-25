@@ -219,6 +219,14 @@ The supervisor also accepts `--storage-root DIR` for managed worker storage. If
 omitted, it uses the directory containing the actual running executable as
 resolved through `/proc/self/exe`.
 
+> **UART recovery is a prepared deployment, not another device path.** A RAW
+> UART needs a dedicated binary-clean endpoint. A shared-console DIRTY UART
+> additionally needs a sole-RX `lmux-uart-dispatch`, supervisor IPC, a matching
+> host endpoint, and a verified emergency-console/recovery procedure. An open
+> host standby endpoint alone does not make target recovery ready. Read
+> [Shared-console DIRTY deployment](docs/uart-dispatcher.md#shared-console-dirty-deployment)
+> before enabling or relying on UART recovery.
+
 On the host, the helper starts the default topology:
 
 ```sh

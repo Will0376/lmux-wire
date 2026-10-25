@@ -5,6 +5,14 @@ add an LMUX/2 transport or change OUTER/1, LXF1, or service wire protocols.
 Carrier identity is deliberately independent of device naming and physical
 technology.
 
+> **Deployment warning:** a shared-console DIRTY UART is not a drop-in RAW
+> carrier and is not enabled merely by naming a serial device. It requires a
+> prepared sole-RX dispatcher, target supervisor IPC, matching host endpoint,
+> and a tested console/recovery procedure. A dedicated binary-clean UART can
+> use RAW without the console dispatcher. See
+> [Shared-console DIRTY deployment](uart-dispatcher.md#shared-console-dirty-deployment)
+> for the normative ownership, startup, failure, and readiness guidance.
+
 ## Identity model
 
 Every configured endpoint has four separate properties:
@@ -79,16 +87,21 @@ does not prove that no reader already owns a descriptor.
 
 ## Ownership prerequisites
 
-Both RAW and DIRTY UART require the supervisor to be the sole RX consumer.
-DIRTY permits unrelated TX output on the wire; it is not a multiplexer for two
-readers. `TIOCEXCL` and `/proc` diagnostics do not prove that no descriptor was
-opened earlier and do not replace deployment ordering.
+RAW requires its direct carrier owner (normally the supervisor) to be the sole
+RX consumer. A dedicated DIRTY endpoint may use the same ownership model, but
+a shared-console DIRTY endpoint instead makes `lmux-uart-dispatch` the sole
+physical RX owner and connects the supervisor through local IPC. DIRTY permits
+unrelated TX output on the wire; it is not a multiplexer for two readers.
+`TIOCEXCL` and `/proc` diagnostics do not prove that no descriptor was opened
+earlier and do not replace deployment ordering.
 
-Deployment must disable getty/login/shell readers and any kernel serial-input
-consumer before starting the supervisor. RAW additionally requires a clean,
-dedicated TX path with no printk or serial-console writer. DIRTY may coexist
-with printk or serial-console TX only when no kernel or userspace path consumes
-RX. LMUX never changes console, getty, printk, or SysRq configuration.
+Deployment must disable competing getty/login/shell readers and any kernel
+serial-input consumer before assigning RX ownership. RAW additionally requires
+a clean, dedicated TX path with no printk or serial-console writer. DIRTY may
+coexist with printk or serial-console TX only when no other kernel or userspace
+path consumes RX. LMUX never changes console, getty, printk, or SysRq
+configuration. Shared-console setup and recovery are specified in the
+[dispatcher deployment guide](uart-dispatcher.md#shared-console-dirty-deployment).
 
 ## Standby behavior
 
