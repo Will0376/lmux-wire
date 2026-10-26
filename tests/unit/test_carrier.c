@@ -388,6 +388,60 @@ out:
     return rc ? fail("manager reopen hold mask") : 0;
 }
 
+static int test_carrier_manager_administrative_release(void)
+{
+    struct lmux_carrier_manager m;
+    struct lmux_carrier_endpoint *primary = NULL, *standby = NULL;
+    char *path;
+    int active_pair[2] = { -1, -1 };
+    int master = -1;
+    int rc = 1;
+
+    master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (master < 0 || grantpt(master) < 0 || unlockpt(master) < 0 ||
+        !(path = ptsname(master)) ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, active_pair) < 0)
+        return fail("manager administrative release setup");
+    lmux_carrier_manager_init(&m);
+    if (lmux_carrier_manager_add(&m, "primary", 1, &primary) < 0 ||
+        lmux_carrier_manager_add(&m, "rescue", 0, &standby) < 0 ||
+        lmux_carrier_set_fd(&primary->carrier, active_pair[0]) < 0 ||
+        lmux_carrier_set_tty_path(&standby->carrier, path) < 0 ||
+        lmux_carrier_manager_try_open(&m, 1000) != (1u << 1) ||
+        lmux_carrier_fd(&standby->carrier) < 0)
+        goto out;
+    if (lmux_carrier_manager_release(&m, "rescue") < 0 ||
+        !standby->administratively_released ||
+        lmux_carrier_fd(&standby->carrier) >= 0 ||
+        lmux_carrier_endpoint_state(standby) !=
+            LMUX_CARRIER_ENDPOINT_RELEASED ||
+        lmux_carrier_manager_release(&m, "rescue") < 0 ||
+        lmux_carrier_manager_try_open(&m, 3000) != 0 ||
+        lmux_carrier_fd(&standby->carrier) >= 0)
+        goto out;
+    errno = 0;
+    if (lmux_carrier_manager_set_active(&m, "rescue",
+                                        LMUX_CARRIER_MODE_RAW, 2) == 0 ||
+        errno != EACCES ||
+        lmux_carrier_manager_release(&m, "primary") == 0 ||
+        errno != EBUSY)
+        goto out;
+    if (lmux_carrier_manager_resume(&m, "rescue") < 0 ||
+        standby->administratively_released ||
+        lmux_carrier_manager_resume(&m, "rescue") < 0 ||
+        lmux_carrier_manager_try_open(&m, 3000) != (1u << 1) ||
+        lmux_carrier_fd(&standby->carrier) < 0)
+        goto out;
+    rc = 0;
+out:
+    lmux_carrier_manager_cleanup(&m);
+    if (active_pair[1] >= 0)
+        close(active_pair[1]);
+    if (master >= 0)
+        close(master);
+    return rc ? fail("manager administrative release/resume") : 0;
+}
+
 static int test_carrier_manager_dual_endpoints(void)
 {
     struct lmux_carrier_manager m;
@@ -577,6 +631,24 @@ static int test_lmc1_codec_and_raw_demux(void)
     in.status = LMUX_LMC1_STATUS_OK;
     if (lmux_lmc1_encode(&in, encoded, sizeof(encoded), &encoded_len) < 0)
         return fail("LMC1 re-encode after invalid status");
+    {
+        static const uint8_t admin_types[] = {
+            LMUX_LMC1_RELEASE, LMUX_LMC1_RELEASED,
+            LMUX_LMC1_RESUME, LMUX_LMC1_RESUMED
+        };
+        size_t j;
+        for (j = 0; j < sizeof(admin_types); j++) {
+            in.type = admin_types[j];
+            if (lmux_lmc1_encode(&in, encoded, sizeof(encoded),
+                                 &encoded_len) < 0 ||
+                lmux_lmc1_decode(encoded, encoded_len - 1, &out) != 0 ||
+                out.type != admin_types[j])
+                return fail("LMC1 administrative codec roundtrip");
+        }
+        in.type = LMUX_LMC1_PREPARE;
+        if (lmux_lmc1_encode(&in, encoded, sizeof(encoded), &encoded_len) < 0)
+            return fail("LMC1 restore PREPARE encoding");
+    }
 
     memset(&capture, 0, sizeof(capture));
     lmux_lmc1_raw_init(&io);
@@ -670,6 +742,7 @@ int main(void)
         test_tty_strict_configuration_and_exclusive() ||
         test_tty_policy_speed_mismatch() ||
         test_carrier_manager_reopen_hold() ||
+        test_carrier_manager_administrative_release() ||
         test_carrier_manager_dual_endpoints() ||
         test_carrier_manager_names() ||
         test_matching_names_different_paths() ||

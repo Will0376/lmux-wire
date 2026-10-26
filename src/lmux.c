@@ -32,6 +32,24 @@ static volatile sig_atomic_t term_winch_pending;
 #define LMUX_DEFAULT_CONTROL_SOCKET "/run/lmux/control.sock"
 #define LMUX_DEFAULT_STRUCTURED_SOCKET "/run/lmux/control-v2.sock"
 
+enum term_snapshot_state {
+    TERM_SNAPSHOT_UNUSED = 0,
+    TERM_SNAPSHOT_CONNECTING,
+    TERM_SNAPSHOT_WRITING,
+    TERM_SNAPSHOT_READING,
+    TERM_SNAPSHOT_READY
+};
+
+struct term_carrier_snapshot {
+    int fd;
+    enum term_snapshot_state state;
+    size_t request_pos;
+    char reply[160];
+    size_t reply_len;
+    char name[LMUX_CARRIER_NAME_MAX + 1];
+    char mode[16];
+};
+
 struct transfer_config {
     const char *sock_path;
     const char *remote_dir;
@@ -372,9 +390,11 @@ static void usage(FILE *f)
         "lmux %s (%s)\n"
         "Usage:\n"
         "  lmux connect SOCKET\n"
-        "  lmux status [--control SOCKET]\n"
-        "  lmux carrier status [--control SOCKET]\n"
+        "  lmux status [--verbose] [--control SOCKET]\n"
+        "  lmux carrier status [--verbose] [--control SOCKET]\n"
         "  lmux carrier switch NAME [--mode raw|dirty] [--timeout-ms N] [--control SOCKET]\n"
+        "  lmux carrier release NAME [--control SOCKET]\n"
+        "  lmux carrier resume NAME [--control SOCKET]\n"
         "  lmux carrier console NAME [--control SOCKET]\n"
         "  lmux deploy FILE [--restart-supervisor] [--timeout-ms N] [--control SOCKET]\n"
         "  lmux deploy --restart-supervisor [--control SOCKET]\n"
@@ -390,7 +410,7 @@ static void usage(FILE *f)
         "  lmux zeromux probe --tty DEVICE [serial options]\n"
         "  lmux zeromux send LOCAL_FILE TARGET_TEMP --tty DEVICE [serial options]\n"
         "  lmux zeromux install FILE --tty DEVICE --install-dir TARGET_DIR --lmux-carrier TARGET_CARRIER [serial options]\n"
-        "  lmux term [-v|--verbose] [--remote-dir DIR] [--channel 1|2] [1|2|SOCKET]\n"
+        "  lmux term [-v|--verbose] [--control SOCKET] [--remote-dir DIR] [--channel 1|2] [1|2|SOCKET]\n"
         "  lmux stream [--control SOCKET] -- /absolute/target/program [ARGS...]\n"
         "  lmux exec SOCKET -- PROGRAM [ARGS...]\n"
         "  lmux put [OPTIONS] HOST_SRC [TARGET_DST]\n"
@@ -661,7 +681,7 @@ static int deploy_restart_supervisor(const char *control)
     return control_request(control, "DEPLOY_RESTART\n", 1, 0) < 0 ? 1 : 0;
 }
 
-static int send_winsize_control(int channel)
+static int send_winsize_control(int channel, const char *control)
 {
     struct winsize ws;
     char req[96];
@@ -672,7 +692,7 @@ static int send_winsize_control(int channel)
     snprintf(req, sizeof(req), "WINSIZE %d %u %u %u %u\n", channel,
              (unsigned int)ws.ws_row, (unsigned int)ws.ws_col,
              (unsigned int)ws.ws_xpixel, (unsigned int)ws.ws_ypixel);
-    return control_request(LMUX_DEFAULT_CONTROL_SOCKET, req, 0, 1);
+    return control_request(control, req, 0, 1);
 }
 
 static int set_nonblock(int fd)
@@ -823,6 +843,18 @@ static void term_print_attached(const char *label)
     fflush(stderr);
 }
 
+static void term_print_attached_via(const char *label,
+                                    const struct term_carrier_snapshot *snapshot)
+{
+    if (!snapshot || snapshot->state != TERM_SNAPSHOT_READY) {
+        term_print_attached(label);
+        return;
+    }
+    fprintf(stderr, "[attached: %s via %s/%s]\r\n",
+            label ? label : "console1", snapshot->name, snapshot->mode);
+    fflush(stderr);
+}
+
 static void term_print_waiting(const char *label)
 {
     /* A local Unix socket accept is not proof of a remote LMUX stream. */
@@ -847,6 +879,111 @@ static void append_byte(struct pipebuf *p, uint8_t b)
     compact_pipebuf(p);
     if (p->off + p->len < sizeof(p->buf))
         p->buf[p->off + p->len++] = b;
+}
+
+static void term_snapshot_close(struct term_carrier_snapshot *snapshot)
+{
+    if (snapshot->fd >= 0)
+        close(snapshot->fd);
+    snapshot->fd = -1;
+    if (snapshot->state != TERM_SNAPSHOT_READY)
+        snapshot->state = TERM_SNAPSHOT_UNUSED;
+}
+
+static void term_snapshot_parse(struct term_carrier_snapshot *snapshot)
+{
+    snapshot->reply[snapshot->reply_len] = 0;
+    if (sscanf(snapshot->reply,
+               "OK CARRIER ACTIVE name=%31s mode=%15s",
+               snapshot->name, snapshot->mode) == 2) {
+        snapshot->state = TERM_SNAPSHOT_READY;
+        term_snapshot_close(snapshot);
+    } else {
+        term_snapshot_close(snapshot);
+    }
+}
+
+static void term_snapshot_start(struct term_carrier_snapshot *snapshot,
+                                const char *control)
+{
+    struct sockaddr_un sa;
+    int flags, rc;
+
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->fd = -1;
+    if (!control || strlen(control) >= sizeof(sa.sun_path))
+        return;
+    snapshot->fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (snapshot->fd < 0)
+        return;
+    flags = fcntl(snapshot->fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(snapshot->fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        term_snapshot_close(snapshot);
+        return;
+    }
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    strcpy(sa.sun_path, control);
+    rc = connect(snapshot->fd, (struct sockaddr *)&sa, sizeof(sa));
+    if (rc == 0)
+        snapshot->state = TERM_SNAPSHOT_WRITING;
+    else if (errno == EINPROGRESS || errno == EAGAIN)
+        snapshot->state = TERM_SNAPSHOT_CONNECTING;
+    else
+        term_snapshot_close(snapshot);
+}
+
+static void term_snapshot_process(struct term_carrier_snapshot *snapshot,
+                                  short revents)
+{
+    static const char request[] = "CARRIER ACTIVE\n";
+    if (!snapshot || snapshot->fd < 0)
+        return;
+    if (revents & (POLLERR | POLLNVAL)) {
+        term_snapshot_close(snapshot);
+        return;
+    }
+    if (snapshot->state == TERM_SNAPSHOT_CONNECTING && (revents & POLLOUT)) {
+        int error = 0;
+        socklen_t len = sizeof(error);
+        if (getsockopt(snapshot->fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0 ||
+            error != 0) {
+            term_snapshot_close(snapshot);
+            return;
+        }
+        snapshot->state = TERM_SNAPSHOT_WRITING;
+    }
+    if (snapshot->state == TERM_SNAPSHOT_WRITING && (revents & POLLOUT)) {
+        ssize_t w = write(snapshot->fd, request + snapshot->request_pos,
+                          sizeof(request) - 1 - snapshot->request_pos);
+        if (w > 0) {
+            snapshot->request_pos += (size_t)w;
+            if (snapshot->request_pos == sizeof(request) - 1)
+                snapshot->state = TERM_SNAPSHOT_READING;
+        } else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                   errno != EINTR) {
+            term_snapshot_close(snapshot);
+        }
+    }
+    if (snapshot->state == TERM_SNAPSHOT_READING &&
+        (revents & (POLLIN | POLLHUP))) {
+        ssize_t r = read(snapshot->fd,
+                         snapshot->reply + snapshot->reply_len,
+                         sizeof(snapshot->reply) - 1 - snapshot->reply_len);
+        if (r > 0) {
+            snapshot->reply_len += (size_t)r;
+            if (memchr(snapshot->reply, '\n', snapshot->reply_len) ||
+                snapshot->reply_len == sizeof(snapshot->reply) - 1)
+                term_snapshot_parse(snapshot);
+        } else if (r == 0) {
+            if (snapshot->reply_len)
+                term_snapshot_parse(snapshot);
+            else
+                term_snapshot_close(snapshot);
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            term_snapshot_close(snapshot);
+        }
+    }
 }
 
 static void term_filter_input(struct pipebuf *out, const uint8_t *buf, size_t len, int *prefix)
@@ -989,9 +1126,11 @@ cancel:
 }
 
 static int term_bridge_loop(int sock, const char *remote_dir, int channel,
-                            int verbose, const char *label)
+                            int verbose, const char *label,
+                            const char *control)
 {
     struct pipebuf a, b;
+    struct term_carrier_snapshot snapshot;
     int stdin_open = 1, sock_open = 1, stdout_open = 1;
     int prefix = 0;
     int remote_attached = 0;
@@ -1003,20 +1142,24 @@ static int term_bridge_loop(int sock, const char *remote_dir, int channel,
     term_label = label;
     term_winch_pending = 1;
     term_print_waiting(label);
+    term_winch_pending = 0;
+    (void)send_winsize_control(channel, control);
+    term_snapshot_start(&snapshot, control);
     if (set_nonblock(STDIN_FILENO) < 0 || set_nonblock(STDOUT_FILENO) < 0 || set_nonblock(sock) < 0) {
         perror("fcntl");
         return 1;
     }
 
     while (!term_detach && (stdin_open || a.len) && (sock_open || b.len) && stdout_open) {
-        struct pollfd pfds[3];
+        struct pollfd pfds[4];
         nfds_t n = 0;
-        int stdin_idx = -1, sock_idx = -1, out_idx = -1;
+        int stdin_idx = -1, sock_idx = -1, out_idx = -1, snapshot_idx = -1;
         short sock_events = 0;
 
         if (term_winch_pending) {
             term_winch_pending = 0;
-            (void)send_winsize_control(channel);
+            term_snapshot_close(&snapshot);
+            (void)send_winsize_control(channel, control);
         }
 
         if (term_modal) {
@@ -1050,12 +1193,21 @@ static int term_bridge_loop(int sock, const char *remote_dir, int channel,
             pfds[n].events = POLLOUT;
             pfds[n++].revents = 0;
         }
+        if (!remote_attached && snapshot.fd >= 0) {
+            snapshot_idx = (int)n;
+            pfds[n].fd = snapshot.fd;
+            pfds[n].events = snapshot.state == TERM_SNAPSHOT_READING ?
+                POLLIN : POLLOUT;
+            pfds[n++].revents = 0;
+        }
         if (poll(pfds, n, -1) < 0) {
             if (errno == EINTR)
                 continue;
             perror("poll");
             return 1;
         }
+        if (snapshot_idx >= 0 && pfds[snapshot_idx].revents)
+            term_snapshot_process(&snapshot, pfds[snapshot_idx].revents);
         if (stdin_idx >= 0 && (pfds[stdin_idx].revents & (POLLIN | POLLHUP))) {
             uint8_t tmp[256];
             ssize_t r = read(STDIN_FILENO, tmp, sizeof(tmp));
@@ -1084,7 +1236,8 @@ static int term_bridge_loop(int sock, const char *remote_dir, int channel,
             ssize_t r = read(sock, b.buf + b.off + b.len, sizeof(b.buf) - b.off - b.len);
             if (r > 0) {
                 if (!remote_attached) {
-                    term_print_attached(label);
+                    term_print_attached_via(label, &snapshot);
+                    term_snapshot_close(&snapshot);
                     remote_attached = 1;
                 }
                 b.len += (size_t)r;
@@ -1109,11 +1262,13 @@ static int term_bridge_loop(int sock, const char *remote_dir, int channel,
     }
     if (!term_detach && !sock_open)
         term_print_disconnected(label);
+    term_snapshot_close(&snapshot);
     return 0;
 }
 
 static int cmd_connect(const char *path, int raw_term, const char *remote_dir,
-                       int channel, int verbose, const char *label)
+                       int channel, int verbose, const char *label,
+                       const char *control)
 {
     int fd = raw_term ? connect_unix_mode(path, 1) : connect_unix(path);
 
@@ -1136,7 +1291,8 @@ static int cmd_connect(const char *path, int raw_term, const char *remote_dir,
         }
     }
     if (raw_term) {
-        return term_bridge_loop(fd, remote_dir, channel, verbose, label ? label : path);
+        return term_bridge_loop(fd, remote_dir, channel, verbose,
+                                label ? label : path, control);
     }
     return bridge_loop(fd);
 }
@@ -2458,17 +2614,23 @@ static int cmd_stream(int argc, char **argv)
 static int cmd_status(int argc, char **argv)
 {
     const char *control = LMUX_DEFAULT_CONTROL_SOCKET;
+    int verbose = 0;
     while (argc > 0) {
         if (strcmp(argv[0], "--control") == 0 && argc >= 2) {
             control = argv[1];
             argv += 2;
             argc -= 2;
+        } else if (strcmp(argv[0], "--verbose") == 0) {
+            verbose = 1;
+            argv++;
+            argc--;
         } else {
             usage(stderr);
             return 1;
         }
     }
-    return control_request(control, "STATUS\n", 1, 0) < 0 ? 1 : 0;
+    return control_request(control, verbose ? "STATUS VERBOSE\n" :
+                           "STATUS SUMMARY\n", 1, 0) < 0 ? 1 : 0;
 }
 
 static int carrier_control_request(const char *control, const char *request)
@@ -2521,13 +2683,15 @@ static int cmd_carrier(int argc, char **argv)
     const char *name = NULL;
     const char *action;
     unsigned timeout_ms = 30000;
+    int verbose = 0;
     char request[160];
     if (argc < 1)
         return usage(stderr), 1;
     action = argv[0];
     argv++;
     argc--;
-    if (strcmp(action, "switch") == 0 || strcmp(action, "console") == 0) {
+    if (strcmp(action, "switch") == 0 || strcmp(action, "console") == 0 ||
+        strcmp(action, "release") == 0 || strcmp(action, "resume") == 0) {
         if (argc < 1)
             return usage(stderr), 1;
         name = argv[0];
@@ -2541,6 +2705,11 @@ static int cmd_carrier(int argc, char **argv)
             control = argv[1];
             argv += 2;
             argc -= 2;
+        } else if (strcmp(action, "status") == 0 &&
+                   strcmp(argv[0], "--verbose") == 0) {
+            verbose = 1;
+            argv++;
+            argc--;
         } else if (strcmp(action, "switch") == 0 &&
                    strcmp(argv[0], "--mode") == 0 && argc >= 2) {
             mode = argv[1];
@@ -2560,11 +2729,20 @@ static int cmd_carrier(int argc, char **argv)
         }
     }
     if (strcmp(action, "status") == 0)
-        return carrier_control_request(control, "CARRIER STATUS\n");
+        return carrier_control_request(control, verbose ?
+            "CARRIER STATUS VERBOSE\n" : "CARRIER STATUS SUMMARY\n");
     if (strcmp(action, "console") == 0) {
         if (strlen(name) > LMUX_CARRIER_NAME_MAX)
             return usage(stderr), 1;
         snprintf(request, sizeof(request), "CARRIER CONSOLE %s\n", name);
+        return carrier_control_request(control, request);
+    }
+    if (strcmp(action, "release") == 0 || strcmp(action, "resume") == 0) {
+        if (strlen(name) > LMUX_CARRIER_NAME_MAX)
+            return usage(stderr), 1;
+        snprintf(request, sizeof(request), "CARRIER %s %s\n",
+                 strcmp(action, "release") == 0 ? "RELEASE" : "RESUME",
+                 name);
         return carrier_control_request(control, request);
     }
     if (strlen(name) > LMUX_CARRIER_NAME_MAX ||
@@ -2750,7 +2928,8 @@ int main(int argc, char **argv)
             usage(stderr);
             return 1;
         }
-        return cmd_connect(argv[2], 0, NULL, 0, 0, argv[2]);
+        return cmd_connect(argv[2], 0, NULL, 0, 0, argv[2],
+                           LMUX_DEFAULT_CONTROL_SOCKET);
     }
     if (strcmp(argv[1], "status") == 0)
         return cmd_status(argc - 2, argv + 2);
@@ -2764,6 +2943,7 @@ int main(int argc, char **argv)
         return lmux_zeromux_main(argc - 2, argv + 2);
     if (strcmp(argv[1], "term") == 0) {
         const char *remote_dir = NULL;
+        const char *control = LMUX_DEFAULT_CONTROL_SOCKET;
         const char *arg = NULL;
         const char *sock;
         int i, channel = 0, channel_set = 0, verbose = 0;
@@ -2774,6 +2954,12 @@ int main(int argc, char **argv)
                     return 1;
                 }
                 remote_dir = argv[i];
+            } else if (strcmp(argv[i], "--control") == 0) {
+                if (++i >= argc) {
+                    usage(stderr);
+                    return 1;
+                }
+                control = argv[i];
             } else if (strcmp(argv[i], "--channel") == 0) {
                 if (++i >= argc || parse_channel_arg(argv[i], &channel) < 0) {
                     usage(stderr);
@@ -2798,7 +2984,7 @@ int main(int argc, char **argv)
         }
         sock = console_socket_for_arg(arg);
         return cmd_connect(sock, 1, remote_dir, channel, verbose,
-                           console_label_for_arg(arg));
+                           console_label_for_arg(arg), control);
     }
     if (strcmp(argv[1], "exec") == 0)
         return cmd_exec(argc - 2, argv + 2);

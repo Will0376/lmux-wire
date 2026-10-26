@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -66,24 +67,37 @@ type Session struct {
 }
 
 type Command struct {
-	Token      string
-	ExecRef    uint64
-	TargetID   uint64
-	Kind       string
-	Argv       []string
-	CWD        string
-	State      string
-	OutputDone bool
-	ExitCode   uint32
-	Signal     uint32
-	StartErrno uint16
-	LostReason string
-	Released   bool
-	Created    time.Time
-	Events     []Event
-	file       *os.File
-	path       string
-	bytes      int64
+	Token        string
+	ExecRef      uint64
+	TargetID     uint64
+	Kind         string
+	Argv         []string
+	CWD          string
+	State        string
+	OutputDone   bool
+	ExitCode     uint32
+	Signal       uint32
+	StartErrno   uint16
+	LostReason   string
+	Released     bool
+	Created      time.Time
+	LastVerified time.Time
+	Events       []Event
+	file         *os.File
+	path         string
+	bytes        int64
+}
+
+type CommandSnapshot struct {
+	Token        string
+	ExecRef      uint64
+	TargetID     uint64
+	Kind         string
+	State        string
+	LostReason   string
+	Released     bool
+	Created      time.Time
+	LastVerified time.Time
 }
 
 type Event struct {
@@ -233,7 +247,7 @@ func commandActive(c *Command) bool {
 		return false
 	}
 	switch c.State {
-	case "DONE", "START_FAILED", "LOST":
+	case "DONE", "FAILED", "START_FAILED", "LOST":
 		return false
 	default:
 		return true
@@ -293,6 +307,49 @@ func (s *Session) ByExecRef(ref uint64) *Command {
 	return nil
 }
 
+func commandTerminal(c *Command) bool {
+	if c == nil {
+		return true
+	}
+	switch c.State {
+	case "DONE", "FAILED", "START_FAILED", "LOST":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Session) ListCommands(includeTerminal bool, limit int) ([]CommandSnapshot, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if limit <= 0 {
+		limit = 128
+	}
+	items := make([]CommandSnapshot, 0, len(s.commands))
+	for _, c := range s.commands {
+		if c.Released || (!includeTerminal && commandTerminal(c)) {
+			continue
+		}
+		items = append(items, CommandSnapshot{
+			Token: c.Token, ExecRef: c.ExecRef, TargetID: c.TargetID,
+			Kind: c.Kind, State: c.State, LostReason: c.LostReason,
+			Released: c.Released, Created: c.Created,
+			LastVerified: c.LastVerified,
+		})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Created.Equal(items[j].Created) {
+			return items[i].Token < items[j].Token
+		}
+		return items[i].Created.Before(items[j].Created)
+	})
+	total := len(items)
+	if len(items) > limit {
+		items = items[len(items)-limit:]
+	}
+	return items, total
+}
+
 func (s *Session) AppendOutput(token, stream string, data []byte) error {
 	kind := eventStdout
 	if stream == "stderr" {
@@ -315,6 +372,7 @@ func (s *Session) UpdateState(token string, st hc2.ExecState) error {
 		return errors.New("command not found")
 	}
 	c.State = stateName(st.State)
+	c.LastVerified = time.Now()
 	c.OutputDone = c.State == "DONE"
 	c.ExitCode = st.ExitCode
 	c.Signal = st.TermSignal
@@ -335,6 +393,7 @@ func (s *Session) MarkLostByRef(ref uint64, reason uint32) {
 	for _, c := range s.commands {
 		if c.ExecRef == ref && !c.Released {
 			c.State = "LOST"
+			c.LastVerified = time.Now()
 			c.LostReason = fmt.Sprintf("%d", reason)
 			_ = s.appendEventLocked(c, Event{Kind: eventLost, State: "LOST", Data: []byte(c.LostReason), Time: time.Now()})
 			s.JournalLocked("COMMAND_LOST", map[string]any{"cmd": c.Token, "reason": reason})
@@ -516,7 +575,7 @@ func (s *Session) JournalLocked(event string, fields map[string]any) {
 }
 
 func CommandStatus(c *Command) map[string]any {
-	return map[string]any{
+	out := map[string]any{
 		"command_token": c.Token,
 		"kind":          c.Kind,
 		"state":         c.State,
@@ -526,7 +585,13 @@ func CommandStatus(c *Command) map[string]any {
 		"lost_reason":   c.LostReason,
 		"output_done":   c.OutputDone,
 		"released":      c.Released,
+		"execution_id":  strconv.FormatUint(c.TargetID, 10),
+		"exec_ref":      strconv.FormatUint(c.ExecRef, 10),
 	}
+	if !c.LastVerified.IsZero() {
+		out["last_verified_at"] = c.LastVerified.UTC().Format(time.RFC3339Nano)
+	}
+	return out
 }
 
 func cursorFor(seq uint64) string {

@@ -135,6 +135,8 @@ int lmux_carrier_try_open(struct lmux_carrier *c, long long now_ms)
     c->next_attempt_ms = now_ms + 1000;
     if (c->kind == LMUX_CARRIER_TTY_PATH)
         rc = lmux_carrier_tty_open(c);
+    else if (c->kind == LMUX_CARRIER_UNIX_LISTEN)
+        rc = lmux_carrier_unix_listen_start(c);
     else if (c->kind == LMUX_CARRIER_UNIX_CONNECT)
         rc = lmux_carrier_unix_connect_open(c);
     else if (c->kind == LMUX_CARRIER_DISPATCH_CONNECT)
@@ -162,6 +164,28 @@ int lmux_carrier_accept(struct lmux_carrier *c)
         c->last_errno = errno;
     }
     return rc;
+}
+
+void lmux_carrier_close(struct lmux_carrier *c)
+{
+    if (!c)
+        return;
+    release_exclusive(c);
+    if (c->owns_fd)
+        close_owned_fd(&c->fd);
+    else
+        c->fd = -1;
+    close_owned_fd(&c->listen_fd);
+    if (c->created_path && c->path)
+        unlink(c->path);
+    c->created_path = 0;
+    c->exclusive_acquired = 0;
+    c->dispatch_tx_len = 0;
+    c->dispatch_tx_unreported = 0;
+    c->dispatch_control = 0;
+    c->dispatch_rx_len = 0;
+    c->dispatch_rx_pos = 0;
+    c->last_errno = 0;
 }
 
 void lmux_carrier_mark_lost(struct lmux_carrier *c, long long now_ms)
@@ -207,6 +231,7 @@ int lmux_carrier_is_configured(const struct lmux_carrier *c)
 int lmux_carrier_can_reopen(const struct lmux_carrier *c)
 {
     return c->kind == LMUX_CARRIER_TTY_PATH ||
+           c->kind == LMUX_CARRIER_UNIX_LISTEN ||
            c->kind == LMUX_CARRIER_UNIX_CONNECT ||
            c->kind == LMUX_CARRIER_DISPATCH_CONNECT;
 }

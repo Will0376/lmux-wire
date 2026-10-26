@@ -34,6 +34,7 @@ func TestSDKToolDiscoveryAndCall(t *testing.T) {
 		"file_operation_wait":    false,
 		"file_operation_cancel":  false,
 		"command_start":          false,
+		"command_list":           false,
 		"command_status":         false,
 		"command_read":           false,
 		"command_write_stdin":    false,
@@ -71,6 +72,66 @@ func TestSDKToolDiscoveryAndCall(t *testing.T) {
 	got, ok := res.StructuredContent.(map[string]any)
 	if !ok || got["released"] != true {
 		t.Fatalf("bad structured content: %#v", res.StructuredContent)
+	}
+}
+
+func TestCommandListPresentationLiveTerminalStaleAndU64(t *testing.T) {
+	now := time.Now()
+	commands := []mcpapp.CommandSnapshot{
+		{Token: "c-running", ExecRef: ^uint64(0), TargetID: ^uint64(0) - 1,
+			Kind: "session", State: "RUNNING", LastVerified: now.Add(-time.Second)},
+		{Token: "c-terminating", ExecRef: 2, TargetID: 3,
+			Kind: "oneshot", State: "TERMINATING", LastVerified: now.Add(-time.Second)},
+		{Token: "c-done", ExecRef: 4, TargetID: 5,
+			Kind: "oneshot", State: "DONE", LastVerified: now.Add(-time.Hour)},
+		{Token: "c-lost", ExecRef: 6, TargetID: 7,
+			Kind: "session", State: "LOST", LostReason: "5", LastVerified: now.Add(-time.Hour)},
+	}
+	out := commandListResult("s-test", commands, len(commands), true, "online", now)
+	items := out["commands"].([]map[string]any)
+	if len(items) != 4 || items[0]["state_verified"] != true ||
+		items[0]["execution_id"] != "18446744073709551614" ||
+		items[0]["exec_ref"] != "18446744073709551615" ||
+		items[2]["verification"] != "terminal" || items[3]["lost_reason"] != "5" ||
+		out["truncated"] != false || out["total_matching"] != len(commands) ||
+		out["bounded_limit"] != commandListLimit {
+		t.Fatalf("bad command list result: %#v", out)
+	}
+	truncated := commandListResult("s-test", commands[:1], len(commands), false, "online", now)
+	if truncated["truncated"] != true || truncated["total_matching"] != len(commands) ||
+		len(truncated["commands"].([]map[string]any)) != 1 {
+		t.Fatalf("bounded command list did not expose truncation: %#v", truncated)
+	}
+	stale := commandListResult("s-test", commands[:1], 1, false, "offline", now)
+	staleItem := stale["commands"].([]map[string]any)[0]
+	if staleItem["state"] != "RUNNING" || staleItem["state_verified"] != false ||
+		staleItem["verification"] != "stale" || staleItem["reattachable"] != true {
+		t.Fatalf("offline RUNNING was not retained as stale: %#v", staleItem)
+	}
+	wire, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(wire, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	decodedItem := decoded["commands"].([]any)[0].(map[string]any)
+	if _, ok := decodedItem["execution_id"].(string); !ok {
+		t.Fatalf("execution identity is not a JSON string: %s", wire)
+	}
+}
+
+func TestCommandListEmptyDoesNotRequireHC2(t *testing.T) {
+	a := testApp(t)
+	out, err := a.toolCommandList(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := out.(map[string]any)
+	if len(m["commands"].([]map[string]any)) != 0 ||
+		m["target_availability"] != "unknown" || m["scope"] != "mcp_session" {
+		t.Fatalf("bad empty command list: %#v", m)
 	}
 }
 
@@ -136,6 +197,41 @@ func TestFileOperationIDJSONRoundTrip(t *testing.T) {
 	}
 	if _, err := parseFileOperationID("18446744073709551616"); err == nil {
 		t.Fatal("overflowing operation ID accepted")
+	}
+}
+
+func TestLmuxStatusLegacyJSONFieldsRemainCompatible(t *testing.T) {
+	st := hc2.Status{
+		BuildVersion: "1.0.2+build.test", CarrierOpen: true,
+		CarrierRX: 11, CarrierTX: 12,
+		Outer:         hc2.StatusOuter{State: 2, LocalConn: 13, PeerConn: 14},
+		LMUX:          hc2.StatusLMUX{State: 1, LocalConn: 15, PeerConn: 16, EstablishedCount: 17},
+		Factories:     hc2.Factories{PTY: true, Exec: true},
+		Services:      []hc2.ServiceRow{{Name: "exec", Type: "exec", Acknowledged: true, ServiceID: 18}},
+		Observability: hc2.UnsupportedObservability("old daemon"),
+	}
+	wire, err := json.Marshal(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacy struct {
+		BuildVersion string           `json:"build_version"`
+		CarrierOpen  bool             `json:"carrier_open"`
+		CarrierRX    uint64           `json:"carrier_rx_bytes"`
+		CarrierTX    uint64           `json:"carrier_tx_bytes"`
+		Outer        hc2.StatusOuter  `json:"outer"`
+		LMUX         hc2.StatusLMUX   `json:"lmux"`
+		Factories    hc2.Factories    `json:"factories"`
+		Services     []hc2.ServiceRow `json:"services"`
+	}
+	if err := json.Unmarshal(wire, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.BuildVersion != st.BuildVersion || !legacy.CarrierOpen ||
+		legacy.CarrierRX != 11 || legacy.CarrierTX != 12 ||
+		legacy.Outer.LocalConn != 13 || legacy.LMUX.PeerConn != 16 ||
+		len(legacy.Services) != 1 || legacy.Services[0].ServiceID != 18 {
+		t.Fatalf("legacy status schema/value changed: %s", wire)
 	}
 }
 

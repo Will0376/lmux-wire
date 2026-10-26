@@ -20,6 +20,8 @@ enum lmux_hc2_type {
 
     LMUX_HC2_STATUS_REQUEST = 10,
     LMUX_HC2_STATUS_REPLY = 11,
+    LMUX_HC2_STATUS_DETAIL_REQUEST = 12,
+    LMUX_HC2_STATUS_DETAIL_REPLY = 13,
 
     LMUX_HC2_EXEC_START = 20,
     LMUX_HC2_EXEC_STARTED = 21,
@@ -77,7 +79,8 @@ enum lmux_hc2_caps {
     LMUX_HC2_CAP_STATUS = 1u << 0,
     LMUX_HC2_CAP_EXEC = 1u << 1,
     LMUX_HC2_CAP_FILE = 1u << 2,
-    LMUX_HC2_CAP_FILE_LIFECYCLE = 1u << 3
+    LMUX_HC2_CAP_FILE_LIFECYCLE = 1u << 3,
+    LMUX_HC2_CAP_STATUS_DETAIL = 1u << 4
 };
 
 enum lmux_hc2_exec_signal {

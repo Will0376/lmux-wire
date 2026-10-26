@@ -318,6 +318,15 @@ struct v2_host_status {
     const char *carrier_console_name;
     unsigned carrier_console_hold_mask;
     unsigned carrier_failure_hold_mask;
+    const char *carrier_admin_phase;
+    const char *carrier_admin_name;
+    const char *carrier_admin_action;
+    const char *carrier_admin_last_name;
+    const char *carrier_admin_last_action;
+    const char *carrier_admin_last_result;
+    const char *carrier_admin_last_error;
+    unsigned carrier_admin_target_known_mask;
+    unsigned carrier_admin_target_released_mask;
     const struct lmux_dirty *dirty;
 };
 
@@ -348,6 +357,9 @@ int v2_runtime_carrier_switch_start(struct v2_app *a, const char *name,
                                     enum lmux_carrier_mode mode,
                                     unsigned timeout_ms,
                                     char *error, size_t error_cap);
+int v2_runtime_carrier_admin_start(struct v2_app *a, const char *name,
+                                   int release, unsigned timeout_ms,
+                                   char *error, size_t error_cap);
 int v2_runtime_open_stream_token(struct v2_app *a, uint64_t service_id,
                                  uint64_t token, uint64_t *stream_id);
 int v2_runtime_stream_is_open(struct v2_app *a, uint64_t stream_id);

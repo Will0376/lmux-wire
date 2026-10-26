@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,8 @@ const (
 	TypeError                  uint16 = 3
 	TypeStatusRequest          uint16 = 10
 	TypeStatusReply            uint16 = 11
+	TypeStatusDetailRequest    uint16 = 12
+	TypeStatusDetailReply      uint16 = 13
 	TypeExecStart              uint16 = 20
 	TypeExecStarted            uint16 = 21
 	TypeExecAttach             uint16 = 22
@@ -57,6 +60,7 @@ const (
 	CapExec          uint32 = 1 << 1
 	CapFile          uint32 = 1 << 2
 	CapFileLifecycle uint32 = 1 << 3
+	CapStatusDetail  uint32 = 1 << 4
 
 	ErrOK                 uint32 = 0
 	ErrInvalidArgument    uint32 = 1
@@ -81,6 +85,9 @@ const (
 	FileFailed    byte = 3
 	FileCancelled byte = 4
 	FileLost      byte = 5
+
+	OuterStateEstablished byte = 2
+	LMUXStateEstablished  byte = 1
 )
 
 type Frame struct {
@@ -114,14 +121,105 @@ type ExecState struct {
 }
 
 type Status struct {
-	BuildVersion string       `json:"build_version"`
-	CarrierOpen  bool         `json:"carrier_open"`
-	CarrierRX    uint64       `json:"carrier_rx_bytes"`
-	CarrierTX    uint64       `json:"carrier_tx_bytes"`
-	Outer        StatusOuter  `json:"outer"`
-	LMUX         StatusLMUX   `json:"lmux"`
-	Factories    Factories    `json:"factories"`
-	Services     []ServiceRow `json:"services"`
+	BuildVersion  string              `json:"build_version"`
+	CarrierOpen   bool                `json:"carrier_open"`
+	CarrierRX     uint64              `json:"carrier_rx_bytes"`
+	CarrierTX     uint64              `json:"carrier_tx_bytes"`
+	Outer         StatusOuter         `json:"outer"`
+	LMUX          StatusLMUX          `json:"lmux"`
+	Factories     Factories           `json:"factories"`
+	Services      []ServiceRow        `json:"services"`
+	Observability StatusObservability `json:"observability"`
+}
+
+type StatusObservability struct {
+	Supported         bool                  `json:"supported"`
+	UnavailableReason string                `json:"unavailable_reason,omitempty"`
+	Carrier           *StatusCarrier        `json:"carrier,omitempty"`
+	Endpoints         []StatusEndpoint      `json:"endpoints,omitempty"`
+	Connection        *StatusConnection     `json:"connection,omitempty"`
+	StructuredExec    *StatusStructuredExec `json:"structured_exec,omitempty"`
+	Dirty             *StatusDirty          `json:"dirty,omitempty"`
+}
+
+type StatusCarrier struct {
+	Name                 string `json:"name"`
+	Backend              string `json:"backend"`
+	Mode                 string `json:"mode"`
+	Path                 string `json:"path"`
+	RuntimeState         string `json:"runtime_state"`
+	FDOpen               bool   `json:"fd_open"`
+	FDOwnership          string `json:"fd_ownership"`
+	Generation           string `json:"generation"`
+	SwitchPhase          string `json:"switch_phase"`
+	SwitchTarget         string `json:"switch_target,omitempty"`
+	AdministrativePhase  string `json:"administrative_phase"`
+	AdministrativeName   string `json:"administrative_name,omitempty"`
+	AdministrativeAction string `json:"administrative_action,omitempty"`
+	CommittedButDown     bool   `json:"committed_but_down"`
+	ProtocolFailed       bool   `json:"protocol_failed"`
+	ConsoleReleased      bool   `json:"console_released"`
+	CurrentFailure       string `json:"current_failure,omitempty"`
+	HistoricalError      string `json:"historical_last_error,omitempty"`
+}
+
+type StatusEndpoint struct {
+	Name                     string `json:"name"`
+	Backend                  string `json:"backend"`
+	ConfiguredMode           string `json:"configured_mode"`
+	CurrentMode              string `json:"current_mode"`
+	Role                     string `json:"role"`
+	RuntimeState             string `json:"runtime_state"`
+	EffectiveState           string `json:"effective_state"`
+	AdministrativelyReleased bool   `json:"administratively_released"`
+	TargetConfirmation       string `json:"target_administrative_confirmation"`
+	Path                     string `json:"path"`
+	FDOpen                   bool   `json:"fd_open"`
+	FDOwnership              string `json:"fd_ownership"`
+	CommittedButDown         bool   `json:"committed_but_down"`
+	ProtocolFailed           bool   `json:"protocol_failed"`
+	ConsoleReleased          bool   `json:"console_released"`
+	HistoricalErrno          int32  `json:"historical_errno"`
+}
+
+type StatusConnection struct {
+	Overall         string `json:"overall"`
+	OuterState      string `json:"outer_state"`
+	LMUXState       string `json:"lmux_state"`
+	OuterLocalID    string `json:"outer_local_id"`
+	OuterPeerID     string `json:"outer_peer_id"`
+	LMUXLocalID     string `json:"lmux_local_id"`
+	LMUXPeerID      string `json:"lmux_peer_id"`
+	CurrentFailure  string `json:"current_failure,omitempty"`
+	ServicesReady   uint32 `json:"services_ready"`
+	ServicesDesired uint32 `json:"services_desired"`
+}
+
+type StatusStructuredExec struct {
+	ActiveControlOperation string `json:"active_control_operation"`
+	PendingQueue           uint32 `json:"pending_queue"`
+	RetiringControlStream  string `json:"retiring_control_stream"`
+	CompletedTransactions  string `json:"completed_transactions"`
+	TotalTransactions      string `json:"total_transactions"`
+	AutoStatusCount        string `json:"auto_status_count"`
+	Failure                string `json:"failure,omitempty"`
+}
+
+type StatusDirtyCounters struct {
+	InvalidRecords   string `json:"invalid_records"`
+	ForeignBytes     string `json:"foreign_bytes"`
+	CRCFailures      string `json:"crc_failures"`
+	Retransmissions  string `json:"retransmissions"`
+	RetryFailures    string `json:"retry_failures"`
+	DeadlineFailures string `json:"deadline_failures"`
+}
+
+type StatusDirty struct {
+	Active            bool                 `json:"active"`
+	CurrentFailure    bool                 `json:"current_failure"`
+	LastFailure       string               `json:"historical_last_failure,omitempty"`
+	Session           *StatusDirtyCounters `json:"session,omitempty"`
+	LifetimeAvailable bool                 `json:"lifetime_available"`
 }
 
 type StatusOuter struct {
@@ -520,6 +618,79 @@ func DecodeStatus(p []byte) (Status, error) {
 	return st, nil
 }
 
+func UnsupportedObservability(reason string) StatusObservability {
+	return StatusObservability{Supported: false, UnavailableReason: reason}
+}
+
+func DecodeStatusDetail(p []byte) (StatusObservability, error) {
+	d := decoder{p: p}
+	if version := d.u16(); version != 1 {
+		if d.err != nil {
+			return StatusObservability{}, d.err
+		}
+		return StatusObservability{}, fmt.Errorf("unsupported status detail version %d", version)
+	}
+	toString := func(v uint64) string { return strconv.FormatUint(v, 10) }
+	o := StatusObservability{Supported: true}
+	o.Carrier = &StatusCarrier{
+		Name: d.string(), Backend: d.string(), Mode: d.string(), Path: d.string(),
+		RuntimeState: d.string(), FDOpen: d.u8() != 0, FDOwnership: d.string(),
+		Generation: toString(d.u64()), SwitchPhase: d.string(),
+		SwitchTarget: d.string(), AdministrativePhase: d.string(),
+		AdministrativeName: d.string(), AdministrativeAction: d.string(),
+		CommittedButDown: d.u8() != 0, ProtocolFailed: d.u8() != 0,
+		ConsoleReleased: d.u8() != 0, CurrentFailure: d.string(),
+		HistoricalError: d.string(),
+	}
+	count := d.u8()
+	if count > 16 {
+		return StatusObservability{}, errors.New("too many status endpoints")
+	}
+	for i := byte(0); i < count; i++ {
+		o.Endpoints = append(o.Endpoints, StatusEndpoint{
+			Name: d.string(), Backend: d.string(), ConfiguredMode: d.string(),
+			CurrentMode: d.string(), Role: d.string(), RuntimeState: d.string(),
+			EffectiveState: d.string(), AdministrativelyReleased: d.u8() != 0,
+			TargetConfirmation: d.string(), Path: d.string(), FDOpen: d.u8() != 0,
+			FDOwnership: d.string(), CommittedButDown: d.u8() != 0,
+			ProtocolFailed: d.u8() != 0, ConsoleReleased: d.u8() != 0,
+			HistoricalErrno: int32(d.u32()),
+		})
+	}
+	o.Connection = &StatusConnection{
+		Overall: d.string(), OuterState: d.string(), LMUXState: d.string(),
+		OuterLocalID: toString(d.u64()), OuterPeerID: toString(d.u64()),
+		LMUXLocalID: toString(d.u64()), LMUXPeerID: toString(d.u64()),
+		CurrentFailure: d.string(), ServicesReady: d.u32(),
+		ServicesDesired: d.u32(),
+	}
+	o.StructuredExec = &StatusStructuredExec{
+		ActiveControlOperation: d.string(), PendingQueue: d.u32(),
+		RetiringControlStream: toString(d.u64()),
+		CompletedTransactions: toString(d.u64()),
+		TotalTransactions:     toString(d.u64()), AutoStatusCount: toString(d.u64()),
+		Failure: d.string(),
+	}
+	dirty := &StatusDirty{Active: d.u8() != 0}
+	if dirty.Active {
+		dirty.CurrentFailure = d.u8() != 0
+		dirty.LastFailure = d.string()
+		dirty.Session = &StatusDirtyCounters{
+			InvalidRecords: toString(d.u64()), ForeignBytes: toString(d.u64()),
+			CRCFailures: toString(d.u64()), Retransmissions: toString(d.u64()),
+			RetryFailures: toString(d.u64()), DeadlineFailures: toString(d.u64()),
+		}
+	}
+	// DIRTY counters are reset with each adapter session. The host does not
+	// aggregate a distinct process-lifetime DIRTY total.
+	dirty.LifetimeAvailable = false
+	o.Dirty = dirty
+	if d.err != nil {
+		return StatusObservability{}, d.err
+	}
+	return o, nil
+}
+
 func EncodeString(buf *bytes.Buffer, s string) error {
 	if len(s) > 65535 {
 		return errors.New("string too long")
@@ -738,6 +909,15 @@ func (d *decoder) u8() byte {
 	}
 	v := d.p[d.off]
 	d.off++
+	return v
+}
+
+func (d *decoder) u16() uint16 {
+	if !d.need(2) {
+		return 0
+	}
+	v := binary.LittleEndian.Uint16(d.p[d.off : d.off+2])
+	d.off += 2
 	return v
 }
 

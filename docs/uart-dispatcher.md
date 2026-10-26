@@ -184,9 +184,13 @@ abort boundary followed by `~LMUX CONSOLE\r\n`. A successful reply means the
 complete escape sequence was accepted by the physical carrier write path and
 the host endpoint was released; it is not an acknowledgment from the target
 shell. The endpoint must be the active named DIRTY carrier. The host keeps the
-released endpoint closed, so its normal reopen loop cannot steal RX back from
-login. A later explicit `lmux carrier switch NAME --mode dirty` clears that
-hold and is the resume operation after logout/dispatcher respawn.
+console-released endpoint closed, so its normal reopen loop cannot steal RX
+back from login. This console-release hold is separate from the carrier
+manager's administrative `RELEASED` state. A later explicit
+`lmux carrier switch NAME --mode dirty` clears the console-release hold and is
+the console lifecycle's resume operation after logout/dispatcher respawn;
+`lmux carrier resume NAME` clears only an administrative hold and does not
+perform a switch.
 
 If host `lmuxd` is unavailable and no longer owns the host UART, an operator
 may send the physical command directly, for example on one particular

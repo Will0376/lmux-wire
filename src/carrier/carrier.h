@@ -146,6 +146,7 @@ void lmux_carrier_set_tty_policy(struct lmux_carrier *c,
 int lmux_carrier_start(struct lmux_carrier *c);
 int lmux_carrier_try_open(struct lmux_carrier *c, long long now_ms);
 int lmux_carrier_accept(struct lmux_carrier *c);
+void lmux_carrier_close(struct lmux_carrier *c);
 void lmux_carrier_mark_lost(struct lmux_carrier *c, long long now_ms);
 
 int lmux_carrier_fd(const struct lmux_carrier *c);

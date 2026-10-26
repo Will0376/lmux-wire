@@ -106,6 +106,7 @@ file_operation_status
 file_operation_wait
 file_operation_cancel
 command_start
+command_list
 command_status
 command_read
 command_write_stdin
@@ -197,6 +198,43 @@ report `interrupt_transport="gdb-rsp"` and
 ```
 
 when shell behavior is wanted.
+
+`lmux_status` keeps its original fields and adds an `observability` object.
+With a compatible host daemon, that object contains the active logical carrier,
+backend, mode, local path, generation and switch state; every configured
+endpoint and its local/target administrative state; the current OUTER/LMUX
+health and service reconciliation count; bounded structured EXEC scheduler
+state; and current-session DIRTY counters. Connection and carrier IDs in the
+new object are decimal strings so JSON consumers cannot lose `u64` precision.
+Historical errors are labelled separately from current failures. DIRTY does not
+have a separately accumulated process-lifetime counter set, so
+`lifetime_available` is false rather than duplicating the session counters.
+
+The added data is negotiated with the HC2 `STATUS_DETAIL` capability. Against
+an older daemon, the legacy `lmux_status` fields remain available and
+`observability.supported=false` identifies the missing extension. The MCP
+process uses its existing HC2 connection; it does not invoke `lmux status` or
+parse human-readable output.
+
+`command_list()` returns retained nonterminal commands owned by the current
+MCP process session. `command_list(include_terminal=true)` also returns retained
+`DONE`, failed, and `LOST` entries. Each item includes the opaque token,
+state, decimal-string EXEC identities, terminal/reattachable flags, target
+availability, and last verification time when known. PID/starttime are not
+reported because private EXEC/HC2 does not expose them.
+
+The list is bounded to 128 results without extending retention. The response
+sets `truncated=true` and reports `total_matching` when more matching commands
+exist than are returned. Default results are nonterminal commands, principally
+`RUNNING` and `TERMINATING`; a bounded `STARTING` or output-draining transition
+may also be visible. A released token disappears immediately. Tokens and the
+registry survive an HC2 reconnect inside the same `lmux-mcp` process, and
+normal EXEC reconciliation remains authoritative across carrier or LMUX
+reconnect. A worker incarnation change marks affected commands `LOST`. An
+`lmux-mcp` process restart creates a new session and does not claim old tokens.
+When OUTER/LMUX is unavailable, a cached live state remains `RUNNING` or
+`TERMINATING` but is returned as stale with `state_verified=false`; loss of a
+carrier alone never restarts the command.
 
 Debug tools are documented in [debugging.md](debugging.md). They use a host GDB
 process plus a target `gdbserver stdio` structured EXEC and are separate from

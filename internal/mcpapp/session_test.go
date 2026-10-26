@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"lmux/internal/hc2"
 )
 
 func TestTranscriptCursorAndExpiration(t *testing.T) {
@@ -69,6 +72,80 @@ func TestCommandKindAndActiveCounts(t *testing.T) {
 	}
 	if _, err := NormalizeCommandKind("forever"); err == nil {
 		t.Fatal("invalid command kind accepted")
+	}
+}
+
+func TestCommandListingScopeTerminalReleaseAndBound(t *testing.T) {
+	dir := t.TempDir()
+	s := &Session{ID: "scope-a", Dir: dir, MaxBytes: 4096, JournalSegment: 256, commands: map[string]*Command{}, floorEvent: 1}
+	if err := s.openJournal(); err != nil {
+		t.Fatal(err)
+	}
+	running, err := s.NewCommand([]string{"/bin/sleep"}, "", 11, ^uint64(0), "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateState(running.Token, hc2.ExecState{State: 2}); err != nil {
+		t.Fatal(err)
+	}
+	terminating, err := s.NewCommand([]string{"/bin/sleep"}, "", 13, 98, "oneshot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateState(terminating.Token, hc2.ExecState{State: 6}); err != nil {
+		t.Fatal(err)
+	}
+	done, err := s.NewCommand([]string{"/bin/true"}, "", 12, 99, "oneshot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateState(done.Token, hc2.ExecState{State: 4}); err != nil {
+		t.Fatal(err)
+	}
+	items, total := s.ListCommands(false, 128)
+	if total != 2 || len(items) != 2 || items[0].Token != running.Token ||
+		items[1].Token != terminating.Token ||
+		items[0].TargetID != ^uint64(0) || items[0].LastVerified.IsZero() {
+		t.Fatalf("live listing = %#v total=%d", items, total)
+	}
+	items, total = s.ListCommands(true, 1)
+	if total != 3 || len(items) != 1 || items[0].Token != done.Token {
+		t.Fatalf("bounded terminal listing = %#v total=%d", items, total)
+	}
+	s.MarkLostByRef(running.ExecRef, hc2.ErrStaleTarget)
+	items, total = s.ListCommands(false, 128)
+	if total != 1 || len(items) != 1 || items[0].Token != terminating.Token {
+		t.Fatalf("LOST command appeared in default listing: %#v total=%d", items, total)
+	}
+	s.Release(done.Token)
+	items, total = s.ListCommands(true, 128)
+	if total != 2 || len(items) != 2 || items[0].Token != running.Token ||
+		time.Since(items[0].LastVerified) > time.Second {
+		t.Fatalf("released token/list state = %#v total=%d", items, total)
+	}
+}
+
+func TestManagerRestartDoesNotRestoreCommandTokens(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	s, err := m.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.NewCommand([]string{"/bin/sleep"}, "", 1, 2, "session"); err != nil {
+		t.Fatal(err)
+	}
+	m.Close()
+
+	m2 := NewManager(dir)
+	s2, err := m2.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m2.Close()
+	items, total := s2.ListCommands(true, 128)
+	if total != 0 || len(items) != 0 || s2.ID == s.ID {
+		t.Fatalf("fresh MCP process session restored old tokens: old=%q new=%q items=%#v", s.ID, s2.ID, items)
 	}
 }
 

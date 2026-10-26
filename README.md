@@ -257,6 +257,11 @@ Basic commands:
 
 ```sh
 lmux status
+lmux status --verbose
+lmux carrier status
+lmux carrier status --verbose
+lmux carrier release primary
+lmux carrier resume primary
 lmux term
 lmux term 2
 lmux put ./local.bin /tmp/remote.bin
@@ -264,6 +269,19 @@ lmux get /tmp/remote.bin ./local.bin
 tar -cf - DIR | lmux stream -- /bin/tar -xf - -C /tmp
 lmux stream -- /bin/dd if=/dev/device bs=65536 > image.bin
 ```
+
+The default status commands are concise operator views. Add `--verbose` for
+the full carrier, transport, service, flow-control, stream, and failure
+diagnostics. The legacy local-control `STATUS` request remains available to
+existing machine consumers.
+
+`carrier release` is allowed only for an inactive standby endpoint; an active
+endpoint is rejected. A successful release closes that logical endpoint on
+both host and target and suppresses its reopen loop without disturbing the
+active OUTER/LMUX connection. `carrier resume` removes that process-local
+administrative hold; it does not switch carriers or prove that a physically
+absent device opened.
+See [Named Carrier Architecture](docs/uart-carrier.md#administrative-endpoint-release-and-resume).
 
 `lmux term` uses local Ctrl-T commands:
 
@@ -274,6 +292,19 @@ Ctrl-T Ctrl-T   send literal Ctrl-T
 Ctrl-T p        upload file   HOST -> TARGET
 Ctrl-T g        download file TARGET -> HOST
 ```
+
+After remote attachment is confirmed, `lmux term` also reports the current
+logical carrier snapshot, for example
+`[attached: console1 via rescue/dirty]`. If that best-effort local status
+query is unavailable, attachment continues with the legacy message and PTY
+data is not delayed.
+
+The MCP `lmux_status` tool exposes the same authoritative carrier, connection,
+administrative-release, service, and structured-EXEC health through the
+capability-gated HC2 `STATUS_DETAIL` extension. Older daemons keep the legacy
+status fields and report the extension as unsupported. `command_list` lists
+only retained tokens owned by the current MCP process session; see
+[lmux-mcp](docs/lmux-mcp.md) for its bounded inventory and stale-state rules.
 
 `lmux put` and `lmux get` use `/run/lmux/file.sock` by default. Use
 `--remote-dir`, `--channel 1|2`, `--mode OCTAL`, `-S SOCKET`, and `-v` as shown

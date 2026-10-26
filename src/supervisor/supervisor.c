@@ -114,6 +114,8 @@ struct supervisor {
     } carrier_pending;
     struct lmux_lmc1_msg carrier_completed[LMUX_LMC1_COMPLETED_CACHE];
     unsigned carrier_completed_next;
+    struct lmux_lmc1_msg carrier_admin_completed[LMUX_LMC1_COMPLETED_CACHE];
+    unsigned carrier_admin_completed_next;
     struct {
         int valid;
         unsigned endpoint;
@@ -2098,6 +2100,32 @@ static int completed_matches(const struct lmux_lmc1_msg *done,
                LMUX_LMC1_COOKIE_LEN) == 0;
 }
 
+static struct lmux_lmc1_msg *admin_completed_for_nonce(
+    struct supervisor *s, const uint8_t nonce[LMUX_LMC1_NONCE_LEN])
+{
+    unsigned i;
+    for (i = 0; i < LMUX_LMC1_COMPLETED_CACHE; i++)
+        if ((s->carrier_admin_completed[i].type == LMUX_LMC1_RELEASED ||
+             s->carrier_admin_completed[i].type == LMUX_LMC1_RESUMED) &&
+            lmux_lmc1_nonce_equal(s->carrier_admin_completed[i].nonce,
+                                  nonce))
+            return &s->carrier_admin_completed[i];
+    return NULL;
+}
+
+static int admin_completed_matches(const struct lmux_lmc1_msg *done,
+                                   const struct lmux_lmc1_msg *request)
+{
+    uint8_t expected = request->type == LMUX_LMC1_RELEASE ?
+        LMUX_LMC1_RELEASED : LMUX_LMC1_RESUMED;
+    return done && request && done->type == expected &&
+        lmux_lmc1_nonce_equal(done->nonce, request->nonce) &&
+        strcmp(done->name, request->name) == 0 &&
+        done->generation == request->generation &&
+        memcmp(done->boot_id, request->boot_id,
+               LMUX_LMC1_BOOT_ID_LEN) == 0;
+}
+
 static int queue_lmc_response(struct supervisor *s, unsigned endpoint,
                               enum lmux_lmc1_codec codec,
                               const struct lmux_lmc1_msg *msg)
@@ -2236,6 +2264,88 @@ static void maybe_apply_deferred_carrier_commit(struct supervisor *s)
     apply_carrier_commit(s, endpoint, codec, &request);
 }
 
+static int supervisor_lmc_admin(struct supervisor *s,
+                                const struct supervisor_lmc_context *ctx,
+                                const struct lmux_lmc1_msg *msg)
+{
+    struct lmux_carrier_endpoint *rx_ep;
+    struct lmux_carrier_endpoint *ep;
+    struct lmux_lmc1_msg reply;
+    struct lmux_lmc1_msg *done;
+    int releasing = msg->type == LMUX_LMC1_RELEASE;
+
+    if (!releasing && msg->type != LMUX_LMC1_RESUME)
+        return 0;
+    rx_ep = lmux_carrier_manager_at(&s->carriers, ctx->endpoint);
+    if (!rx_ep || !lmux_carrier_manager_is_active(&s->carriers, rx_ep)) {
+        queue_lmc_error(s, ctx->endpoint, ctx->codec, msg,
+                        LMUX_LMC1_STATUS_BAD_REQUEST);
+        return 1;
+    }
+    if (msg->generation != s->carriers.generation ||
+        memcmp(msg->boot_id, s->carrier_boot_id,
+               LMUX_LMC1_BOOT_ID_LEN) != 0) {
+        queue_lmc_error(s, ctx->endpoint, ctx->codec, msg,
+                        LMUX_LMC1_STATUS_STALE);
+        return 1;
+    }
+    ep = lmux_carrier_manager_find(&s->carriers, msg->name);
+    if (!ep) {
+        queue_lmc_error(s, ctx->endpoint, ctx->codec, msg,
+                        LMUX_LMC1_STATUS_UNKNOWN_CARRIER);
+        return 1;
+    }
+    if (s->carrier_pending.valid || s->carrier_commit_drain.valid ||
+        s->carrier_committed_wait_outer) {
+        queue_lmc_error(s, ctx->endpoint, ctx->codec, msg,
+                        LMUX_LMC1_STATUS_BUSY);
+        return 1;
+    }
+    done = admin_completed_for_nonce(s, msg->nonce);
+    if (done) {
+        if (admin_completed_matches(done, msg))
+            (void)queue_lmc_response(s, ctx->endpoint, ctx->codec, done);
+        else
+            queue_lmc_error(s, ctx->endpoint, ctx->codec, msg,
+                            LMUX_LMC1_STATUS_STALE);
+        return 1;
+    }
+    if (releasing && lmux_carrier_manager_is_active(&s->carriers, ep)) {
+        queue_lmc_error(s, ctx->endpoint, ctx->codec, msg,
+                        LMUX_LMC1_STATUS_BUSY);
+        return 1;
+    }
+    if ((releasing ?
+         lmux_carrier_manager_release(&s->carriers, msg->name) :
+         lmux_carrier_manager_resume(&s->carriers, msg->name)) < 0) {
+        queue_lmc_error(s, ctx->endpoint, ctx->codec, msg,
+                        errno == EBUSY ? LMUX_LMC1_STATUS_BUSY :
+                        LMUX_LMC1_STATUS_UNAVAILABLE);
+        return 1;
+    }
+    {
+        unsigned endpoint = (unsigned)(ep - s->carriers.endpoint);
+        if (!lmux_carrier_manager_is_active(&s->carriers, ep)) {
+            lmux_lmc1_raw_init(&s->lmc_io[endpoint]);
+            lmux_lmc1_dirty_init(&s->lmc_dirty_io[endpoint]);
+        }
+    }
+    reply = *msg;
+    reply.type = releasing ? LMUX_LMC1_RELEASED : LMUX_LMC1_RESUMED;
+    reply.status = LMUX_LMC1_STATUS_OK;
+    reply.deadline_ms = 0;
+    reply.mode = ep->mode;
+    memcpy(reply.boot_id, s->carrier_boot_id, sizeof(reply.boot_id));
+    s->carrier_admin_completed[s->carrier_admin_completed_next] = reply;
+    s->carrier_admin_completed_next =
+        (s->carrier_admin_completed_next + 1) % LMUX_LMC1_COMPLETED_CACHE;
+    (void)queue_lmc_response(s, ctx->endpoint, ctx->codec, &reply);
+    sup_log(s, 0, "carrier endpoint %s name=%s generation=%llu",
+            releasing ? "released" : "resumed", ep->name,
+            (unsigned long long)s->carriers.generation);
+    return 1;
+}
+
 static void supervisor_lmc_control(void *opaque,
                                    const struct lmux_lmc1_msg *msg)
 {
@@ -2266,6 +2376,8 @@ static void supervisor_lmc_control(void *opaque,
         (void)queue_lmc_response(s, ctx->endpoint, ctx->codec, &reply);
         return;
     }
+    if (supervisor_lmc_admin(s, ctx, msg))
+        return;
     if (msg->type == LMUX_LMC1_PREPARE) {
         done = completed_for_nonce(s, msg->nonce);
         if (done) {

@@ -225,6 +225,10 @@ int lmux_carrier_manager_set_active(struct lmux_carrier_manager *m,
     ep = lmux_carrier_manager_find(m, name);
     if (!ep)
         return -1;
+    if (ep->administratively_released) {
+        errno = EACCES;
+        return -1;
+    }
     index = ep - m->endpoint;
     if (index < 0 || index >= LMUX_CARRIER_MAX_ENDPOINTS) {
         errno = EINVAL;
@@ -233,6 +237,43 @@ int lmux_carrier_manager_set_active(struct lmux_carrier_manager *m,
     ep->mode = mode;
     m->active_index = (int)index;
     m->generation = generation;
+    return 0;
+}
+
+int lmux_carrier_manager_release(struct lmux_carrier_manager *m,
+                                 const char *name)
+{
+    struct lmux_carrier_endpoint *ep;
+    if (!m || !name) {
+        errno = EINVAL;
+        return -1;
+    }
+    ep = lmux_carrier_manager_find(m, name);
+    if (!ep)
+        return -1;
+    if (lmux_carrier_manager_is_active(m, ep)) {
+        errno = EBUSY;
+        return -1;
+    }
+    ep->administratively_released = 1;
+    lmux_carrier_close(&ep->carrier);
+    return 0;
+}
+
+int lmux_carrier_manager_resume(struct lmux_carrier_manager *m,
+                                const char *name)
+{
+    struct lmux_carrier_endpoint *ep;
+    if (!m || !name) {
+        errno = EINVAL;
+        return -1;
+    }
+    ep = lmux_carrier_manager_find(m, name);
+    if (!ep)
+        return -1;
+    ep->administratively_released = 0;
+    ep->carrier.next_attempt_ms = 0;
+    ep->carrier.last_errno = 0;
     return 0;
 }
 
@@ -265,6 +306,8 @@ lmux_carrier_endpoint_state(const struct lmux_carrier_endpoint *ep)
 {
     if (!ep || !ep->configured || ep->carrier.kind == LMUX_CARRIER_NONE)
         return LMUX_CARRIER_ENDPOINT_DOWN;
+    if (ep->administratively_released)
+        return LMUX_CARRIER_ENDPOINT_RELEASED;
     if (lmux_carrier_fd(&ep->carrier) >= 0)
         return LMUX_CARRIER_ENDPOINT_OPEN;
     if (lmux_carrier_listen_fd(&ep->carrier) >= 0)
@@ -282,6 +325,7 @@ const char *lmux_carrier_endpoint_state_name(
     case LMUX_CARRIER_ENDPOINT_LISTENING: return "listening";
     case LMUX_CARRIER_ENDPOINT_OPEN: return "open";
     case LMUX_CARRIER_ENDPOINT_FAILED: return "failed";
+    case LMUX_CARRIER_ENDPOINT_RELEASED: return "released";
     }
     return "unknown";
 }
@@ -320,6 +364,8 @@ int lmux_carrier_manager_start(struct lmux_carrier_manager *m)
         if (!ep)
             continue;
         c = &ep->carrier;
+        if (ep->administratively_released)
+            continue;
         if (!lmux_carrier_is_configured(c))
             continue;
         if (lmux_carrier_start(c) < 0) {
@@ -348,6 +394,8 @@ unsigned lmux_carrier_manager_try_open_except(struct lmux_carrier_manager *m,
             lmux_carrier_manager_at(m, i);
         struct lmux_carrier *c;
         if (!ep || (skip_mask & (1u << i)))
+            continue;
+        if (ep->administratively_released)
             continue;
         c = &ep->carrier;
         if (!lmux_carrier_is_configured(c))

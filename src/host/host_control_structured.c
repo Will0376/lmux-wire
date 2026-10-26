@@ -553,7 +553,8 @@ static int hc2_queue_server_hello(struct v2_host *h, uint64_t request_id)
     if (n > 40)
         n = 40;
     lmux_put_le32(p, LMUX_HC2_CAP_STATUS | LMUX_HC2_CAP_EXEC |
-                  LMUX_HC2_CAP_FILE | LMUX_HC2_CAP_FILE_LIFECYCLE);
+                  LMUX_HC2_CAP_FILE | LMUX_HC2_CAP_FILE_LIFECYCLE |
+                  LMUX_HC2_CAP_STATUS_DETAIL);
     lmux_put_le32(p + 4, LMUX_HC2_MAX_PAYLOAD);
     lmux_put_le32(p + 8, LMUX_HC2_TX_CAP);
     lmux_put_le16(p + 12, (uint16_t)n);
@@ -567,6 +568,15 @@ static int hc2_append_u8(uint8_t *p, size_t cap, size_t *off, uint8_t v)
     if (*off + 1 > cap)
         return -1;
     p[(*off)++] = v;
+    return 0;
+}
+
+static int hc2_append_u16(uint8_t *p, size_t cap, size_t *off, uint16_t v)
+{
+    if (*off + 2 > cap)
+        return -1;
+    lmux_put_le16(p + *off, v);
+    *off += 2;
     return 0;
 }
 
@@ -838,6 +848,273 @@ static int hc2_queue_status(struct v2_host *h, const struct v2_host_status *st,
             return -1;
     }
     return hc2_queue_frame(h, LMUX_HC2_STATUS_REPLY, 0, request_id,
+                           p, (uint32_t)off);
+}
+
+static const char *hc2_lmux_state_name(enum lmux2_conn_state state)
+{
+    switch (state) {
+    case LMUX2_CONN_WAIT_HELLO: return "WAIT_HELLO";
+    case LMUX2_CONN_ESTABLISHED: return "ESTABLISHED";
+    case LMUX2_CONN_ERROR: return "ERROR";
+    }
+    return "UNKNOWN";
+}
+
+static const char *hc2_connection_state(const struct v2_host_status *st)
+{
+    if (st->outer && st->outer->state == LMUX_LINK_ESTABLISHED &&
+        st->conn->state == LMUX2_CONN_ESTABLISHED)
+        return "ONLINE";
+    if ((st->outer && st->outer->state != LMUX_LINK_DOWN) ||
+        (st->carrier && lmux_carrier_fd(st->carrier) >= 0))
+        return "CONNECTING";
+    return "OFFLINE";
+}
+
+static const char *hc2_optional_status_value(const char *value)
+{
+    return value && strcmp(value, "-") != 0 ? value : "";
+}
+
+static const char *hc2_fd_ownership(const struct lmux_carrier *carrier)
+{
+    if (!carrier)
+        return "closed";
+    if (lmux_carrier_fd(carrier) >= 0)
+        return carrier->owns_fd ? "owned" : "borrowed";
+    if (lmux_carrier_listen_fd(carrier) >= 0)
+        return "listener-owned";
+    return "closed";
+}
+
+static const char *hc2_target_confirmation(const struct v2_host_status *st,
+                                           unsigned id)
+{
+    if (!(st->carrier_admin_target_known_mask & (1u << id)))
+        return "unknown";
+    return (st->carrier_admin_target_released_mask & (1u << id)) ?
+        "released" : "unreleased";
+}
+
+static const char *hc2_endpoint_effective_state(
+    const struct v2_host_status *st, const struct lmux_carrier_endpoint *ep,
+    unsigned id)
+{
+    enum lmux_carrier_endpoint_state state = lmux_carrier_endpoint_state(ep);
+    if (ep->administratively_released)
+        return "released";
+    if (lmux_carrier_manager_is_active(st->carriers, ep) &&
+        st->carrier_committed_but_down)
+        return "committed-but-down";
+    if (st->carrier_failure_hold_mask & (1u << id))
+        return "protocol-failed";
+    if (st->carrier_console_hold_mask & (1u << id))
+        return "console-released";
+    if (lmux_carrier_manager_is_active(st->carriers, ep) &&
+        (state == LMUX_CARRIER_ENDPOINT_OPEN ||
+         state == LMUX_CARRIER_ENDPOINT_LISTENING))
+        return "active";
+    if (state == LMUX_CARRIER_ENDPOINT_OPEN ||
+        state == LMUX_CARRIER_ENDPOINT_LISTENING)
+        return "standby";
+    return lmux_carrier_endpoint_state_name(state);
+}
+
+static const char *hc2_control_op_name(enum v2_host_structured_control_kind kind)
+{
+    switch (kind) {
+    case V2_HC2_CTL_NONE: return "idle";
+    case V2_HC2_CTL_INFO: return "info";
+    case V2_HC2_CTL_START: return "start";
+    case V2_HC2_CTL_ATTACH: return "attach";
+    case V2_HC2_CTL_STATUS: return "status";
+    case V2_HC2_CTL_SIGNAL: return "signal";
+    case V2_HC2_CTL_RELEASE: return "release";
+    }
+    return "unknown";
+}
+
+static const char *hc2_current_failure(const struct v2_host_status *st,
+                                       int active_id)
+{
+    if (st->carrier_committed_but_down)
+        return "carrier committed but down";
+    if (active_id >= 0 &&
+        (st->carrier_failure_hold_mask & (1u << (unsigned)active_id)))
+        return "carrier protocol failed";
+    if (!st->outer)
+        return "OUTER disabled";
+    if (st->outer->state != LMUX_LINK_ESTABLISHED)
+        return "OUTER not established";
+    if (st->conn->state != LMUX2_CONN_ESTABLISHED)
+        return "LMUX not established";
+    return "";
+}
+
+static int hc2_queue_status_detail(struct v2_host *h,
+                                   const struct v2_host_status *st,
+                                   uint64_t request_id)
+{
+    uint8_t p[LMUX_HC2_MAX_PAYLOAD];
+    const struct lmux_carrier_endpoint *active = st->carriers ?
+        lmux_carrier_manager_active_endpoint_const(st->carriers) : NULL;
+    int active_id = st->carriers ? st->carriers->active_index : -1;
+    size_t off = 0;
+    unsigned i;
+    uint8_t endpoint_count = 0;
+    uint32_t services_ready = 0, services_desired = 0;
+
+#define APPEND(x) do { if ((x) < 0) return -1; } while (0)
+    APPEND(hc2_append_u16(p, sizeof(p), &off, 1));
+    APPEND(hc2_append_string(p, sizeof(p), &off, active ? active->name : ""));
+    APPEND(hc2_append_string(p, sizeof(p), &off,
+                             active ? lmux_carrier_type_name(active) : "none"));
+    APPEND(hc2_append_string(p, sizeof(p), &off,
+                             active ? lmux_carrier_mode_name(active->mode) : "unknown"));
+    APPEND(hc2_append_string(p, sizeof(p), &off,
+                             active && active->carrier.path ? active->carrier.path : ""));
+    APPEND(hc2_append_string(p, sizeof(p), &off,
+                             active ? lmux_carrier_endpoint_state_name(
+                                 lmux_carrier_endpoint_state(active)) : "down"));
+    APPEND(hc2_append_u8(p, sizeof(p), &off,
+                         active && lmux_carrier_fd(&active->carrier) >= 0));
+    APPEND(hc2_append_string(p, sizeof(p), &off,
+                             hc2_fd_ownership(active ? &active->carrier : NULL)));
+    APPEND(hc2_append_u64(p, sizeof(p), &off,
+                          st->carriers ? st->carriers->generation : 0));
+    APPEND(hc2_append_string(p, sizeof(p), &off,
+                             st->carrier_switch_phase ? st->carrier_switch_phase : "idle"));
+    APPEND(hc2_append_string(p, sizeof(p), &off,
+                             hc2_optional_status_value(st->carrier_switch_name)));
+    APPEND(hc2_append_string(p, sizeof(p), &off,
+                             st->carrier_admin_phase ? st->carrier_admin_phase : "idle"));
+    APPEND(hc2_append_string(p, sizeof(p), &off,
+                             hc2_optional_status_value(st->carrier_admin_name)));
+    APPEND(hc2_append_string(p, sizeof(p), &off,
+                             hc2_optional_status_value(st->carrier_admin_action)));
+    APPEND(hc2_append_u8(p, sizeof(p), &off, st->carrier_committed_but_down));
+    APPEND(hc2_append_u8(p, sizeof(p), &off,
+                         active_id >= 0 &&
+                         (st->carrier_failure_hold_mask & (1u << (unsigned)active_id))));
+    APPEND(hc2_append_u8(p, sizeof(p), &off,
+                         active_id >= 0 &&
+                         (st->carrier_console_hold_mask & (1u << (unsigned)active_id))));
+    APPEND(hc2_append_string(p, sizeof(p), &off,
+                             hc2_current_failure(st, active_id)));
+    APPEND(hc2_append_string(p, sizeof(p), &off,
+                             hc2_optional_status_value(st->carrier_last_error)));
+
+    if (st->carriers)
+        for (i = 0; i < LMUX_CARRIER_MAX_ENDPOINTS; i++)
+            if (lmux_carrier_manager_at_const(st->carriers, i))
+                endpoint_count++;
+    APPEND(hc2_append_u8(p, sizeof(p), &off, endpoint_count));
+    if (st->carriers) {
+        for (i = 0; i < LMUX_CARRIER_MAX_ENDPOINTS; i++) {
+            const struct lmux_carrier_endpoint *ep =
+                lmux_carrier_manager_at_const(st->carriers, i);
+            int is_active, committed, protocol_failed, console_released;
+            if (!ep)
+                continue;
+            is_active = lmux_carrier_manager_is_active(st->carriers, ep);
+            committed = is_active && st->carrier_committed_but_down;
+            protocol_failed = (st->carrier_failure_hold_mask & (1u << i)) != 0;
+            console_released = (st->carrier_console_hold_mask & (1u << i)) != 0;
+            APPEND(hc2_append_string(p, sizeof(p), &off, ep->name));
+            APPEND(hc2_append_string(p, sizeof(p), &off,
+                                     lmux_carrier_type_name(ep)));
+            APPEND(hc2_append_string(p, sizeof(p), &off,
+                                     lmux_carrier_mode_name(ep->mode)));
+            APPEND(hc2_append_string(p, sizeof(p), &off,
+                                     lmux_carrier_mode_name(ep->mode)));
+            APPEND(hc2_append_string(p, sizeof(p), &off,
+                                     is_active ? "active" : "standby"));
+            APPEND(hc2_append_string(p, sizeof(p), &off,
+                                     lmux_carrier_endpoint_state_name(
+                                         lmux_carrier_endpoint_state(ep))));
+            APPEND(hc2_append_string(p, sizeof(p), &off,
+                                     hc2_endpoint_effective_state(st, ep, i)));
+            APPEND(hc2_append_u8(p, sizeof(p), &off,
+                                 ep->administratively_released));
+            APPEND(hc2_append_string(p, sizeof(p), &off,
+                                     hc2_target_confirmation(st, i)));
+            APPEND(hc2_append_string(p, sizeof(p), &off,
+                                     ep->carrier.path ? ep->carrier.path : ""));
+            APPEND(hc2_append_u8(p, sizeof(p), &off,
+                                 lmux_carrier_fd(&ep->carrier) >= 0));
+            APPEND(hc2_append_string(p, sizeof(p), &off,
+                                     hc2_fd_ownership(&ep->carrier)));
+            APPEND(hc2_append_u8(p, sizeof(p), &off, committed));
+            APPEND(hc2_append_u8(p, sizeof(p), &off, protocol_failed));
+            APPEND(hc2_append_u8(p, sizeof(p), &off, console_released));
+            APPEND(hc2_append_u32(p, sizeof(p), &off,
+                                  (uint32_t)ep->carrier.last_errno));
+        }
+    }
+
+    for (i = 0; i < V2_MAX_DESIRED; i++) {
+        if (!h->desired[i].used)
+            continue;
+        services_desired++;
+        if (h->desired[i].service_id)
+            services_ready++;
+    }
+    APPEND(hc2_append_string(p, sizeof(p), &off, hc2_connection_state(st)));
+    APPEND(hc2_append_string(p, sizeof(p), &off,
+                             st->outer ? lmux_link_state_name(st->outer->state) : "DISABLED"));
+    APPEND(hc2_append_string(p, sizeof(p), &off,
+                             hc2_lmux_state_name(st->conn->state)));
+    APPEND(hc2_append_u64(p, sizeof(p), &off,
+                          st->outer ? st->outer->local_conn_id : 0));
+    APPEND(hc2_append_u64(p, sizeof(p), &off,
+                          st->outer ? st->outer->peer_conn_id : 0));
+    APPEND(hc2_append_u64(p, sizeof(p), &off, st->conn->local_conn_id));
+    APPEND(hc2_append_u64(p, sizeof(p), &off, st->conn->peer_conn_id));
+    APPEND(hc2_append_string(p, sizeof(p), &off,
+                             hc2_current_failure(st, active_id)));
+    APPEND(hc2_append_u32(p, sizeof(p), &off, services_ready));
+    APPEND(hc2_append_u32(p, sizeof(p), &off, services_desired));
+
+    APPEND(hc2_append_string(p, sizeof(p), &off,
+                             h->exec_active ?
+                             hc2_control_op_name(h->structured_control_op.kind) : "idle"));
+    APPEND(hc2_append_u32(p, sizeof(p), &off,
+                          (uint32_t)h->structured_control_queue_len));
+    APPEND(hc2_append_u64(p, sizeof(p), &off,
+                          h->exec_retiring_control_stream));
+    APPEND(hc2_append_u64(p, sizeof(p), &off,
+                          h->structured_control_completions));
+    APPEND(hc2_append_u64(p, sizeof(p), &off,
+                          h->structured_control_transactions));
+    APPEND(hc2_append_u64(p, sizeof(p), &off,
+                          h->structured_control_autopolls));
+    APPEND(hc2_append_string(p, sizeof(p), &off,
+                             h->structured_control_queue_len >=
+                             V2_HOST_STRUCTURED_CTL_QUEUE_MAX ?
+                             "control queue full" : ""));
+
+    APPEND(hc2_append_u8(p, sizeof(p), &off, st->dirty != NULL));
+    if (st->dirty) {
+        APPEND(hc2_append_u8(p, sizeof(p), &off,
+                             lmux_dirty_failed(st->dirty)));
+        APPEND(hc2_append_string(p, sizeof(p), &off,
+                                 lmux_dirty_fail_reason_name(st->dirty->fail_reason)));
+        APPEND(hc2_append_u64(p, sizeof(p), &off,
+                              st->dirty->stats.invalid_records));
+        APPEND(hc2_append_u64(p, sizeof(p), &off,
+                              st->dirty->stats.foreign_bytes));
+        APPEND(hc2_append_u64(p, sizeof(p), &off,
+                              st->dirty->stats.packet_crc_failures));
+        APPEND(hc2_append_u64(p, sizeof(p), &off,
+                              st->dirty->stats.retransmitted_fragments));
+        APPEND(hc2_append_u64(p, sizeof(p), &off,
+                              st->dirty->stats.retry_failures));
+        APPEND(hc2_append_u64(p, sizeof(p), &off,
+                              st->dirty->stats.deadline_failures));
+    }
+#undef APPEND
+    return hc2_queue_frame(h, LMUX_HC2_STATUS_DETAIL_REPLY, 0, request_id,
                            p, (uint32_t)off);
 }
 
@@ -2028,6 +2305,11 @@ static void hc2_handle_frame(struct v2_app *a, struct v2_host *h,
     case LMUX_HC2_STATUS_REQUEST:
         if (hc2_queue_status(h, st, fr->request_id) < 0)
             hc2_queue_error(h, fr->request_id, LMUX_HC2_E_RESOURCE_LIMIT, "status too large");
+        break;
+    case LMUX_HC2_STATUS_DETAIL_REQUEST:
+        if (hc2_queue_status_detail(h, st, fr->request_id) < 0)
+            hc2_queue_error(h, fr->request_id, LMUX_HC2_E_RESOURCE_LIMIT,
+                            "status detail too large");
         break;
     case LMUX_HC2_EXEC_START:
         hc2_handle_exec_start(a, h, fr);

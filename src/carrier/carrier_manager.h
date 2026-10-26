@@ -18,7 +18,8 @@ enum lmux_carrier_endpoint_state {
     LMUX_CARRIER_ENDPOINT_DOWN = 0,
     LMUX_CARRIER_ENDPOINT_LISTENING,
     LMUX_CARRIER_ENDPOINT_OPEN,
-    LMUX_CARRIER_ENDPOINT_FAILED
+    LMUX_CARRIER_ENDPOINT_FAILED,
+    LMUX_CARRIER_ENDPOINT_RELEASED
 };
 
 struct lmux_carrier_endpoint {
@@ -26,6 +27,7 @@ struct lmux_carrier_endpoint {
     char name[LMUX_CARRIER_NAME_MAX + 1];
     struct lmux_carrier carrier;
     enum lmux_carrier_mode mode;
+    int administratively_released;
     unsigned long long standby_rx_bytes;
     unsigned long long standby_discard_events;
 };
@@ -71,6 +73,10 @@ int lmux_carrier_manager_set_active(struct lmux_carrier_manager *m,
                                     const char *name,
                                     enum lmux_carrier_mode mode,
                                     uint64_t generation);
+int lmux_carrier_manager_release(struct lmux_carrier_manager *m,
+                                 const char *name);
+int lmux_carrier_manager_resume(struct lmux_carrier_manager *m,
+                                const char *name);
 
 const char *lmux_carrier_mode_name(enum lmux_carrier_mode mode);
 const char *lmux_carrier_type_name(const struct lmux_carrier_endpoint *ep);

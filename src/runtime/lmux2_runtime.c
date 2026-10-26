@@ -42,6 +42,14 @@ enum carrier_switch_phase {
     CARRIER_SWITCH_CONVERGING
 };
 
+enum carrier_admin_phase {
+    CARRIER_ADMIN_IDLE = 0,
+    CARRIER_ADMIN_QUERYING,
+    CARRIER_ADMIN_WAIT_QUERY,
+    CARRIER_ADMIN_SENDING,
+    CARRIER_ADMIN_WAIT_ACK
+};
+
 struct v2_app {
     enum lmux2_role role;
     struct lmux_carrier_manager carriers;
@@ -99,6 +107,22 @@ struct v2_app {
     } carrier_switch;
     int carrier_committed_but_down;
     char carrier_last_error[96];
+    struct {
+        enum carrier_admin_phase phase;
+        uint8_t request_type;
+        char name[LMUX_CARRIER_NAME_MAX + 1];
+        uint8_t nonce[LMUX_LMC1_NONCE_LEN];
+        uint8_t boot_id[LMUX_LMC1_BOOT_ID_LEN];
+        uint64_t generation;
+        long long deadline_ms;
+        long long next_retry_ms;
+    } carrier_admin;
+    unsigned carrier_admin_target_known_mask;
+    unsigned carrier_admin_target_released_mask;
+    char carrier_admin_last_name[LMUX_CARRIER_NAME_MAX + 1];
+    char carrier_admin_last_action[8];
+    char carrier_admin_last_result[16];
+    char carrier_admin_last_error[96];
     struct {
         int active;
         unsigned endpoint;
@@ -308,6 +332,7 @@ int v2_runtime_carrier_console_start(struct v2_app *a, const char *name,
         return -1;
     }
     if (a->carrier_switch.phase != CARRIER_SWITCH_IDLE ||
+        a->carrier_admin.phase != CARRIER_ADMIN_IDLE ||
         a->carrier_console.active) {
         snprintf(error, error_cap, "busy");
         return -1;
@@ -400,8 +425,10 @@ static void carrier_lost(struct v2_app *a)
             a->carrier_failure_hold_mask |= 1u << active;
     }
     if (a->outer_enabled) {
-        if (a->role == LMUX2_ROLE_HOST)
+        if (a->role == LMUX2_ROLE_HOST) {
+            a->carrier_admin_target_known_mask = 0;
             v2_host_control_outer_down(&a->host);
+        }
         lmux_link_endpoint_down(&a->outer);
         retire_connection_streams(a);
     } else {
@@ -1558,8 +1585,10 @@ static void outer_session_down(struct v2_app *a)
 {
     log_msg(a, 1, "outer session down reason=%s",
             a->outer.last_error[0] ? a->outer.last_error : "-");
-    if (a->role == LMUX2_ROLE_HOST)
+    if (a->role == LMUX2_ROLE_HOST) {
+        a->carrier_admin_target_known_mask = 0;
         v2_host_control_outer_down(&a->host);
+    }
     retire_connection_streams(a);
     if (lmux_carrier_fd(active_carrier(a)) >= 0)
         begin_outer(a);
@@ -1577,8 +1606,10 @@ static void outer_peer_restart(struct v2_app *a)
             (unsigned long long)old_peer, (unsigned long long)new_peer);
     log_msg(a, 1, "outer old session retired local=%llu peer=%llu",
             (unsigned long long)old_local, (unsigned long long)old_peer);
-    if (a->role == LMUX2_ROLE_HOST)
+    if (a->role == LMUX2_ROLE_HOST) {
+        a->carrier_admin_target_known_mask = 0;
         v2_host_control_outer_down(&a->host);
+    }
     retire_connection_streams(a);
     if (lmux_link_endpoint_restart_from_pending(&a->outer, new_local, &events) < 0) {
         outer_session_down(a);
@@ -1673,6 +1704,18 @@ static const char *carrier_switch_phase_name(enum carrier_switch_phase phase)
     return "unknown";
 }
 
+static const char *carrier_admin_phase_name(enum carrier_admin_phase phase)
+{
+    switch (phase) {
+    case CARRIER_ADMIN_IDLE: return "idle";
+    case CARRIER_ADMIN_QUERYING: return "querying";
+    case CARRIER_ADMIN_WAIT_QUERY: return "wait-query";
+    case CARRIER_ADMIN_SENDING: return "sending";
+    case CARRIER_ADMIN_WAIT_ACK: return "wait-ack";
+    }
+    return "unknown";
+}
+
 static int carrier_endpoint_index(struct v2_app *a,
                                   struct lmux_carrier_endpoint *ep)
 {
@@ -1713,6 +1756,79 @@ static int queue_switch_msg(struct v2_app *a, uint8_t type)
             lmux_lmc1_type_name(type), ep->name,
             (unsigned long long)msg.generation);
     return 0;
+}
+
+static int queue_admin_msg(struct v2_app *a, uint8_t type)
+{
+    struct lmux_carrier_endpoint *active =
+        lmux_carrier_manager_active_endpoint(&a->carriers);
+    struct lmux_carrier_endpoint *subject =
+        lmux_carrier_manager_find(&a->carriers, a->carrier_admin.name);
+    struct lmux_lmc1_msg msg;
+    int index = carrier_endpoint_index(a, active);
+    if (index < 0 || !subject || lmux_carrier_fd(&active->carrier) < 0) {
+        errno = ENODEV;
+        return -1;
+    }
+    memset(&msg, 0, sizeof(msg));
+    msg.type = type;
+    msg.mode = type == LMUX_LMC1_QUERY ? active->mode : subject->mode;
+    msg.generation = type == LMUX_LMC1_QUERY ?
+        a->carriers.generation : a->carrier_admin.generation;
+    msg.deadline_ms = LMUX_LMC1_DEFAULT_DEADLINE_MS;
+    memcpy(msg.nonce, a->carrier_admin.nonce, sizeof(msg.nonce));
+    memcpy(msg.boot_id, a->carrier_admin.boot_id, sizeof(msg.boot_id));
+    strcpy(msg.name, type == LMUX_LMC1_QUERY ?
+           active->name : a->carrier_admin.name);
+    if (active->mode == LMUX_CARRIER_MODE_DIRTY) {
+        if (lmux_lmc1_dirty_queue(&a->lmc_dirty_io[index], &msg) < 0)
+            return -1;
+    } else if (lmux_lmc1_raw_queue(&a->lmc_io[index], &msg) < 0) {
+        return -1;
+    }
+    log_msg(a, 1, "LMC1 admin %s queued subject=%s via=%s generation=%llu",
+            lmux_lmc1_type_name(type), a->carrier_admin.name, active->name,
+            (unsigned long long)msg.generation);
+    return 0;
+}
+
+static void finish_carrier_admin(struct v2_app *a, int success,
+                                 const char *reason)
+{
+    struct lmux_carrier_endpoint *ep =
+        lmux_carrier_manager_find(&a->carriers, a->carrier_admin.name);
+    int releasing = a->carrier_admin.request_type == LMUX_LMC1_RELEASE;
+    char line[256];
+    snprintf(a->carrier_admin_last_name,
+             sizeof(a->carrier_admin_last_name), "%s",
+             a->carrier_admin.name);
+    snprintf(a->carrier_admin_last_action,
+             sizeof(a->carrier_admin_last_action), "%s",
+             releasing ? "release" : "resume");
+    snprintf(a->carrier_admin_last_result,
+             sizeof(a->carrier_admin_last_result), "%s",
+             success ? "ok" : "partial");
+    snprintf(a->carrier_admin_last_error,
+             sizeof(a->carrier_admin_last_error), "%s",
+             success ? "-" : (reason ? reason : "failed"));
+    if (success) {
+        snprintf(line, sizeof(line),
+                 "OK CARRIER %s name=%s local=%s target=%s generation=%llu\n",
+                 releasing ? "RELEASE" : "RESUME",
+                 a->carrier_admin.name,
+                 ep && ep->administratively_released ? "released" : "resumed",
+                 releasing ? "released" : "resumed",
+                 (unsigned long long)a->carrier_admin.generation);
+    } else {
+        snprintf(line, sizeof(line),
+                 "ERR CARRIER %s partial name=%s local=%s target=unknown %s\n",
+                 releasing ? "RELEASE" : "RESUME",
+                 a->carrier_admin.name,
+                 ep && ep->administratively_released ? "released" : "resumed",
+                 reason ? reason : "failed");
+    }
+    a->carrier_admin.phase = CARRIER_ADMIN_IDLE;
+    v2_host_control_carrier_result(&a->host, line);
 }
 
 static void freeze_old_outer_for_commit(struct v2_app *a)
@@ -1812,6 +1928,63 @@ struct runtime_lmc_context {
     enum lmux_lmc1_codec codec;
 };
 
+static int runtime_lmc_admin_control(struct v2_app *a,
+                                     const struct lmux_lmc1_msg *msg)
+{
+    struct lmux_carrier_endpoint *active;
+    struct lmux_carrier_endpoint *subject;
+    unsigned bit;
+    uint8_t expected;
+    if (a->carrier_admin.phase == CARRIER_ADMIN_IDLE ||
+        !lmux_lmc1_nonce_equal(msg->nonce, a->carrier_admin.nonce))
+        return 0;
+    if (msg->type == LMUX_LMC1_ERROR) {
+        if (msg->status == LMUX_LMC1_STATUS_STALE)
+            a->carrier_admin_target_known_mask = 0;
+        finish_carrier_admin(a, 0, lmux_lmc1_status_name(msg->status));
+        return 1;
+    }
+    if (msg->type == LMUX_LMC1_QUERY_REPLY &&
+        (a->carrier_admin.phase == CARRIER_ADMIN_QUERYING ||
+         a->carrier_admin.phase == CARRIER_ADMIN_WAIT_QUERY)) {
+        active = lmux_carrier_manager_active_endpoint(&a->carriers);
+        if (!active || strcmp(msg->name, active->name) != 0 ||
+            msg->mode != active->mode ||
+            msg->generation != a->carriers.generation) {
+            finish_carrier_admin(a, 0, "authority-conflict");
+            return 1;
+        }
+        memcpy(a->carrier_admin.boot_id, msg->boot_id,
+               sizeof(a->carrier_admin.boot_id));
+        a->carrier_admin.generation = msg->generation;
+        a->carrier_admin.phase = CARRIER_ADMIN_SENDING;
+        a->carrier_admin.next_retry_ms = now_ms();
+        return 1;
+    }
+    expected = a->carrier_admin.request_type == LMUX_LMC1_RELEASE ?
+        LMUX_LMC1_RELEASED : LMUX_LMC1_RESUMED;
+    if (msg->type != expected ||
+        a->carrier_admin.phase != CARRIER_ADMIN_WAIT_ACK)
+        return 1;
+    subject = lmux_carrier_manager_find(&a->carriers,
+                                        a->carrier_admin.name);
+    if (!subject || strcmp(msg->name, a->carrier_admin.name) != 0 ||
+        msg->generation != a->carrier_admin.generation ||
+        memcmp(msg->boot_id, a->carrier_admin.boot_id,
+               LMUX_LMC1_BOOT_ID_LEN) != 0) {
+        finish_carrier_admin(a, 0, "invalid-ack");
+        return 1;
+    }
+    bit = 1u << (unsigned)(subject - a->carriers.endpoint);
+    a->carrier_admin_target_known_mask |= bit;
+    if (a->carrier_admin.request_type == LMUX_LMC1_RELEASE)
+        a->carrier_admin_target_released_mask |= bit;
+    else
+        a->carrier_admin_target_released_mask &= ~bit;
+    finish_carrier_admin(a, 1, NULL);
+    return 1;
+}
+
 static void runtime_lmc_control(void *opaque,
                                 const struct lmux_lmc1_msg *msg)
 {
@@ -1819,7 +1992,11 @@ static void runtime_lmc_control(void *opaque,
     struct v2_app *a = ctx->a;
     struct lmux_carrier_endpoint *ep =
         lmux_carrier_manager_at(&a->carriers, ctx->endpoint);
-    if (!ep || a->carrier_switch.phase == CARRIER_SWITCH_IDLE ||
+    if (!ep)
+        return;
+    if (runtime_lmc_admin_control(a, msg))
+        return;
+    if (a->carrier_switch.phase == CARRIER_SWITCH_IDLE ||
         !lmux_lmc1_nonce_equal(msg->nonce, a->carrier_switch.nonce))
         return;
     log_msg(a, 1, "LMC1 %s received endpoint=%s generation=%llu status=%s",
@@ -2035,6 +2212,15 @@ static void feed_raw_endpoint(struct v2_app *a, unsigned endpoint,
 
 static void switch_tx_completed(struct v2_app *a, uint8_t type)
 {
+    if (a->carrier_admin.phase != CARRIER_ADMIN_IDLE) {
+        if (type == LMUX_LMC1_QUERY &&
+            a->carrier_admin.phase == CARRIER_ADMIN_QUERYING)
+            a->carrier_admin.phase = CARRIER_ADMIN_WAIT_QUERY;
+        else if (type == a->carrier_admin.request_type &&
+                 a->carrier_admin.phase == CARRIER_ADMIN_SENDING)
+            a->carrier_admin.phase = CARRIER_ADMIN_WAIT_ACK;
+        return;
+    }
     if (type == LMUX_LMC1_QUERY &&
         a->carrier_switch.phase == CARRIER_SWITCH_QUERYING)
         a->carrier_switch.phase = CARRIER_SWITCH_WAIT_QUERY;
@@ -2086,6 +2272,88 @@ static void flush_raw_control(struct v2_app *a, unsigned endpoint)
     }
 }
 
+int v2_runtime_carrier_admin_start(struct v2_app *a, const char *name,
+                                   int release, unsigned timeout_ms,
+                                   char *error, size_t error_cap)
+{
+    struct lmux_carrier_endpoint *ep;
+    unsigned endpoint;
+    if (!a || a->role != LMUX2_ROLE_HOST || !a->outer_enabled) {
+        snprintf(error, error_cap, "unavailable");
+        return -1;
+    }
+    ep = lmux_carrier_manager_find(&a->carriers, name);
+    if (!ep) {
+        snprintf(error, error_cap, "unknown-carrier");
+        return -1;
+    }
+    if (release && lmux_carrier_manager_is_active(&a->carriers, ep)) {
+        snprintf(error, error_cap, "active-carrier");
+        return -1;
+    }
+    if (a->carrier_switch.phase != CARRIER_SWITCH_IDLE ||
+        a->carrier_admin.phase != CARRIER_ADMIN_IDLE ||
+        a->carrier_console.active) {
+        snprintf(error, error_cap, "busy");
+        return -1;
+    }
+    endpoint = (unsigned)(ep - a->carriers.endpoint);
+    if ((release ?
+         lmux_carrier_manager_release(&a->carriers, name) :
+         lmux_carrier_manager_resume(&a->carriers, name)) < 0) {
+        snprintf(error, error_cap, errno == EBUSY ?
+                 "active-carrier" : "local-failure");
+        return -1;
+    }
+    if (!lmux_carrier_manager_is_active(&a->carriers, ep)) {
+        lmux_lmc1_raw_init(&a->lmc_io[endpoint]);
+        lmux_lmc1_dirty_init(&a->lmc_dirty_io[endpoint]);
+    }
+    memset(&a->carrier_admin, 0, sizeof(a->carrier_admin));
+    a->carrier_admin.phase = CARRIER_ADMIN_QUERYING;
+    a->carrier_admin.request_type = release ?
+        LMUX_LMC1_RELEASE : LMUX_LMC1_RESUME;
+    strcpy(a->carrier_admin.name, name);
+    runtime_random_bytes(a->carrier_admin.nonce,
+                         sizeof(a->carrier_admin.nonce));
+    a->carrier_admin.deadline_ms = now_ms() + timeout_ms;
+    a->carrier_admin.next_retry_ms = now_ms();
+    a->carrier_admin_target_known_mask &= ~(1u << endpoint);
+    a->carrier_admin_target_released_mask &= ~(1u << endpoint);
+    a->carrier_admin_last_error[0] = 0;
+    return 0;
+}
+
+static void carrier_admin_tick(struct v2_app *a, long long now)
+{
+    uint8_t type;
+    if (a->carrier_admin.phase == CARRIER_ADMIN_IDLE)
+        return;
+    if (now > a->carrier_admin.deadline_ms) {
+        finish_carrier_admin(a, 0, "timeout");
+        return;
+    }
+    if (now < a->carrier_admin.next_retry_ms)
+        return;
+    if (a->carrier_admin.phase == CARRIER_ADMIN_QUERYING ||
+        a->carrier_admin.phase == CARRIER_ADMIN_WAIT_QUERY) {
+        type = LMUX_LMC1_QUERY;
+        if (queue_admin_msg(a, type) == 0) {
+            a->carrier_admin.phase = CARRIER_ADMIN_QUERYING;
+            a->carrier_admin.next_retry_ms = now + 500;
+        }
+        return;
+    }
+    if (a->carrier_admin.phase == CARRIER_ADMIN_SENDING ||
+        a->carrier_admin.phase == CARRIER_ADMIN_WAIT_ACK) {
+        type = a->carrier_admin.request_type;
+        if (queue_admin_msg(a, type) == 0) {
+            a->carrier_admin.phase = CARRIER_ADMIN_SENDING;
+            a->carrier_admin.next_retry_ms = now + 500;
+        }
+    }
+}
+
 int v2_runtime_carrier_switch_start(struct v2_app *a, const char *name,
                                     enum lmux_carrier_mode mode,
                                     unsigned timeout_ms,
@@ -2106,8 +2374,13 @@ int v2_runtime_carrier_switch_start(struct v2_app *a, const char *name,
         snprintf(error, error_cap, "unknown-carrier");
         return -1;
     }
-    if (a->carrier_switch.phase != CARRIER_SWITCH_IDLE) {
+    if (a->carrier_switch.phase != CARRIER_SWITCH_IDLE ||
+        a->carrier_admin.phase != CARRIER_ADMIN_IDLE) {
         snprintf(error, error_cap, "busy");
+        return -1;
+    }
+    if (candidate->administratively_released) {
+        snprintf(error, error_cap, "released");
         return -1;
     }
     /* An explicit switch is the only operation which resumes a UART that was
@@ -2368,6 +2641,24 @@ static void fill_host_status(struct v2_app *a, struct v2_host_status *st)
     }
     st->carrier_console_hold_mask = a->carrier_console_hold_mask;
     st->carrier_failure_hold_mask = a->carrier_failure_hold_mask;
+    st->carrier_admin_phase = carrier_admin_phase_name(a->carrier_admin.phase);
+    st->carrier_admin_name = a->carrier_admin.phase == CARRIER_ADMIN_IDLE ?
+        "-" : a->carrier_admin.name;
+    st->carrier_admin_action = a->carrier_admin.phase == CARRIER_ADMIN_IDLE ?
+        "-" : (a->carrier_admin.request_type == LMUX_LMC1_RELEASE ?
+               "release" : "resume");
+    st->carrier_admin_last_name = a->carrier_admin_last_name[0] ?
+        a->carrier_admin_last_name : "-";
+    st->carrier_admin_last_action = a->carrier_admin_last_action[0] ?
+        a->carrier_admin_last_action : "-";
+    st->carrier_admin_last_result = a->carrier_admin_last_result[0] ?
+        a->carrier_admin_last_result : "-";
+    st->carrier_admin_last_error = a->carrier_admin_last_error[0] ?
+        a->carrier_admin_last_error : "-";
+    st->carrier_admin_target_known_mask =
+        a->carrier_admin_target_known_mask;
+    st->carrier_admin_target_released_mask =
+        a->carrier_admin_target_released_mask;
     st->dirty = a->dirty_active &&
         active_carrier_mode(a) == LMUX_CARRIER_MODE_DIRTY ? &a->dirty : NULL;
 }
@@ -2420,6 +2711,8 @@ static void run_loop(struct v2_app *a)
             try_open_carrier(a);
         if (a->role == LMUX2_ROLE_HOST)
             carrier_console_tick(a, now);
+        if (a->role == LMUX2_ROLE_HOST && a->outer_enabled)
+            carrier_admin_tick(a, now);
         if (a->role == LMUX2_ROLE_HOST && a->outer_enabled)
             carrier_switch_tick(a, now);
         if (a->outer_enabled && a->dirty_active &&

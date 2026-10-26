@@ -654,8 +654,241 @@ static void write_target_services(struct v2_host *h,
     }
 }
 
-void v2_host_status_write(struct v2_app *a, struct v2_host *h,
-                          const struct v2_host_status *st)
+static const char *summary_connection_state(const struct v2_host_status *st)
+{
+    if (st->outer && st->outer->state == LMUX_LINK_ESTABLISHED &&
+        st->conn->state == LMUX2_CONN_ESTABLISHED)
+        return "ONLINE";
+    if ((st->outer && st->outer->state != LMUX_LINK_DOWN) ||
+        (st->carrier && lmux_carrier_fd(st->carrier) >= 0))
+        return "CONNECTING";
+    return "OFFLINE";
+}
+
+static const char *summary_endpoint_state(const struct v2_host_status *st,
+                                          const struct lmux_carrier_endpoint *ep,
+                                          unsigned endpoint_id)
+{
+    enum lmux_carrier_endpoint_state state =
+        lmux_carrier_endpoint_state(ep);
+    if (ep->administratively_released)
+        return "RELEASED";
+    if (lmux_carrier_manager_is_active(st->carriers, ep) &&
+        st->carrier_committed_but_down)
+        return "COMMITTED-DOWN";
+    if (st->carrier_failure_hold_mask & (1u << endpoint_id))
+        return "PROTOCOL-FAILED";
+    if (lmux_carrier_manager_is_active(st->carriers, ep) &&
+        (state == LMUX_CARRIER_ENDPOINT_OPEN ||
+         state == LMUX_CARRIER_ENDPOINT_LISTENING))
+        return "ACTIVE";
+    if (st->carrier_console_hold_mask & (1u << endpoint_id))
+        return "CONSOLE-RELEASED";
+    if (state == LMUX_CARRIER_ENDPOINT_OPEN ||
+        state == LMUX_CARRIER_ENDPOINT_LISTENING)
+        return "STANDBY";
+    if (state == LMUX_CARRIER_ENDPOINT_FAILED)
+        return "FAILED";
+    return "DOWN";
+}
+
+static const char *summary_target_admin(const struct v2_host_status *st,
+                                        unsigned endpoint_id)
+{
+    if (!(st->carrier_admin_target_known_mask & (1u << endpoint_id)))
+        return "unknown";
+    return (st->carrier_admin_target_released_mask & (1u << endpoint_id)) ?
+        "released" : "unreleased";
+}
+
+static void write_status_carrier_summary(struct v2_host *h,
+                                         const struct v2_host_status *st)
+{
+    const struct lmux_carrier_endpoint *active = st->carriers ?
+        lmux_carrier_manager_active_endpoint_const(st->carriers) : NULL;
+    unsigned i;
+
+    control_printf(h, "Carrier:\n");
+    control_printf(h, "  Active: %s%s%s\n",
+                   active ? active->name : "-",
+                   active ? " / " : "",
+                   active ? lmux_carrier_mode_name(active->mode) : "-");
+    control_printf(h, "  Device: %s\n",
+                   active && active->carrier.path ? active->carrier.path : "-");
+    control_printf(h, "  Generation: %llu\n",
+                   (unsigned long long)(st->carriers ?
+                       st->carriers->generation : 0));
+    control_printf(h, "  Switch: %s%s%s\n",
+                   st->carrier_switch_phase ? st->carrier_switch_phase : "idle",
+                   st->carrier_committed_but_down ? " (committed but down" : "",
+                   st->carrier_committed_but_down ? ")" : "");
+    control_printf(h, "  Administrative operation: %s\n",
+                   st->carrier_admin_phase ? st->carrier_admin_phase : "idle");
+    control_printf(h, "\nEndpoints:\n");
+    if (!st->carriers)
+        return;
+    for (i = 0; i < LMUX_CARRIER_MAX_ENDPOINTS; i++) {
+        const struct lmux_carrier_endpoint *ep =
+            lmux_carrier_manager_at_const(st->carriers, i);
+        const char *target, *state;
+        if (!ep)
+            continue;
+        target = summary_target_admin(st, i);
+        state = summary_endpoint_state(st, ep, i);
+        control_printf(h, "  %-10s %-16s %-5s %s",
+                       ep->name, state,
+                       lmux_carrier_mode_name(ep->mode),
+                       lmux_carrier_fd(&ep->carrier) >= 0 ? "open" : "closed");
+        if (ep->administratively_released)
+            control_printf(h, " (host released; target admin: %s)", target);
+        else
+            control_printf(h, " (target admin: %s)", target);
+        if ((st->carrier_failure_hold_mask & (1u << i)) &&
+            strcmp(state, "PROTOCOL-FAILED") != 0)
+            control_printf(h, " [protocol failed]");
+        if ((st->carrier_console_hold_mask & (1u << i)) &&
+            strcmp(state, "CONSOLE-RELEASED") != 0)
+            control_printf(h, " [console released]");
+        if (ep->carrier.last_errno)
+            control_printf(h, " [historical errno=%d]", ep->carrier.last_errno);
+        control_printf(h, "\n");
+    }
+}
+
+static void v2_host_status_write_summary(struct v2_app *a, struct v2_host *h,
+                                         const struct v2_host_status *st,
+                                         int carrier_only)
+{
+    const char *connection = summary_connection_state(st);
+    int desired = 0, ready = 0, i;
+    (void)a;
+
+    control_printf(h, "LMUX Wire %s\n", LMUX_BUILD_VERSION);
+    control_printf(h, "Role: %s\n", role_name(st->role));
+    if (!carrier_only)
+        control_printf(h, "Connection: %s\n", connection);
+    control_printf(h, "\n");
+    write_status_carrier_summary(h, st);
+    if (carrier_only) {
+        if (st->dirty) {
+            control_printf(h, "\nDIRTY (current session):\n");
+            control_printf(h, "  Invalid records: %llu\n",
+                           (unsigned long long)st->dirty->stats.invalid_records);
+            control_printf(h, "  CRC failures: %llu\n",
+                           (unsigned long long)st->dirty->stats.packet_crc_failures);
+            control_printf(h, "  Retransmissions: %llu\n",
+                           (unsigned long long)st->dirty->stats.retransmitted_fragments);
+            control_printf(h, "  Retry failures: %llu\n",
+                           (unsigned long long)(st->dirty->stats.retry_failures +
+                                                st->dirty->stats.deadline_failures));
+        }
+        return;
+    }
+
+    control_printf(h, "\nTransport:\n");
+    control_printf(h, "  OUTER: %s\n", st->outer ?
+                   lmux_link_state_name(st->outer->state) : "DISABLED");
+    control_printf(h, "  LMUX:  %s\n", conn_state_name(st->conn->state));
+    if (strcmp(connection, "ONLINE") != 0) {
+        if (st->carrier_committed_but_down)
+            control_printf(h, "  Current issue: carrier committed but down\n");
+        else if (!st->outer || st->outer->state != LMUX_LINK_ESTABLISHED)
+            control_printf(h, "  Current issue: OUTER is %s\n", st->outer ?
+                           lmux_link_state_name(st->outer->state) : "disabled");
+        else
+            control_printf(h, "  Current issue: LMUX is %s\n",
+                           conn_state_name(st->conn->state));
+    }
+
+    for (i = 0; i < V2_MAX_DESIRED; i++) {
+        if (!h->desired[i].used)
+            continue;
+        desired++;
+        if (h->desired[i].service_id != 0)
+            ready++;
+    }
+    control_printf(h, "\nServices: %d/%d ready\n", ready, desired);
+    for (i = 0; i < V2_MAX_DESIRED; i++) {
+        const struct v2_desired *d = &h->desired[i];
+        if (!d->used)
+            continue;
+        control_printf(h, "  %-10s %s\n", d->name,
+                       d->service_id != 0 ? "ready" :
+                       (d->sent ? "pending" : "not sent"));
+    }
+
+    control_printf(h, "\nStructured EXEC:\n");
+    control_printf(h, "  Control: %s\n",
+                   h->exec_active ? "busy" : "idle");
+    control_printf(h, "  Queue: %d\n", h->structured_control_queue_len);
+    control_printf(h, "  Retiring: %s\n",
+                   h->exec_retiring_control_stream ? "1" : "0");
+    if (st->dirty) {
+        control_printf(h, "\nDIRTY (current session):\n");
+        control_printf(h, "  Invalid records: %llu\n",
+                       (unsigned long long)st->dirty->stats.invalid_records);
+        control_printf(h, "  CRC failures: %llu\n",
+                       (unsigned long long)st->dirty->stats.packet_crc_failures);
+        control_printf(h, "  Retransmissions: %llu\n",
+                       (unsigned long long)st->dirty->stats.retransmitted_fragments);
+        control_printf(h, "  Retry failures: %llu\n",
+                       (unsigned long long)(st->dirty->stats.retry_failures +
+                                            st->dirty->stats.deadline_failures));
+        control_printf(h, "  Last failure (historical): %s\n",
+                       lmux_dirty_fail_reason_name(st->dirty->fail_reason));
+    }
+    control_printf(h, "\nProcess-lifetime counters:\n");
+    control_printf(h, "  LMUX establishments: %llu\n",
+                   st->connection_established_count);
+    control_printf(h, "  LMUX recreations: %llu\n",
+                   st->connection_recreated_count);
+    control_printf(h, "  Peer restarts: %llu\n", st->peer_restart_count);
+    control_printf(h, "  Carrier losses: %llu\n",
+                   st->carrier ? st->carrier->lost_count : 0);
+    control_printf(h, "  Carrier open failures: %llu\n",
+                   st->carrier ? st->carrier->open_fail_count : 0);
+    control_printf(h, "\nHistorical last errors (not current state):\n");
+    control_printf(h, "  Carrier: %s\n",
+                   st->carrier_last_error ? st->carrier_last_error : "-");
+    control_printf(h, "  OUTER: %s\n", st->outer && st->outer->last_error[0] ?
+                   st->outer->last_error : "-");
+    control_printf(h, "  LMUX: %s\n", st->conn->last_error[0] ?
+                   st->conn->last_error : "-");
+}
+
+static void write_structured_exec_diagnostics(struct v2_host *h)
+{
+    control_printf(h,
+                   "structured_exec_control: active=%s phase=%d op=%u queue=%d poll_next=%d stream=%llu retiring_stream=%llu transactions=%llu completions=%llu auto_status=%llu retirements=%llu retire_wait_ticks=%llu\n",
+                   yesno(h->exec_active), h->exec_phase,
+                   (unsigned)h->structured_control_op.kind,
+                   h->structured_control_queue_len,
+                   h->structured_exec_poll_next,
+                   (unsigned long long)h->exec_control_stream,
+                   (unsigned long long)h->exec_retiring_control_stream,
+                   h->structured_control_transactions,
+                   h->structured_control_completions,
+                   h->structured_control_autopolls,
+                   h->structured_control_retirements,
+                   h->structured_control_retire_wait_ticks);
+}
+
+static void write_flow_diagnostics(struct v2_host *h,
+                                   const struct v2_host_status *st)
+{
+    control_printf(h, "flow: conn_tx=%llu peer_max_data=%llu conn_rx=%llu conn_consumed=%llu local_max_data=%llu last_max_data_sent=%llu dirty=%s outq=%zu\n",
+                   (unsigned long long)st->conn->conn_send_offset,
+                   (unsigned long long)st->conn->peer_max_data,
+                   (unsigned long long)st->conn->conn_recv_offset,
+                   (unsigned long long)st->conn->conn_rx_consumed,
+                   (unsigned long long)st->conn->local_max_data,
+                   (unsigned long long)st->conn->last_sent_max_data,
+                   yesno(st->conn->max_data_dirty), st->conn->outq_len);
+}
+
+static void v2_host_status_write_detailed(struct v2_app *a, struct v2_host *h,
+                                          const struct v2_host_status *st,
+                                          int headings, int carrier_only)
 {
     int i;
     (void)a;
@@ -663,6 +896,8 @@ void v2_host_status_write(struct v2_app *a, struct v2_host *h,
     control_printf(h, "local:  %s\n", LMUX_BUILD_VERSION);
     control_printf(h, "wire:   LMUX/2\n");
     control_printf(h, "role:   %s\n", role_name(st->role));
+    if (headings)
+        control_printf(h, "\n[Carrier manager / endpoints / administrative state]\n");
     control_printf(h, "carrier: %s fd=%d opens=%llu lost=%llu open_fail=%llu rx_bytes=%llu tx_bytes=%llu\n",
                    lmux_carrier_fd(st->carrier) >= 0 ? "open" : "down",
                    lmux_carrier_fd(st->carrier),
@@ -686,8 +921,13 @@ void v2_host_status_write(struct v2_app *a, struct v2_host *h,
             if (!ep)
                 continue;
             const struct lmux_carrier *c = &ep->carrier;
+            const char *target_admin =
+                !(st->carrier_admin_target_known_mask &
+                  (1u << endpoint_id)) ? "unknown" :
+                ((st->carrier_admin_target_released_mask &
+                  (1u << endpoint_id)) ? "released" : "resumed");
             control_printf(h,
-                           "carrier_endpoint: name=%s type=%s configured=%s active=%s mode=%s state=%s console_released=%s protocol_failed=%s fd=%d path=%s baud=%u rtscts=%s tty_policy=%s opens=%llu lost=%llu open_fail=%llu last_errno=%d tty_error_stage=%s tty_syscall_errno=%d tty_validation_mismatch=0x%x exclusive_requested=%s exclusive_acquired=%s standby_rx_bytes=%llu standby_discard_events=%llu\n",
+                           "carrier_endpoint: name=%s type=%s configured=%s active=%s mode=%s state=%s administratively_released=%s target_admin=%s console_released=%s protocol_failed=%s fd=%d path=%s baud=%u rtscts=%s tty_policy=%s opens=%llu lost=%llu open_fail=%llu last_errno=%d tty_error_stage=%s tty_syscall_errno=%d tty_validation_mismatch=0x%x exclusive_requested=%s exclusive_acquired=%s standby_rx_bytes=%llu standby_discard_events=%llu\n",
                            ep->name, lmux_carrier_type_name(ep),
                            yesno(ep->configured &&
                                  lmux_carrier_is_configured(c)),
@@ -696,6 +936,8 @@ void v2_host_status_write(struct v2_app *a, struct v2_host *h,
                            lmux_carrier_mode_name(ep->mode),
                            lmux_carrier_endpoint_state_name(
                                lmux_carrier_endpoint_state(ep)),
+                           yesno(ep->administratively_released),
+                           target_admin,
                            yesno(st->carrier_console_hold_mask &
                                  (1u << endpoint_id)),
                            yesno(st->carrier_failure_hold_mask &
@@ -717,6 +959,8 @@ void v2_host_status_write(struct v2_app *a, struct v2_host *h,
                            ep->standby_discard_events);
         }
     }
+    if (headings)
+        control_printf(h, "\n[Carrier switch / LMC1]\n");
     control_printf(h,
                    "carrier_switch: phase=%s pending=%s committed_but_down=%s last_error=%s\n",
                    st->carrier_switch_phase ? st->carrier_switch_phase : "idle",
@@ -727,6 +971,23 @@ void v2_host_status_write(struct v2_app *a, struct v2_host *h,
                    st->carrier_console_state ? st->carrier_console_state : "idle",
                    st->carrier_console_name ? st->carrier_console_name : "-",
                    st->carrier_console_hold_mask);
+    control_printf(h,
+                   "carrier_admin: phase=%s pending=%s action=%s last_endpoint=%s last_action=%s last_result=%s last_error=%s target_known_mask=0x%x target_released_mask=0x%x\n",
+                   st->carrier_admin_phase ? st->carrier_admin_phase : "idle",
+                   st->carrier_admin_name ? st->carrier_admin_name : "-",
+                   st->carrier_admin_action ? st->carrier_admin_action : "-",
+                   st->carrier_admin_last_name ?
+                       st->carrier_admin_last_name : "-",
+                   st->carrier_admin_last_action ?
+                       st->carrier_admin_last_action : "-",
+                   st->carrier_admin_last_result ?
+                       st->carrier_admin_last_result : "-",
+                   st->carrier_admin_last_error ?
+                       st->carrier_admin_last_error : "-",
+                   st->carrier_admin_target_known_mask,
+                   st->carrier_admin_target_released_mask);
+    if (headings)
+        control_printf(h, "\n[DIRTY adapter and diagnostics]\n");
     if (st->dirty) {
         const struct lmux_dirty *d = st->dirty;
         char invalid_hex[LMUX_DIRTY_DIAG_SAMPLE_MAX * 2 + 1];
@@ -813,6 +1074,10 @@ void v2_host_status_write(struct v2_app *a, struct v2_host *h,
             (unsigned long long)d->diagnostic.invalid_reason[
                 LMUX_DIRTY_PARSE_FRAGMENT_CRC]);
     }
+    if (carrier_only)
+        return;
+    if (headings)
+        control_printf(h, "\n[OUTER/1]\n");
     if (st->outer) {
         control_printf(h, "outer: %s local_conn=%llu peer_conn=%llu tx_seq=%llu rx_expected_seq=%llu tx_frames=%llu rx_frames=%llu crc_errors=%llu seq_errors=%llu resync_drops=%llu protocol_errors=%llu tx_payload_max=%u transport_tx_bytes=%llu transport_rx_bytes=%llu last_error=%s\n",
                        lmux_link_state_name(st->outer->state),
@@ -854,6 +1119,8 @@ void v2_host_status_write(struct v2_app *a, struct v2_host *h,
                        h->control_fd >= 0 && !h->boot_control_gone ?
                        "attached" : "detached");
     }
+    if (headings)
+        control_printf(h, "\n[LMUX/2]\n");
     control_printf(h, "connection: %s local_conn=%llu peer_conn=%llu established=%llu recreations=%llu peer_restarts=%llu last_error=%s\n",
                    conn_state_name(st->conn->state),
                    (unsigned long long)st->conn->local_conn_id,
@@ -869,27 +1136,12 @@ void v2_host_status_write(struct v2_app *a, struct v2_host *h,
     control_printf(h, "stream_counters: opens=%llu closes=%llu resets=%llu\n",
                    st->stream_open_count, st->stream_close_count,
                    st->stream_reset_count);
-    control_printf(h,
-                   "structured_exec_control: active=%s phase=%d op=%u queue=%d poll_next=%d stream=%llu retiring_stream=%llu transactions=%llu completions=%llu auto_status=%llu retirements=%llu retire_wait_ticks=%llu\n",
-                   yesno(h->exec_active), h->exec_phase,
-                   (unsigned)h->structured_control_op.kind,
-                   h->structured_control_queue_len,
-                   h->structured_exec_poll_next,
-                   (unsigned long long)h->exec_control_stream,
-                   (unsigned long long)h->exec_retiring_control_stream,
-                   h->structured_control_transactions,
-                   h->structured_control_completions,
-                   h->structured_control_autopolls,
-                   h->structured_control_retirements,
-                   h->structured_control_retire_wait_ticks);
-    control_printf(h, "flow: conn_tx=%llu peer_max_data=%llu conn_rx=%llu conn_consumed=%llu local_max_data=%llu last_max_data_sent=%llu dirty=%s outq=%zu\n",
-                   (unsigned long long)st->conn->conn_send_offset,
-                   (unsigned long long)st->conn->peer_max_data,
-                   (unsigned long long)st->conn->conn_recv_offset,
-                   (unsigned long long)st->conn->conn_rx_consumed,
-                   (unsigned long long)st->conn->local_max_data,
-                   (unsigned long long)st->conn->last_sent_max_data,
-                   yesno(st->conn->max_data_dirty), st->conn->outq_len);
+    if (!headings) {
+        write_structured_exec_diagnostics(h);
+        write_flow_diagnostics(h, st);
+    }
+    if (headings)
+        control_printf(h, "\n[Services and desired-state reconciliation]\n");
     if (st->role == LMUX2_ROLE_TARGET) {
         control_printf(h, "factories: unix-rendezvous pty file exec\n");
     } else {
@@ -914,6 +1166,13 @@ void v2_host_status_write(struct v2_app *a, struct v2_host *h,
         write_host_services(h);
     else
         write_target_services(h, st->target_services);
+    if (headings) {
+        control_printf(h, "\n[Structured EXEC scheduler]\n");
+        write_structured_exec_diagnostics(h);
+        control_printf(h, "\n[Flow control]\n");
+        write_flow_diagnostics(h, st);
+        control_printf(h, "\n[Streams]\n");
+    }
     control_printf(h, "streams:\n");
     for (i = 0; i < LMUX2_CORE_MAX_STREAMS; i++) {
         const struct lmux2_stream *ls = &st->conn->streams[i];
@@ -931,6 +1190,28 @@ void v2_host_status_write(struct v2_app *a, struct v2_host *h,
                        (unsigned long long)ls->last_sent_max_stream_data,
                        yesno(ls->max_stream_data_dirty));
     }
+    if (headings) {
+        control_printf(h, "\n[Failure counters]\n");
+        control_printf(h,
+                       "lifetime_failures: carrier_lost=%llu carrier_open_fail=%llu lmux_recreations=%llu peer_restarts=%llu stream_resets=%llu\n",
+                       st->carrier ? st->carrier->lost_count : 0,
+                       st->carrier ? st->carrier->open_fail_count : 0,
+                       st->connection_recreated_count, st->peer_restart_count,
+                       st->stream_reset_count);
+    }
+}
+
+void v2_host_status_write(struct v2_app *a, struct v2_host *h,
+                          const struct v2_host_status *st)
+{
+    v2_host_status_write_detailed(a, h, st, 0, 0);
+}
+
+static void v2_host_status_write_verbose(struct v2_app *a, struct v2_host *h,
+                                         const struct v2_host_status *st,
+                                         int carrier_only)
+{
+    v2_host_status_write_detailed(a, h, st, 1, carrier_only);
 }
 
 static void control_handle_line(struct v2_app *a, struct v2_host *h,
@@ -948,7 +1229,16 @@ static void control_handle_line(struct v2_app *a, struct v2_host *h,
         return;
     }
     if (strcmp(cmd, "STATUS") == 0) {
-        v2_host_status_write(a, h, st);
+        char format[16] = "";
+        int parsed = sscanf(line, "%*s %15s", format);
+        if (parsed <= 0)
+            v2_host_status_write(a, h, st);
+        else if (strcmp(format, "SUMMARY") == 0)
+            v2_host_status_write_summary(a, h, st, 0);
+        else if (strcmp(format, "VERBOSE") == 0)
+            v2_host_status_write_verbose(a, h, st, 0);
+        else
+            control_printf(h, "ERR STATUS bad-request\n");
         v2_host_close_fd(&h->control_fd);
     } else if (strcmp(cmd, "CARRIER") == 0) {
         char action[16], carrier[LMUX_CARRIER_NAME_MAX + 1], mode[16];
@@ -958,7 +1248,26 @@ static void control_handle_line(struct v2_app *a, struct v2_host *h,
         int file_busy = h->structured_file_active;
         int i;
         if (parsed >= 1 && strcmp(action, "STATUS") == 0) {
-            v2_host_status_write(a, h, st);
+            if (parsed == 1)
+                v2_host_status_write(a, h, st);
+            else if (strcmp(carrier, "SUMMARY") == 0)
+                v2_host_status_write_summary(a, h, st, 1);
+            else if (strcmp(carrier, "VERBOSE") == 0)
+                v2_host_status_write_verbose(a, h, st, 1);
+            else
+                control_printf(h, "ERR CARRIER STATUS bad-request\n");
+            v2_host_close_fd(&h->control_fd);
+            return;
+        }
+        if (parsed >= 1 && strcmp(action, "ACTIVE") == 0) {
+            const struct lmux_carrier_endpoint *active = st->carriers ?
+                lmux_carrier_manager_active_endpoint_const(st->carriers) : NULL;
+            if (parsed != 1 || !active)
+                control_printf(h, "ERR CARRIER ACTIVE unavailable\n");
+            else
+                control_printf(h, "OK CARRIER ACTIVE name=%s mode=%s\n",
+                               active->name,
+                               lmux_carrier_mode_name(active->mode));
             v2_host_close_fd(&h->control_fd);
             return;
         }
@@ -976,6 +1285,21 @@ static void control_handle_line(struct v2_app *a, struct v2_host *h,
                 v2_host_close_fd(&h->control_fd);
             } else {
                 control_detach_carrier_client(h, 3);
+            }
+            return;
+        }
+        if (parsed == 2 &&
+            (strcmp(action, "RELEASE") == 0 ||
+             strcmp(action, "RESUME") == 0)) {
+            char error[64];
+            int releasing = strcmp(action, "RELEASE") == 0;
+            int rc = v2_runtime_carrier_admin_start(
+                a, carrier, releasing, timeout_ms, error, sizeof(error));
+            if (rc < 0) {
+                control_printf(h, "ERR CARRIER %s %s\n", action, error);
+                v2_host_close_fd(&h->control_fd);
+            } else {
+                control_detach_carrier_client(h, 4);
             }
             return;
         }

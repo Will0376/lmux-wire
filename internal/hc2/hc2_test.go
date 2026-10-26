@@ -4,10 +4,32 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"io"
 	"net"
 	"testing"
 )
+
+func putTestU8(b *bytes.Buffer, v byte) { b.WriteByte(v) }
+func putTestU16(b *bytes.Buffer, v uint16) {
+	var p [2]byte
+	binary.LittleEndian.PutUint16(p[:], v)
+	b.Write(p[:])
+}
+func putTestU32(b *bytes.Buffer, v uint32) {
+	var p [4]byte
+	binary.LittleEndian.PutUint32(p[:], v)
+	b.Write(p[:])
+}
+func putTestU64(b *bytes.Buffer, v uint64) {
+	var p [8]byte
+	binary.LittleEndian.PutUint64(p[:], v)
+	b.Write(p[:])
+}
+func putTestString(b *bytes.Buffer, v string) {
+	putTestU16(b, uint16(len(v)))
+	b.WriteString(v)
+}
 
 func buildFrame(t *testing.T, typ uint16, req uint64, payload []byte) []byte {
 	t.Helper()
@@ -95,6 +117,103 @@ func TestEncodeRequests(t *testing.T) {
 	}
 	if _, err := StdinPayload(1, make([]byte, MaxPayload)); err == nil {
 		t.Fatalf("oversized stdin accepted")
+	}
+}
+
+func TestDecodeStatusDetailAndJSONU64Strings(t *testing.T) {
+	var p bytes.Buffer
+	putTestU16(&p, 1)
+	for _, s := range []string{"rescue", "uart-dispatch", "dirty", "/tmp/lmux-uart.sock", "open"} {
+		putTestString(&p, s)
+	}
+	putTestU8(&p, 1)
+	putTestString(&p, "owned")
+	putTestU64(&p, ^uint64(0))
+	putTestString(&p, "idle")
+	putTestString(&p, "-")
+	putTestString(&p, "idle")
+	putTestString(&p, "-")
+	putTestString(&p, "-")
+	putTestU8(&p, 0)
+	putTestU8(&p, 0)
+	putTestU8(&p, 0)
+	putTestString(&p, "")
+	putTestString(&p, "old peer restart")
+	putTestU8(&p, 1)
+	for _, s := range []string{"primary", "tty", "raw", "raw", "standby", "released", "released"} {
+		putTestString(&p, s)
+	}
+	putTestU8(&p, 1)
+	putTestString(&p, "unknown")
+	putTestString(&p, "/dev/ttyACM0")
+	putTestU8(&p, 0)
+	putTestString(&p, "closed")
+	putTestU8(&p, 0)
+	putTestU8(&p, 0)
+	putTestU8(&p, 0)
+	putTestU32(&p, uint32(5))
+	for _, s := range []string{"ONLINE", "ESTABLISHED", "ESTABLISHED"} {
+		putTestString(&p, s)
+	}
+	putTestU64(&p, ^uint64(0))
+	putTestU64(&p, ^uint64(0)-1)
+	putTestU64(&p, ^uint64(0)-2)
+	putTestU64(&p, ^uint64(0)-3)
+	putTestString(&p, "")
+	putTestU32(&p, 5)
+	putTestU32(&p, 5)
+	putTestString(&p, "idle")
+	putTestU32(&p, 0)
+	putTestU64(&p, ^uint64(0)-4)
+	putTestU64(&p, ^uint64(0)-5)
+	putTestU64(&p, ^uint64(0)-6)
+	putTestU64(&p, ^uint64(0)-7)
+	putTestString(&p, "")
+	putTestU8(&p, 1)
+	putTestU8(&p, 0)
+	putTestString(&p, "none")
+	for i := uint64(8); i < 14; i++ {
+		putTestU64(&p, ^uint64(0)-i)
+	}
+
+	o, err := DecodeStatusDetail(p.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !o.Supported || o.Carrier.Name != "rescue" || o.Carrier.Mode != "dirty" ||
+		o.Carrier.Generation != "18446744073709551615" || len(o.Endpoints) != 1 ||
+		o.Endpoints[0].TargetConfirmation != "unknown" ||
+		o.Connection.LMUXLocalID != "18446744073709551613" ||
+		o.Dirty.Session == nil || o.Dirty.Session.InvalidRecords != "18446744073709551607" ||
+		o.Dirty.LifetimeAvailable {
+		t.Fatalf("bad status detail: %+v", o)
+	}
+	wire, err := json.Marshal(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(wire, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	carrier := decoded["carrier"].(map[string]any)
+	if _, ok := carrier["generation"].(string); !ok {
+		t.Fatalf("generation lost string representation: %s", wire)
+	}
+}
+
+func TestStatusDetailRejectsMissingOrUnknownExtension(t *testing.T) {
+	if _, err := DecodeStatusDetail(nil); err == nil {
+		t.Fatal("accepted absent detail payload")
+	}
+	var p bytes.Buffer
+	putTestU16(&p, 2)
+	if _, err := DecodeStatusDetail(p.Bytes()); err == nil {
+		t.Fatal("accepted unknown detail version")
+	}
+	o := UnsupportedObservability("old daemon")
+	if o.Supported || o.UnavailableReason != "old daemon" {
+		t.Fatalf("bad unsupported marker: %+v", o)
 	}
 }
 

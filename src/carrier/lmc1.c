@@ -27,7 +27,7 @@ static void put_le64(uint8_t *p, uint64_t v)
 
 static int type_valid(uint8_t type)
 {
-    return type >= LMUX_LMC1_PREPARE && type <= LMUX_LMC1_ERROR;
+    return type >= LMUX_LMC1_PREPARE && type <= LMUX_LMC1_RESUMED;
 }
 
 static int mode_valid(enum lmux_carrier_mode mode)
@@ -521,6 +521,10 @@ const char *lmux_lmc1_type_name(uint8_t type)
     case LMUX_LMC1_QUERY: return "QUERY";
     case LMUX_LMC1_QUERY_REPLY: return "QUERY_REPLY";
     case LMUX_LMC1_ERROR: return "ERROR";
+    case LMUX_LMC1_RELEASE: return "RELEASE";
+    case LMUX_LMC1_RELEASED: return "RELEASED";
+    case LMUX_LMC1_RESUME: return "RESUME";
+    case LMUX_LMC1_RESUMED: return "RESUMED";
     }
     return "UNKNOWN";
 }

@@ -797,9 +797,11 @@ static int hc2_connect_hello(const char *path)
     }
     caps = lmux_get_le32(payload);
     if ((caps & (LMUX_HC2_CAP_STATUS | LMUX_HC2_CAP_EXEC |
-                 LMUX_HC2_CAP_FILE | LMUX_HC2_CAP_FILE_LIFECYCLE)) !=
+                 LMUX_HC2_CAP_FILE | LMUX_HC2_CAP_FILE_LIFECYCLE |
+                 LMUX_HC2_CAP_STATUS_DETAIL)) !=
         (LMUX_HC2_CAP_STATUS | LMUX_HC2_CAP_EXEC |
-         LMUX_HC2_CAP_FILE | LMUX_HC2_CAP_FILE_LIFECYCLE)) {
+         LMUX_HC2_CAP_FILE | LMUX_HC2_CAP_FILE_LIFECYCLE |
+         LMUX_HC2_CAP_STATUS_DETAIL)) {
         close(fd);
         return -1;
     }
@@ -1663,6 +1665,8 @@ static const char *hc2_type_name(uint16_t type)
     case LMUX_HC2_ERROR: return "ERROR";
     case LMUX_HC2_STATUS_REQUEST: return "STATUS_REQUEST";
     case LMUX_HC2_STATUS_REPLY: return "STATUS_REPLY";
+    case LMUX_HC2_STATUS_DETAIL_REQUEST: return "STATUS_DETAIL_REQUEST";
+    case LMUX_HC2_STATUS_DETAIL_REPLY: return "STATUS_DETAIL_REPLY";
     case LMUX_HC2_EXEC_START: return "EXEC_START";
     case LMUX_HC2_EXEC_STARTED: return "EXEC_STARTED";
     case LMUX_HC2_EXEC_ATTACH: return "EXEC_ATTACH";
@@ -3989,6 +3993,16 @@ static int carrier_manager_standby_without_usb_test(void)
         why = "status lacks named main/rescue endpoints";
         goto out;
     }
+    if (control_request_test(control, "STATUS SUMMARY\n",
+                             out, sizeof(out)) < 0 ||
+        !strstr(out, "Connection: ONLINE") ||
+        !strstr(out, "Active: main / raw") ||
+        !strstr(out, "main") || !strstr(out, "ACTIVE") ||
+        !strstr(out, "rescue") || !strstr(out, "STANDBY") ||
+        !strstr(out, "target admin: unknown")) {
+        why = "named carrier summary";
+        goto out;
+    }
     rc = 0;
 out:
     if (rc != 0) {
@@ -4078,6 +4092,14 @@ static int carrier_manager_usb_without_uart_test(void)
         why = "legacy status lacks active primary";
         goto out;
     }
+    if (control_request_test(control, "STATUS SUMMARY\n",
+                             out, sizeof(out)) < 0 ||
+        !strstr(out, "Connection: ONLINE") ||
+        !strstr(out, "Active: primary / raw") ||
+        strstr(out, "rescue")) {
+        why = "single-carrier summary";
+        goto out;
+    }
     rc = 0;
 out:
     if (rc != 0) {
@@ -4149,6 +4171,57 @@ static int run_lmux_carrier_cli(const char *action, const char *name,
                                 const char *control, char *out, size_t cap)
 {
     return run_lmux_carrier_cli_mode(action, name, "raw", control, out, cap);
+}
+
+static int run_lmux_status_cli(int carrier_only, int verbose,
+                               const char *control, char *out, size_t cap)
+{
+    int p[2], st;
+    pid_t pid;
+    size_t len = 0;
+    if (!control || !out || cap == 0 || pipe(p) < 0)
+        return -1;
+    out[0] = 0;
+    pid = fork();
+    if (pid == 0) {
+        close(p[0]);
+        if (dup2(p[1], STDOUT_FILENO) < 0)
+            _exit(127);
+        close(p[1]);
+        if (carrier_only && verbose)
+            execl("build/host/lmux", "lmux", "carrier", "status",
+                  "--verbose", "--control", control, (char *)NULL);
+        if (carrier_only)
+            execl("build/host/lmux", "lmux", "carrier", "status",
+                  "--control", control, (char *)NULL);
+        if (verbose)
+            execl("build/host/lmux", "lmux", "status", "--verbose",
+                  "--control", control, (char *)NULL);
+        execl("build/host/lmux", "lmux", "status", "--control", control,
+              (char *)NULL);
+        _exit(127);
+    }
+    close(p[1]);
+    if (pid < 0) {
+        close(p[0]);
+        return -1;
+    }
+    while (len + 1 < cap) {
+        ssize_t n = read(p[0], out + len, cap - len - 1);
+        if (n > 0) {
+            len += (size_t)n;
+            out[len] = 0;
+        } else if (n == 0) {
+            break;
+        } else if (errno != EINTR) {
+            close(p[0]);
+            return -1;
+        }
+    }
+    close(p[0]);
+    if (waitpid(pid, &st, 0) != pid)
+        return -1;
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : -1;
 }
 
 static int carrier_dispatcher_handover_console_test(void)
@@ -4271,6 +4344,13 @@ static int carrier_dispatcher_handover_console_test(void)
         !strstr(out,
                 "carrier_console: state=released endpoint=rescue held_mask=0x2")) {
         why = "host UART release state";
+        goto out;
+    }
+    if (control_request_test(control, "STATUS SUMMARY\n",
+                             out, sizeof(out)) < 0 ||
+        !strstr(out, "Connection: OFFLINE") ||
+        !strstr(out, "rescue") || !strstr(out, "CONSOLE-RELEASED")) {
+        why = "console-released summary";
         goto out;
     }
     if (run_lmux_carrier_cli_mode("switch", "primary", "raw", control,
@@ -4500,6 +4580,52 @@ static int carrier_lmc1_state_machine_test(void)
         why = "post-COMMIT QUERY/worker";
         goto out;
     }
+    request = reply;
+    request.type = LMUX_LMC1_RELEASE;
+    strcpy(request.name, "primary");
+    lmc_test_nonce(request.nonce, 8);
+    if (lmc_test_request(fd, &request, &reply) < 0 ||
+        reply.type != LMUX_LMC1_RELEASED || reply.generation != 2 ||
+        strcmp(reply.name, "primary") != 0) {
+        why = "administrative RELEASE";
+        goto out;
+    }
+    if (lmc_test_request(fd, &request, &reply) < 0 ||
+        reply.type != LMUX_LMC1_RELEASED) {
+        why = "duplicate administrative RELEASE";
+        goto out;
+    }
+    request.generation = 1;
+    lmc_test_nonce(request.nonce, 9);
+    if (lmc_test_request(fd, &request, &reply) < 0 ||
+        reply.type != LMUX_LMC1_ERROR ||
+        reply.status != LMUX_LMC1_STATUS_STALE) {
+        why = "stale administrative RELEASE";
+        goto out;
+    }
+    request.generation = 2;
+    request.type = LMUX_LMC1_RESUME;
+    lmc_test_nonce(request.nonce, 10);
+    if (lmc_test_request(fd, &request, &reply) < 0 ||
+        reply.type != LMUX_LMC1_RESUMED || reply.generation != 2) {
+        why = "administrative RESUME";
+        goto out;
+    }
+    strcpy(request.name, "rescue");
+    lmc_test_nonce(request.nonce, 11);
+    if (lmc_test_request(fd, &request, &reply) < 0 ||
+        reply.type != LMUX_LMC1_RESUMED || reply.generation != 2) {
+        why = "idempotent RESUME active";
+        goto out;
+    }
+    request.type = LMUX_LMC1_RELEASE;
+    lmc_test_nonce(request.nonce, 12);
+    if (lmc_test_request(fd, &request, &reply) < 0 ||
+        reply.type != LMUX_LMC1_ERROR ||
+        reply.status != LMUX_LMC1_STATUS_BUSY) {
+        why = "administrative RELEASE active BUSY";
+        goto out;
+    }
     rc = 0;
 out:
     if (rc != 0)
@@ -4521,11 +4647,15 @@ static int carrier_raw_switch_roundtrip_test(void)
     pid_t host = -1, sup = -1, worker = -1;
     uint8_t hc2_payload[LMUX_HC2_MAX_PAYLOAD];
     uint16_t hc2_type = 0;
-    uint64_t hc2_req = 0, file_op = 0;
+    uint64_t hc2_req = 0, file_op = 0, release_exec_ref = 0;
     uint32_t hc2_len = 0;
     int cfd = -1, sfd = -1, worker_stopped = 0, rc = 1;
+    int sup_fds_before_release = -1;
     const char *why = "setup";
     unsigned long long old_local, old_peer;
+    unsigned long long release_outer_local, release_outer_peer;
+    unsigned long long release_lmux_local, release_lmux_peer;
+    const char *release_exec_argv[] = { "/bin/cat" };
 
     if (!mkdtemp(dir))
         return fail("carrier switch mkdtemp");
@@ -4586,6 +4716,28 @@ static int carrier_raw_switch_roundtrip_test(void)
     }
     old_local = status_value(out, "local_conn=");
     old_peer = status_value(out, "peer_conn=");
+    if (run_lmux_status_cli(0, 0, control, out, sizeof(out)) < 0 ||
+        !strstr(out, "Connection: ONLINE") ||
+        !strstr(out, "Active: primary / raw") ||
+        !strstr(out, "OUTER: ESTABLISHED") ||
+        !strstr(out, "LMUX:  ESTABLISHED") ||
+        !strstr(out, "Services:") || !strstr(out, "ready") ||
+        !strstr(out, "Structured EXEC:") ||
+        strstr(out, "carrier_endpoint:")) {
+        why = "primary summary status";
+        goto out;
+    }
+    if (run_lmux_status_cli(0, 1, control, out, sizeof(out)) < 0 ||
+        !strstr(out, "[Carrier manager / endpoints / administrative state]") ||
+        !strstr(out, "[Carrier switch / LMC1]") ||
+        !strstr(out, "[OUTER/1]") || !strstr(out, "[LMUX/2]") ||
+        !strstr(out, "[Services and desired-state reconciliation]") ||
+        !strstr(out, "[Structured EXEC scheduler]") ||
+        !strstr(out, "carrier_endpoint: name=primary") ||
+        !strstr(out, "structured_exec_control:")) {
+        why = "verbose status sections/legacy diagnostics";
+        goto out;
+    }
     if (control_request_test(control,
             "CARRIER SWITCH missing raw 1000\n", out, sizeof(out)) < 0 ||
         !strstr(out, "ERR CARRIER unknown-carrier")) {
@@ -4665,18 +4817,238 @@ static int carrier_raw_switch_roundtrip_test(void)
     }
     if (run_lmux_carrier_cli("status", NULL, control,
                              out, sizeof(out)) < 0 ||
-        !strstr(out, "carrier_manager: active=rescue generation=2") ||
-        !strstr(out, "carrier_switch: phase=idle")) {
+        !strstr(out, "Active: rescue / raw") ||
+        !strstr(out, "Generation: 2") ||
+        !strstr(out, "Switch: idle") ||
+        strstr(out, "Transport:")) {
         why = "carrier CLI status";
         goto out;
     }
-    sfd = hc2_connect_hello_retry(structured, 3000);
-    if (sfd < 0 || hc2_run_echo(sfd, 700, "B2_STRUCTURED_EXEC") < 0) {
-        why = "structured EXEC after rescue";
+    if (run_lmux_status_cli(0, 0, control, out, sizeof(out)) < 0 ||
+        !strstr(out, "Connection: ONLINE") ||
+        !strstr(out, "Active: rescue / raw") ||
+        !strstr(out, "primary") || !strstr(out, "STANDBY") ||
+        !strstr(out, "rescue") || !strstr(out, "ACTIVE")) {
+        why = "rescue summary status";
         goto out;
+    }
+    if (run_lmux_status_cli(1, 1, control, out, sizeof(out)) < 0 ||
+        !strstr(out, "[Carrier manager / endpoints / administrative state]") ||
+        !strstr(out, "[Carrier switch / LMC1]") ||
+        !strstr(out, "[DIRTY adapter and diagnostics]") ||
+        strstr(out, "[Services and desired-state reconciliation]")) {
+        why = "carrier verbose scope";
+        goto out;
+    }
+    if (read_status(control, out, sizeof(out)) < 0) {
+        why = "legacy status compatibility";
+        goto out;
+    }
+    release_outer_local = status_value(out,
+        "outer: ESTABLISHED local_conn=");
+    release_outer_peer = status_value(out, "peer_conn=");
+    {
+        const char *connection = strstr(out, "connection: ESTABLISHED");
+        release_lmux_local = connection ?
+            status_value(connection, "local_conn=") : 0;
+        release_lmux_peer = connection ?
+            status_value(connection, "peer_conn=") : 0;
+    }
+    if (!release_outer_local || !release_outer_peer ||
+        !release_lmux_local || !release_lmux_peer ||
+        run_lmux_carrier_cli("release", "rescue", control,
+                             out, sizeof(out)) == 0 ||
+        !strstr(out, "ERR CARRIER RELEASE active-carrier")) {
+        why = "release active rejected";
+        goto out;
+    }
+    if (run_lmux_carrier_cli("resume", "rescue", control,
+                             out, sizeof(out)) < 0 ||
+        !strstr(out,
+                "OK CARRIER RESUME name=rescue local=resumed target=resumed generation=2")) {
+        why = "resume active idempotent";
+        goto out;
+    }
+    sup_fds_before_release = count_fds(sup);
+    if (sup_fds_before_release < 1) {
+        why = "target fd baseline before release";
+        goto out;
+    }
+    sfd = hc2_connect_hello_retry(structured, 3000);
+    if (sfd < 0 || hc2_exec_start_ready_ref(sfd, 700, "",
+                                             release_exec_argv, 1,
+                                             &release_exec_ref) < 0 ||
+        !release_exec_ref) {
+        why = "structured EXEC before release";
+        goto out;
+    }
+    if (run_lmux_carrier_cli("release", "primary", control,
+                             out, sizeof(out)) < 0 ||
+        !strstr(out,
+                "OK CARRIER RELEASE name=primary local=released target=released generation=2") ||
+        run_lmux_carrier_cli("release", "primary", control,
+                             out, sizeof(out)) < 0 ||
+        read_status(control, out, sizeof(out)) < 0) {
+        why = "release primary";
+        goto out;
+    }
+    {
+        const char *primary_status = strstr(out,
+            "carrier_endpoint: name=primary");
+        const char *connection = strstr(out, "connection: ESTABLISHED");
+        if (!primary_status ||
+            !strstr(primary_status, "state=released") ||
+            !strstr(primary_status, "administratively_released=yes") ||
+            !strstr(primary_status, "target_admin=released") ||
+            !strstr(primary_status, "fd=-1") ||
+            !strstr(out, "carrier_admin: phase=idle") ||
+            !strstr(out, "last_result=ok") ||
+            status_value(out, "outer: ESTABLISHED local_conn=") !=
+                release_outer_local ||
+            status_value(out, "peer_conn=") != release_outer_peer ||
+            !connection ||
+            status_value(connection, "local_conn=") != release_lmux_local ||
+            status_value(connection, "peer_conn=") != release_lmux_peer ||
+            find_child_pid(sup) != worker ||
+            wait_fd_count(sup, sup_fds_before_release - 1, 1000) !=
+                sup_fds_before_release - 1) {
+            why = "release preserved lifecycle/status";
+            goto out;
+        }
+    }
+    if (run_lmux_status_cli(0, 0, control, out, sizeof(out)) < 0 ||
+        !strstr(out, "Connection: ONLINE") ||
+        !strstr(out, "Active: rescue / raw") ||
+        !strstr(out, "primary") || !strstr(out, "RELEASED") ||
+        !strstr(out, "host released; target admin: released")) {
+        why = "released primary summary";
+        goto out;
+    }
+    {
+        static const char marker[] = "RELEASE_EXEC_ALIVE";
+        int echoed = 0, signal_ok = 0, terminal = 0, released = 0;
+        long long end;
+
+        hc2_test_put_u64(hc2_payload, release_exec_ref);
+        memcpy(hc2_payload + 8, marker, sizeof(marker) - 1);
+        if (hc2_send_frame(sfd, LMUX_HC2_EXEC_STDIN_DATA, 701,
+                           hc2_payload, 8 + sizeof(marker) - 1) < 0) {
+            why = "structured EXEC input after release";
+            goto out;
+        }
+        end = now_ms() + 7000;
+        while (now_ms() < end && !echoed) {
+            if (hc2_read_frame(sfd, &hc2_type, &hc2_req, hc2_payload,
+                               &hc2_len, (int)(end - now_ms())) < 0)
+                break;
+            if (hc2_type == LMUX_HC2_EXEC_STDOUT && hc2_len >= 8 &&
+                hc2_test_get_u64(hc2_payload) == release_exec_ref &&
+                hc2_len - 8 == sizeof(marker) - 1 &&
+                memcmp(hc2_payload + 8, marker, sizeof(marker) - 1) == 0)
+                echoed = 1;
+            else if (hc2_type == LMUX_HC2_EXEC_LOST ||
+                     (hc2_type == LMUX_HC2_ERROR && hc2_len >= 4 &&
+                      lmux_get_le32(hc2_payload) != LMUX_HC2_OK)) {
+                why = "structured EXEC lost after release";
+                goto out;
+            }
+        }
+        if (!echoed) {
+            why = "structured EXEC continuity after release";
+            goto out;
+        }
+        hc2_test_put_u64(hc2_payload, release_exec_ref);
+        lmux_put_le32(hc2_payload + 8, LMUX_HC2_SIG_TERM);
+        if (hc2_send_frame(sfd, LMUX_HC2_EXEC_SIGNAL, 702,
+                           hc2_payload, 12) < 0) {
+            why = "structured EXEC TERM after release";
+            goto out;
+        }
+        end = now_ms() + 7000;
+        while (now_ms() < end && (!signal_ok || !terminal)) {
+            if (hc2_read_frame(sfd, &hc2_type, &hc2_req, hc2_payload,
+                               &hc2_len, (int)(end - now_ms())) < 0)
+                break;
+            if (hc2_type == LMUX_HC2_ERROR && hc2_req == 702 &&
+                hc2_len >= 4 &&
+                lmux_get_le32(hc2_payload) == LMUX_HC2_OK)
+                signal_ok = 1;
+            else if (hc2_type == LMUX_HC2_EXEC_STATE && hc2_len >= 32 &&
+                     hc2_test_get_u64(hc2_payload) == release_exec_ref &&
+                     hc2_payload[16] == V2_EXEC_STATUS_DONE)
+                terminal = 1;
+            else if (hc2_type == LMUX_HC2_EXEC_LOST) {
+                why = "structured EXEC lost during cleanup";
+                goto out;
+            }
+        }
+        if (!signal_ok || !terminal) {
+            why = "structured EXEC terminal after release";
+            goto out;
+        }
+        hc2_test_put_u64(hc2_payload, release_exec_ref);
+        if (hc2_send_frame(sfd, LMUX_HC2_EXEC_RELEASE, 703,
+                           hc2_payload, 8) < 0) {
+            why = "structured EXEC token release send";
+            goto out;
+        }
+        end = now_ms() + 3000;
+        while (now_ms() < end && !released) {
+            if (hc2_read_frame(sfd, &hc2_type, &hc2_req, hc2_payload,
+                               &hc2_len, (int)(end - now_ms())) < 0)
+                break;
+            if (hc2_type == LMUX_HC2_EXEC_STATE && hc2_req == 703)
+                released = 1;
+            else if (hc2_type == LMUX_HC2_ERROR && hc2_req == 703 &&
+                     hc2_len >= 4 &&
+                     lmux_get_le32(hc2_payload) != LMUX_HC2_OK) {
+                why = "structured EXEC token release error";
+                goto out;
+            }
+        }
+        if (!released) {
+            why = "structured EXEC token release completion";
+            goto out;
+        }
     }
     close(sfd);
     sfd = -1;
+    if (run_lmux_carrier_cli("resume", "primary", control,
+                             out, sizeof(out)) < 0 ||
+        !strstr(out,
+                "OK CARRIER RESUME name=primary local=resumed target=resumed generation=2") ||
+        run_lmux_carrier_cli("resume", "primary", control,
+                             out, sizeof(out)) < 0) {
+        why = "resume primary";
+        goto out;
+    }
+    {
+        long long end = now_ms() + 5000;
+        int ready = 0;
+        while (now_ms() < end) {
+            const char *primary_status;
+            if (read_status(control, out, sizeof(out)) < 0)
+                continue;
+            primary_status = strstr(out, "carrier_endpoint: name=primary");
+            if (primary_status && strstr(primary_status, "state=open") &&
+                strstr(primary_status, "administratively_released=no") &&
+                strstr(primary_status, "target_admin=resumed")) {
+                ready = 1;
+                break;
+            }
+            usleep(20000);
+        }
+        if (!ready ||
+            status_value(out, "outer: ESTABLISHED local_conn=") !=
+                release_outer_local ||
+            status_value(out, "peer_conn=") != release_outer_peer ||
+            find_child_pid(sup) != worker ||
+            wait_fd_count(sup, sup_fds_before_release, 5000) !=
+                sup_fds_before_release) {
+            why = "resume reopened without lifecycle change";
+            goto out;
+        }
+    }
     if (run_lmux_carrier_cli_mode("switch", "rescue", "dirty", control,
                                  out, sizeof(out)) < 0 ||
         !strstr(out, "OK CARRIER active=rescue mode=dirty generation=3") ||
@@ -4687,6 +5059,15 @@ static int carrier_raw_switch_roundtrip_test(void)
         why = "rescue raw to dirty";
         goto out;
     }
+    if (run_lmux_status_cli(0, 0, control, out, sizeof(out)) < 0 ||
+        !strstr(out, "Connection: ONLINE") ||
+        !strstr(out, "Active: rescue / dirty") ||
+        !strstr(out, "DIRTY (current session):") ||
+        !strstr(out, "Invalid records:") ||
+        !strstr(out, "Historical last errors (not current state):")) {
+        why = "DIRTY summary status";
+        goto out;
+    }
     sfd = hc2_connect_hello_retry(structured, 3000);
     if (sfd < 0 || hc2_run_echo(sfd, 701, "B4_DIRTY_EXEC") < 0) {
         why = "structured EXEC after dirty";
@@ -4694,6 +5075,47 @@ static int carrier_raw_switch_roundtrip_test(void)
     }
     close(sfd);
     sfd = -1;
+    if (read_status(control, out, sizeof(out)) < 0) {
+        why = "DIRTY administrative baseline";
+        goto out;
+    }
+    release_outer_local = status_value(out,
+        "outer: ESTABLISHED local_conn=");
+    release_outer_peer = status_value(out, "peer_conn=");
+    {
+        const char *connection = strstr(out, "connection: ESTABLISHED");
+        release_lmux_local = connection ?
+            status_value(connection, "local_conn=") : 0;
+        release_lmux_peer = connection ?
+            status_value(connection, "peer_conn=") : 0;
+    }
+    if (run_lmux_carrier_cli("release", "primary", control,
+                             out, sizeof(out)) < 0 ||
+        !strstr(out,
+                "OK CARRIER RELEASE name=primary local=released target=released generation=3") ||
+        read_status(control, out, sizeof(out)) < 0 ||
+        status_value(out, "outer: ESTABLISHED local_conn=") !=
+            release_outer_local || status_value(out, "peer_conn=") !=
+            release_outer_peer || find_child_pid(sup) != worker) {
+        why = "release primary over DIRTY";
+        goto out;
+    }
+    {
+        const char *connection = strstr(out, "connection: ESTABLISHED");
+        if (!connection || status_value(connection, "local_conn=") !=
+            release_lmux_local || status_value(connection, "peer_conn=") !=
+            release_lmux_peer) {
+            why = "release over DIRTY changed LMUX";
+            goto out;
+        }
+    }
+    if (run_lmux_carrier_cli("resume", "primary", control,
+                             out, sizeof(out)) < 0 ||
+        !strstr(out,
+                "OK CARRIER RESUME name=primary local=resumed target=resumed generation=3")) {
+        why = "resume primary over DIRTY";
+        goto out;
+    }
     if (control_request_timeout_test(control,
             "CARRIER SWITCH rescue raw 15000\n", 18000,
             out, sizeof(out)) < 0 ||
@@ -4820,6 +5242,16 @@ static int carrier_recovery_without_primary_one(const char *mode)
         !strstr(out, "carrier_manager: active=rescue generation=2") ||
         find_child_pid(sup) != worker) {
         why = "standby recovery convergence";
+        goto out;
+    }
+    if (control_request_test(control, "STATUS SUMMARY\n",
+                             out, sizeof(out)) < 0 ||
+        !strstr(out, "Connection: ONLINE") ||
+        !strstr(out, "Active: rescue / ") ||
+        !strstr(out, mode) ||
+        !strstr(out, "primary") ||
+        (!strstr(out, "FAILED") && !strstr(out, "DOWN"))) {
+        why = "standby unavailable summary";
         goto out;
     }
     rc = 0;
@@ -5026,6 +5458,237 @@ static int carrier_raw_ambiguous_fault_test(void)
                                         1) ||
         carrier_raw_ambiguous_fault_one(1, LMUX_LMC1_COMMIT,
                                         "lost-COMMIT", 0);
+}
+
+static int carrier_admin_lost_ack_test(void)
+{
+    char dir[] = "/tmp/lmux-carrier-admin-it-XXXXXX";
+    char control[192], hfd[32], tfd[32], hrescue[64], trescue[64];
+    char out[16384];
+    int primary[2] = { -1, -1 }, hc[2] = { -1, -1 };
+    int tc[2] = { -1, -1 }, note[2] = { -1, -1 };
+    pid_t host = -1, sup = -1, proxy = -1, worker = -1;
+    unsigned long long outer_local, outer_peer, lmux_local, lmux_peer;
+    int rc = 1;
+    const char *why = "setup";
+
+    out[0] = 0;
+    if (!mkdtemp(dir) || socketpair(AF_UNIX, SOCK_STREAM, 0, primary) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, hc) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, tc) < 0 || pipe(note) < 0)
+        return fail("carrier admin lost ACK setup");
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(hfd, sizeof(hfd), "%d", primary[0]);
+    snprintf(tfd, sizeof(tfd), "%d", primary[1]);
+    snprintf(hrescue, sizeof(hrescue), "rescue=%d", hc[1]);
+    snprintf(trescue, sizeof(trescue), "rescue=%d", tc[1]);
+    proxy = spawn_lmc_drop_proxy(hc[0], tc[0], 0,
+                                 LMUX_LMC1_RELEASED, note[1]);
+    if (proxy < 0) {
+        why = "proxy";
+        goto out;
+    }
+    host = fork();
+    if (host == 0) {
+        execl("build/host/lmuxd", "lmuxd", "--role", "host", "--outer",
+              "--carrier-fd", hfd, "--carrier-name", "primary",
+              "--standby-carrier-fd", hrescue,
+              "--control", control, (char *)NULL);
+        _exit(127);
+    }
+    sup = fork();
+    if (sup == 0) {
+        execl("build/host/lmuxd", "lmuxd", "--supervisor", "--outer",
+              "--carrier-fd", tfd, "--carrier-name", "primary",
+              "--standby-carrier-fd", trescue, (char *)NULL);
+        _exit(127);
+    }
+    close(primary[0]); primary[0] = -1;
+    close(primary[1]); primary[1] = -1;
+    close(hc[0]); hc[0] = -1;
+    close(hc[1]); hc[1] = -1;
+    close(tc[0]); tc[0] = -1;
+    close(tc[1]); tc[1] = -1;
+    close(note[1]); note[1] = -1;
+    if (host < 0 || sup < 0 ||
+        wait_ready_layers(control, 1, 15000, out, sizeof(out)) < 0) {
+        why = "initial establishment";
+        goto out;
+    }
+    worker = wait_child_pid(sup, -1, 5000);
+    if (worker <= 0 || control_request_timeout_test(control,
+            "CARRIER SWITCH rescue raw 15000\n", 18000,
+            out, sizeof(out)) < 0 ||
+        !strstr(out, "OK CARRIER active=rescue mode=raw generation=2") ||
+        read_status(control, out, sizeof(out)) < 0) {
+        why = "switch rescue";
+        goto out;
+    }
+    outer_local = status_value(out, "outer: ESTABLISHED local_conn=");
+    outer_peer = status_value(out, "peer_conn=");
+    {
+        const char *connection = strstr(out, "connection: ESTABLISHED");
+        lmux_local = connection ? status_value(connection, "local_conn=") : 0;
+        lmux_peer = connection ? status_value(connection, "peer_conn=") : 0;
+    }
+    if (control_request_timeout_test(control,
+            "CARRIER RELEASE primary\n", 10000,
+            out, sizeof(out)) < 0 ||
+        !strstr(out, "OK CARRIER RELEASE name=primary") ||
+        !(wait_fd_event(note[0], POLLIN, 2000) & POLLIN)) {
+        why = "lost RELEASED recovery";
+        goto out;
+    }
+    {
+        char mark = 0;
+        const char *primary_status;
+        const char *connection;
+        if (read(note[0], &mark, 1) != 1 || mark != 'D' ||
+            read_status(control, out, sizeof(out)) < 0) {
+            why = "lost ACK observation";
+            goto out;
+        }
+        primary_status = strstr(out, "carrier_endpoint: name=primary");
+        connection = strstr(out, "connection: ESTABLISHED");
+        if (!primary_status || !strstr(primary_status, "state=released") ||
+            !strstr(primary_status, "target_admin=released") ||
+            status_value(out, "outer: ESTABLISHED local_conn=") !=
+                outer_local || status_value(out, "peer_conn=") != outer_peer ||
+            !connection || status_value(connection, "local_conn=") !=
+                lmux_local || status_value(connection, "peer_conn=") !=
+                lmux_peer || find_child_pid(sup) != worker) {
+            why = "lost ACK changed lifecycle";
+            goto out;
+        }
+    }
+    if (control_request_test(control, "STATUS SUMMARY\n",
+                             out, sizeof(out)) < 0 ||
+        !strstr(out, "Connection: ONLINE") ||
+        !strstr(out, "primary") || !strstr(out, "RELEASED") ||
+        !strstr(out, "host released; target admin: released")) {
+        why = "lost ACK recovered target confirmation summary";
+        goto out;
+    }
+    rc = 0;
+out:
+    if (rc != 0) {
+        fprintf(stderr, "carrier admin lost ACK failure: %s\n", why);
+        dump_excerpt("carrier admin lost ACK", out);
+    }
+    stop_pid(host);
+    stop_pid(sup);
+    stop_pid(proxy);
+    if (primary[0] >= 0) close(primary[0]);
+    if (primary[1] >= 0) close(primary[1]);
+    if (hc[0] >= 0) close(hc[0]);
+    if (hc[1] >= 0) close(hc[1]);
+    if (tc[0] >= 0) close(tc[0]);
+    if (tc[1] >= 0) close(tc[1]);
+    if (note[0] >= 0) close(note[0]);
+    if (note[1] >= 0) close(note[1]);
+    unlink(control);
+    rmdir(dir);
+    return rc;
+}
+
+static int carrier_admin_partial_completion_test(void)
+{
+    char dir[] = "/tmp/lmux-carrier-admin-partial-it-XXXXXX";
+    char control[192], hactive[32], tactive[32];
+    char hstandby[64], tstandby[64], out[16384];
+    int active[2] = { -1, -1 }, standby[2] = { -1, -1 };
+    pid_t host = -1, sup = -1, worker = -1;
+    unsigned long long outer_local, outer_peer, lmux_local, lmux_peer;
+    int rc = 1;
+    const char *why = "setup";
+
+    out[0] = 0;
+    if (!mkdtemp(dir) || socketpair(AF_UNIX, SOCK_STREAM, 0, active) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, standby) < 0)
+        return fail("carrier admin partial setup");
+    snprintf(control, sizeof(control), "%s/control.sock", dir);
+    snprintf(hactive, sizeof(hactive), "%d", active[0]);
+    snprintf(tactive, sizeof(tactive), "%d", active[1]);
+    snprintf(hstandby, sizeof(hstandby), "primary=%d", standby[0]);
+    snprintf(tstandby, sizeof(tstandby), "target-primary=%d", standby[1]);
+    host = fork();
+    if (host == 0) {
+        execl("build/host/lmuxd", "lmuxd", "--role", "host", "--outer",
+              "--carrier-fd", hactive, "--carrier-name", "rescue",
+              "--standby-carrier-fd", hstandby,
+              "--control", control, (char *)NULL);
+        _exit(127);
+    }
+    sup = fork();
+    if (sup == 0) {
+        execl("build/host/lmuxd", "lmuxd", "--supervisor", "--outer",
+              "--carrier-fd", tactive, "--carrier-name", "rescue",
+              "--standby-carrier-fd", tstandby, (char *)NULL);
+        _exit(127);
+    }
+    close(active[0]); active[0] = -1;
+    close(active[1]); active[1] = -1;
+    close(standby[0]); standby[0] = -1;
+    close(standby[1]); standby[1] = -1;
+    if (host < 0 || sup < 0 ||
+        wait_ready_layers(control, 1, 15000, out, sizeof(out)) < 0) {
+        why = "initial establishment";
+        goto out;
+    }
+    worker = wait_child_pid(sup, -1, 5000);
+    outer_local = status_value(out, "outer: ESTABLISHED local_conn=");
+    outer_peer = status_value(out, "peer_conn=");
+    {
+        const char *connection = strstr(out, "connection: ESTABLISHED");
+        lmux_local = connection ? status_value(connection, "local_conn=") : 0;
+        lmux_peer = connection ? status_value(connection, "peer_conn=") : 0;
+    }
+    if (worker <= 0 || !outer_local || !outer_peer ||
+        !lmux_local || !lmux_peer) {
+        why = "initial identities";
+        goto out;
+    }
+    if (run_lmux_carrier_cli("release", "primary", control,
+                             out, sizeof(out)) == 0 ||
+        !strstr(out,
+                "ERR CARRIER RELEASE partial name=primary local=released target=unknown UNKNOWN_CARRIER") ||
+        read_status(control, out, sizeof(out)) < 0) {
+        why = "partial response";
+        goto out;
+    }
+    {
+        const char *primary_status = strstr(out,
+            "carrier_endpoint: name=primary");
+        const char *connection = strstr(out, "connection: ESTABLISHED");
+        if (!primary_status || !strstr(primary_status, "state=released") ||
+            !strstr(primary_status, "administratively_released=yes") ||
+            !strstr(primary_status, "target_admin=unknown") ||
+            !strstr(out, "last_result=partial") ||
+            !strstr(out, "last_error=UNKNOWN_CARRIER") ||
+            status_value(out, "outer: ESTABLISHED local_conn=") !=
+                outer_local || status_value(out, "peer_conn=") != outer_peer ||
+            !connection || status_value(connection, "local_conn=") !=
+                lmux_local || status_value(connection, "peer_conn=") !=
+                lmux_peer || find_child_pid(sup) != worker) {
+            why = "partial status/lifecycle";
+            goto out;
+        }
+    }
+    rc = 0;
+out:
+    if (rc != 0) {
+        fprintf(stderr, "carrier admin partial failure: %s\n", why);
+        dump_excerpt("carrier admin partial", out);
+    }
+    stop_pid(host);
+    stop_pid(sup);
+    if (active[0] >= 0) close(active[0]);
+    if (active[1] >= 0) close(active[1]);
+    if (standby[0] >= 0) close(standby[0]);
+    if (standby[1] >= 0) close(standby[1]);
+    unlink(control);
+    rmdir(dir);
+    return rc;
 }
 
 static int carrier_dirty_fault_handover_test(void)
@@ -5420,6 +6083,15 @@ static int carrier_dirty_explicit_failure_one(int disappear)
         why = "explicit failure state/worker";
         goto out;
     }
+    if (control_request_test(control, "STATUS SUMMARY\n",
+                             out, sizeof(out)) < 0 ||
+        strstr(out, "Connection: ONLINE") ||
+        !strstr(out, "COMMITTED-DOWN") ||
+        !strstr(out, "[protocol failed]") ||
+        !strstr(out, "Current issue: carrier committed but down")) {
+        why = "explicit failure summary";
+        goto out;
+    }
     rc = 0;
 out:
     if (rc != 0) {
@@ -5751,6 +6423,7 @@ static int carrier_raw_unavailable_busy_test(void)
     char dir[] = "/tmp/lmux-carrier-unavailable-it-XXXXXX";
     char primary[192], rescue[192], control[192], rescue_spec[256];
     char first[8192] = { 0 }, second[512] = { 0 };
+    char admin_busy[512] = { 0 };
     pid_t host = -1;
     int fd1 = -1, fd2 = -1, peer = -1, rc = 1;
     const char *why = "setup";
@@ -5817,6 +6490,12 @@ query_seen:
         why = "read-only status during switch";
         goto out;
     }
+    if (control_request_test(control, "CARRIER RELEASE rescue\n",
+                             admin_busy, sizeof(admin_busy)) < 0 ||
+        !strstr(admin_busy, "ERR CARRIER BUSY switch-active")) {
+        why = "administrative release during switch BUSY";
+        goto out;
+    }
     fd2 = wait_connect(control, 3000);
     if (fd2 < 0) {
         why = "concurrent request";
@@ -5857,6 +6536,7 @@ out:
         fprintf(stderr, "carrier unavailable/BUSY failure: %s\n", why);
         dump_excerpt("carrier unavailable first", first);
         dump_excerpt("carrier unavailable second", second);
+        dump_excerpt("carrier unavailable admin", admin_busy);
     }
     if (fd1 >= 0) close(fd1);
     if (fd2 >= 0) close(fd2);
@@ -5896,8 +6576,16 @@ static int legacy_named_primary_status_test(void)
             strstr(out, "carrier_endpoint: name=primary type=tty") &&
             strstr(out, "configured=yes active=yes mode=raw state=failed") &&
             strstr(out, carrier)) {
-            rc = 0;
-            break;
+            if (control_request_test(control, "STATUS SUMMARY\n",
+                                     out, sizeof(out)) == 0 &&
+                strstr(out, "Connection: OFFLINE") &&
+                strstr(out, "primary") && strstr(out, "FAILED") &&
+                strstr(out, "OUTER: DOWN") &&
+                strstr(out, "LMUX:  WAIT_HELLO") &&
+                strstr(out, "Current issue: OUTER is DOWN")) {
+                rc = 0;
+                break;
+            }
         }
         usleep(20000);
     }
@@ -9846,6 +10534,14 @@ static int structured_control_test(void)
     where = "handshake status frame";
     if (type != LMUX_HC2_STATUS_REPLY || req != 2 || len < 64)
         goto out;
+    where = "handshake status detail send";
+    if (hc2_send_frame(fd, LMUX_HC2_STATUS_DETAIL_REQUEST, 25, NULL, 0) < 0)
+        goto out;
+    where = "handshake status detail frame";
+    if (hc2_read_frame(fd, &type, &req, payload, &len, 3000) < 0 ||
+        type != LMUX_HC2_STATUS_DETAIL_REPLY || req != 25 || len < 100 ||
+        lmux_get_le16(payload) != 1)
+        goto out;
     where = "handshake duplicate hello";
     if (hc2_send_frame(fd, LMUX_HC2_CLIENT_HELLO, 24, NULL, 0) < 0 ||
         hc2_expect_error(fd, 24, LMUX_HC2_E_PROTOCOL) < 0)
@@ -13528,8 +14224,14 @@ int main(int argc, char **argv)
             carrier_raw_switch_roundtrip_test() ||
             carrier_raw_recovery_without_primary_test() ||
             carrier_raw_ambiguous_fault_test() ||
+            carrier_admin_lost_ack_test() ||
+            carrier_admin_partial_completion_test() ||
             carrier_raw_old_loss_timing_test() ||
             carrier_raw_unavailable_busy_test() ? 1 : 0;
+    if (getenv("LMUX_SUP_IT_ONLY_STATUS_UX"))
+        return carrier_raw_switch_roundtrip_test() ? 1 : 0;
+    if (getenv("LMUX_SUP_IT_ONLY_STATUS_PARTIAL"))
+        return carrier_admin_partial_completion_test() ? 1 : 0;
     if (getenv("LMUX_SUP_IT_ONLY_CARRIER_AMBIGUOUS"))
         return carrier_raw_ambiguous_fault_test() ? 1 : 0;
     if (getenv("LMUX_SUP_IT_ONLY_CARRIER_B4"))
@@ -13683,6 +14385,8 @@ int main(int argc, char **argv)
         carrier_raw_switch_roundtrip_test() ||
         carrier_raw_recovery_without_primary_test() ||
         carrier_raw_ambiguous_fault_test() ||
+        carrier_admin_lost_ack_test() ||
+        carrier_admin_partial_completion_test() ||
         carrier_raw_old_loss_timing_test() ||
         carrier_raw_unavailable_busy_test() ||
         carrier_dirty_fault_handover_test() ||

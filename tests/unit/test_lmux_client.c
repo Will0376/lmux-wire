@@ -9,6 +9,7 @@
 #endif
 
 #include <stdio.h>
+#include <sys/wait.h>
 
 static int fail(const char *msg)
 {
@@ -106,7 +107,8 @@ static int capture_cmd_connect_failure(const char *path, const char *want)
         return -1;
     }
     close(p[1]);
-    rc = cmd_connect(path, 1, NULL, 1, 0, path);
+    rc = cmd_connect(path, 1, NULL, 1, 0, path,
+                     "/tmp/lmux-client-test-no-control.sock");
     fflush(stderr);
     if (dup2(saved, STDERR_FILENO) < 0) {
         close(saved); close(p[0]);
@@ -146,7 +148,8 @@ static int test_term_disconnected_loop(void)
     close(in[0]);
     close(out[1]);
     close(err[1]);
-    rc = term_bridge_loop(sv[0], NULL, 1, 0, "console1");
+    rc = term_bridge_loop(sv[0], NULL, 1, 0, "console1",
+                          "/tmp/lmux-client-test-no-control.sock");
     fflush(stderr);
     (void)dup2(save_in, STDIN_FILENO);
     (void)dup2(save_out, STDOUT_FILENO);
@@ -189,7 +192,8 @@ static int test_term_attached_after_remote_data(void)
     close(in[0]);
     close(out[1]);
     close(err[1]);
-    rc = term_bridge_loop(sv[0], NULL, 1, 0, "console1");
+    rc = term_bridge_loop(sv[0], NULL, 1, 0, "console1",
+                          "/tmp/lmux-client-test-no-control.sock");
     fflush(stderr);
     (void)dup2(save_in, STDIN_FILENO);
     (void)dup2(save_out, STDOUT_FILENO);
@@ -204,7 +208,75 @@ static int test_term_attached_after_remote_data(void)
     ebuf[en] = 0;
     return rc == 0 && on == 1 && obuf[0] == 'R' &&
         strstr(ebuf, "[waiting: console1]") != NULL &&
-        strstr(ebuf, "[attached: console1]") != NULL ? 0 : -1;
+        strstr(ebuf, "[attached: console1]") != NULL &&
+        strstr(ebuf, " via ") == NULL ? 0 : -1;
+}
+
+static int test_term_carrier_snapshot(const char *reply, const char *want)
+{
+    struct term_carrier_snapshot snapshot;
+    char ebuf[256];
+    int p[2], saved;
+    ssize_t n;
+    if (!reply || strlen(reply) >= sizeof(snapshot.reply) || pipe(p) < 0)
+        return -1;
+    memset(&snapshot, 0, sizeof(snapshot));
+    snapshot.fd = -1;
+    strcpy(snapshot.reply, reply);
+    snapshot.reply_len = strlen(reply);
+    term_snapshot_parse(&snapshot);
+    if (snapshot.state != TERM_SNAPSHOT_READY)
+        return -1;
+    saved = dup(STDERR_FILENO);
+    if (saved < 0)
+        return -1;
+    if (dup2(p[1], STDERR_FILENO) < 0)
+        return -1;
+    close(p[1]);
+    term_print_attached_via("console1", &snapshot);
+    fflush(stderr);
+    if (dup2(saved, STDERR_FILENO) < 0)
+        return -1;
+    close(saved);
+    n = read(p[0], ebuf, sizeof(ebuf) - 1);
+    close(p[0]);
+    if (n < 0)
+        return -1;
+    ebuf[n] = 0;
+    return strstr(ebuf, want) ? 0 : -1;
+}
+
+static int test_term_snapshot_transport(void)
+{
+    static const char reply[] =
+        "OK CARRIER ACTIVE name=rescue mode=dirty\n";
+    struct term_carrier_snapshot snapshot;
+    int sv[2];
+    char request[64];
+    ssize_t n;
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
+        return -1;
+    memset(&snapshot, 0, sizeof(snapshot));
+    snapshot.fd = sv[0];
+    snapshot.state = TERM_SNAPSHOT_WRITING;
+    term_snapshot_process(&snapshot, POLLOUT);
+    n = read(sv[1], request, sizeof(request) - 1);
+    if (n <= 0) {
+        close(sv[0]); close(sv[1]);
+        return -1;
+    }
+    request[n] = 0;
+    if (strcmp(request, "CARRIER ACTIVE\n") != 0 ||
+        write(sv[1], reply, sizeof(reply) - 1) != (ssize_t)sizeof(reply) - 1) {
+        close(sv[0]); close(sv[1]);
+        return -1;
+    }
+    term_snapshot_process(&snapshot, POLLIN);
+    close(sv[1]);
+    return snapshot.state == TERM_SNAPSHOT_READY && snapshot.fd == -1 &&
+        strcmp(snapshot.name, "rescue") == 0 &&
+        strcmp(snapshot.mode, "dirty") == 0 ? 0 : -1;
 }
 
 static int check_filter(const uint8_t *in, size_t in_len, const uint8_t *want, size_t want_len, int want_detach)
@@ -439,6 +511,16 @@ int main(void)
         return fail("term EOF disconnected label");
     if (test_term_attached_after_remote_data() < 0)
         return fail("term remote attachment evidence");
+    if (test_term_carrier_snapshot(
+            "OK CARRIER ACTIVE name=primary mode=raw\n",
+            "[attached: console1 via primary/raw]") < 0)
+        return fail("term primary/raw carrier snapshot");
+    if (test_term_carrier_snapshot(
+            "OK CARRIER ACTIVE name=rescue mode=dirty\n",
+            "[attached: console1 via rescue/dirty]") < 0)
+        return fail("term rescue/dirty carrier snapshot");
+    if (test_term_snapshot_transport() < 0)
+        return fail("term nonblocking carrier snapshot request");
     if (capture_cmd_connect_failure("/tmp/lmux-client-test-no-such.sock",
                                     "lmux term: /tmp/lmux-client-test-no-such.sock: connect:") < 0)
         return fail("term connect failure identity");

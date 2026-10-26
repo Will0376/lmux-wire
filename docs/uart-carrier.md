@@ -20,8 +20,8 @@ Every configured endpoint has four separate properties:
 - `name`: stable logical identity, such as `primary` or `rescue`;
 - `type`: I/O backend, currently `tty` in production;
 - `mode`: `raw` or `dirty` carrier framing;
-- `state`: `down`, `listening`, `open`, or `failed`, plus a separate active
-  role owned by the manager.
+- `state`: `down`, `listening`, `open`, `failed`, or administratively
+  `released`, plus a separate active role owned by the manager.
 
 Names contain 1 through 31 characters. The first character is alphanumeric;
 the remainder may also contain `.`, `_`, and `-`. Matching is exact and
@@ -33,10 +33,12 @@ in LMC1. Exactly one configured endpoint is authoritative; exactly one OUTER/1
 instance uses it. An endpoint may be down without preventing the other endpoint
 from opening or remaining active.
 
-With the B1.1 structures, `sizeof(struct lmux_carrier_endpoint)` is 176 bytes
-and `sizeof(struct lmux_carrier_manager)` is 368 bytes on the ARM EABI5 target
-(184 and 384 bytes respectively on the x86_64 host). These are fixed bounds;
-names, endpoint table entries, and reopen counters allocate no heap memory.
+With the current structures, `sizeof(struct lmux_carrier_endpoint)` is 1032
+bytes and `sizeof(struct lmux_carrier_manager)` is 2080 bytes on the ARM EABI5
+target (1112 and 2240 bytes respectively on the x86_64 host). These fixed
+bounds include the later bounded dispatcher/diagnostic carrier state and the
+administrative flag; names, endpoint table entries, and reopen state allocate
+no heap memory.
 
 The target supervisor owns its carrier manager. The worker continues to own
 LMUX/2 and services and sees carrier changes only through the existing LMS1
@@ -154,9 +156,11 @@ Standby foreign records are discarded. Accumulation is bounded at 4352 bytes;
 an oversize active RAW record is a protocol/carrier failure.
 
 The implemented messages are `PREPARE`, `READY`, `COMMIT`, `COMMITTED`,
-`QUERY`, `QUERY_REPLY`, and `ERROR`. Status values cover `BUSY`, unknown
-carrier, unsupported mode, stale transaction, bad cookie, expired transaction,
-bad request, and unavailable endpoint.
+`QUERY`, `QUERY_REPLY`, `ERROR`, `RELEASE`, `RELEASED`, `RESUME`, and
+`RESUMED`. Status values cover `BUSY`, unknown carrier, unsupported mode,
+stale transaction, bad cookie, expired transaction, bad request, and
+unavailable endpoint. Administrative release/resume uses the same decoded
+LMC1 record and version; it does not alter OUTER/1 or LMUX/2.
 
 The switch exchange is:
 
@@ -255,8 +259,10 @@ no OUTER record at all.
 ## Host CLI and observable completion
 
 ```text
-lmux carrier status [--control SOCKET]
+lmux carrier status [--verbose] [--control SOCKET]
 lmux carrier switch NAME [--mode raw|dirty] [--timeout-ms N] [--control SOCKET]
+lmux carrier release NAME [--control SOCKET]
+lmux carrier resume NAME [--control SOCKET]
 ```
 
 The default mode is RAW and the default timeout is 30 seconds; accepted bounds
@@ -269,6 +275,134 @@ incarnation, and desired-service reconciliation have all completed. It never
 means merely that COMMIT was written. Status reports active name/mode,
 generation, named endpoint states, pending switch phase/name, OUTER/LMUX state,
 last switch error, and `committed-but-down`. The legacy `carrier:` field remains.
+
+## Administrative endpoint release and resume
+
+`carrier release` is distinct from switching and from the dispatcher's
+`console_released` state. Release applies only to a configured **standby**
+endpoint. Releasing the authoritative active endpoint is rejected as
+`ERR CARRIER RELEASE active-carrier` before its local fd is closed. This guard
+prevents an operator from administratively releasing the only carrier that is
+currently carrying the control transaction, including when it is the only
+working UART.
+
+For a valid standby release, the host first closes that local endpoint and
+places it under an administrative hold, then sends the control transaction
+over the still-authoritative active carrier. The target supervisor closes the
+same inactive logical endpoint and replies only after its carrier manager has
+applied the hold. While held, the endpoint is omitted from polling, accepting,
+opening, and periodic reopen; its observable state is `released` and its fd is
+closed. The active OUTER and LMUX connection IDs, carrier generation, worker,
+PTY services, structured EXEC control, streams, and other services are not
+retired or recreated.
+
+The control exchange is:
+
+```text
+QUERY(nonce) -> QUERY_REPLY(target_boot_id, current_generation, active_name/mode)
+RELEASE(same_nonce, target_boot_id, current_generation, subject_name)
+    -> RELEASED(same transaction identity)
+
+QUERY(nonce) -> QUERY_REPLY(...)
+RESUME(same_nonce, target_boot_id, current_generation, subject_name)
+    -> RESUMED(same transaction identity)
+```
+
+The exact bounded logical name is the subject; device paths and local table
+indices are never transmitted. The messages use the RAW or DIRTY LMC1 codec of
+the authoritative active endpoint, not the released subject endpoint. The
+target rejects an old boot ID or generation as `STALE`, release of an active
+subject or a concurrent handover as `BUSY`, and an unmatched name as
+`UNKNOWN_CARRIER`. Resume is an idempotent no-op when the named endpoint is
+already unheld, including when it is active. It retains the last two
+administrative replies, so an identical request nonce can recover a lost
+`RELEASED` or `RESUMED` reply without applying a second state transition.
+
+Release and resume require compatible LMC1 administrative-message support in
+the running host and target implementations. Matching carrier names and an
+established older LMC1 switch implementation are not sufficient. A mixed
+deployment which does not understand `RELEASE`/`RELEASED` and
+`RESUME`/`RESUMED` cannot provide coordinated endpoint ownership and may end
+with only the host-local state known.
+
+Host-local application happens before remote confirmation. Therefore a lost
+carrier or target rejection can produce an intentional partial result: status
+reports the local hold and `target_admin=unknown`, and the CLI returns failure.
+The target may already have applied the request when its confirmation is lost,
+so this result is also operationally ambiguous: successful local release does
+not imply successful target release, and `unknown` must not be reported as
+`released`. There is no automatic rollback or carrier switch. Reissuing the
+same operator action is an explicit operator decision; it starts a fresh
+bounded transaction and converges idempotently. Read-only status remains
+available while the transaction is pending.
+
+The completion forms make that distinction explicit:
+
+```text
+OK CARRIER RELEASE name=primary local=released target=released generation=N
+ERR CARRIER RELEASE partial name=primary local=released target=unknown REASON
+```
+
+`carrier resume` clears the administrative hold on both sides and permits the
+ordinary configured open/listen/connect retry policy. Its success confirms the
+removal of the hold, not that a physically absent device has opened. Resume
+does not change carrier authority or generation and does not switch back to
+that endpoint. A subsequent explicit `carrier switch` is required.
+
+Status deliberately separates administrative policy from transport health and
+from console ownership:
+
+| Status field | Meaning |
+| --- | --- |
+| `state=released`, `administratively_released=yes`, `fd=-1` | The local administrative hold is applied; reopen is disabled. |
+| `state=down` or `state=failed`, `administratively_released=no` | The endpoint is not held; normal open/reopen policy remains eligible. |
+| `target_admin=released` or `target_admin=resumed` | The current target supervisor confirmed that administrative state. |
+| `target_admin=unknown` | No current target confirmation exists; local state alone is not proof of target state. |
+| `console_released=yes` | The separate DIRTY console-handoff hold is active; this is not administrative release. |
+| `carrier_admin: phase=...` and `last_result=...` | Current transaction progress and the last complete or partial outcome. |
+
+Closing `/dev/ttyACM0` on the host and `/dev/ttyGS0` on the target releases
+LMUX ownership only. It does not unbind a USB gadget, change the USB controller
+role, remove either device node, or alter USB enumeration. Once both LMUX fds
+are closed, another application may open the endpoints subject to the platform
+and device-driver ownership rules.
+
+Administrative holds are deliberately process-local and are not written to
+disk. Restarting either daemon reconstructs endpoint policy from its startup
+configuration, so that side is no longer known to be released. An OUTER peer
+restart clears host target-confirmation status. If release must remain policy
+after a supervisor or host-daemon restart, platform startup must configure that
+policy or the operator must issue `carrier release` again after reconciliation.
+A previously successful confirmation must not be treated as current after
+either endpoint-owning process restarts.
+
+Restoring a released primary is two explicit operations: resume ownership
+first, verify that the endpoint can reopen, and then request a separate carrier
+switch. Resume alone never changes the authoritative carrier:
+
+```sh
+lmux carrier switch rescue --mode dirty
+lmux carrier release primary
+lmux carrier status
+
+# Primary is now released on both host and target.
+# OUTER/LMUX continue to run through rescue.
+
+lmux carrier resume primary
+lmux carrier switch primary --mode raw
+```
+
+### Hardware acceptance record
+
+The coordinated release contract was exercised on a Hantek DSO2D15 with
+`1.0.2+build.966`. Host `/dev/ttyACM0` and target `/dev/ttyGS0` were both
+released, both LMUX-owned fds closed, and neither automatic reopen loop resumed
+ownership during the observation window. USB CDC ACM remained available for
+unrelated applications. The active rescue/DIRTY carrier, OUTER and LMUX
+incarnations, managed worker, services, and structured EXEC remained usable.
+
+This is a historical hardware-acceptance result, not a requirement that LMUX
+be deployed on Hantek hardware.
 
 ## B2 fixed memory bounds
 
@@ -283,6 +417,12 @@ two-entry completed cache is 208 bytes. Including the boot ID and small scalar
 state, target B2 carrier-control storage is 9376 fixed bytes; the complete
 supervisor structure is 53840 bytes. `lmux_lmc1_msg` is 104 bytes in memory
 (the wire representation remains exactly 112 bytes).
+
+The later administrative release/resume extension adds a separate bounded
+two-entry completed-reply cache plus its index (212 bytes on ARM) so lost
+`RELEASED`/`RESUMED` can be replayed without consuming or evicting switch
+COMMIT history. It adds no per-transaction allocation or queue; the endpoint
+administrative flags are included in the current manager sizes above.
 
 ## DIRTY/1 grammar
 

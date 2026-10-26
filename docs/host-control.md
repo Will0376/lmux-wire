@@ -11,6 +11,39 @@ such as `lmux status`, `lmux term`, `lmux put`, `lmux get`, `lmux deploy`, and
 `lmux boot`. The structured API is a separate listener owned by the same
 `lmuxd` process and serviced by the same single `poll()` loop.
 
+## Legacy text status requests
+
+The legacy local control socket accepts these read-only requests:
+
+```text
+STATUS
+STATUS SUMMARY
+STATUS VERBOSE
+CARRIER STATUS
+CARRIER STATUS SUMMARY
+CARRIER STATUS VERBOSE
+CARRIER ACTIVE
+```
+
+Bare `STATUS` and `CARRIER STATUS` retain the pre-1.0.3 detailed text response
+for scripts and tests that already consume it. The CLI uses `SUMMARY` for its
+default human view and `VERBOSE` for the sectioned diagnostic view.
+`CARRIER STATUS` variants are limited to carrier-manager, LMC1, and DIRTY
+diagnostics. `CARRIER ACTIVE` is the bounded terminal-client snapshot and
+returns only the active logical name and mode:
+
+```text
+OK CARRIER ACTIVE name=rescue mode=dirty
+```
+
+For compatibility, the retained detailed text spells a confirmed cleared
+target hold as `target_admin=resumed`. Summary status and structured
+`STATUS_DETAIL` normalize that same state to `unreleased`; `released` and
+`unknown` have the same spelling in both representations.
+
+These are local text-control additions. The separate HC2 `STATUS_DETAIL`
+extension described below does not parse or reuse these text responses.
+
 ## Socket
 
 `lmuxd` accepts an optional structured socket path:
@@ -106,6 +139,7 @@ STATUS
 EXEC
 FILE
 FILE_LIFECYCLE
+STATUS_DETAIL
 ```
 
 `FILE` is advertised only by builds that implement the path-based structured
@@ -113,6 +147,8 @@ PUT/GET operations over the existing LMUX FILE/LXF service.
 `FILE_LIFECYCLE` advertises the v1.0.1 daemon-owned status/cancel and
 caller-token idempotency extension. A v1.0.1 `lmux-mcp` diagnoses its absence
 explicitly instead of sending lifecycle frames to a v1.0.0 daemon.
+`STATUS_DETAIL` advertises the additive 1.0.3 read-only observability request.
+Clients that do not know it continue to use the unchanged `STATUS_REPLY`.
 
 Before `CLIENT_HELLO`, all non-hello operations receive a protocol error.
 `SERVER_HELLO` uses the same `request_id` as the `CLIENT_HELLO`. After the
@@ -169,6 +205,16 @@ The payload includes:
 
 The status reply is intentionally a useful stable subset, not a binary copy of
 every line from `lmux status`.
+
+`STATUS_DETAIL_REQUEST` is a separate capability-gated request. Its versioned
+reply adds carrier-manager endpoints, administrative and target confirmation
+state, current connection health, decimal-preserved OUTER/LMUX identities,
+service reconciliation counts, bounded structured EXEC scheduler state, and
+current DIRTY adapter counters. It reads the same authoritative runtime state
+as the CLI but remains structured. It does not change the legacy
+`STATUS_REPLY`, create another HC2 connection, query the target directly, or
+add an LMUX/target service. A client connected to an older daemon must report
+the detail as unsupported rather than infer a logical carrier.
 
 ## Execution References
 

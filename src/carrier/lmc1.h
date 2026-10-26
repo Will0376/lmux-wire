@@ -33,7 +33,11 @@ enum lmux_lmc1_type {
     LMUX_LMC1_COMMITTED = 4,
     LMUX_LMC1_QUERY = 5,
     LMUX_LMC1_QUERY_REPLY = 6,
-    LMUX_LMC1_ERROR = 7
+    LMUX_LMC1_ERROR = 7,
+    LMUX_LMC1_RELEASE = 8,
+    LMUX_LMC1_RELEASED = 9,
+    LMUX_LMC1_RESUME = 10,
+    LMUX_LMC1_RESUMED = 11
 };
 
 enum lmux_lmc1_status {

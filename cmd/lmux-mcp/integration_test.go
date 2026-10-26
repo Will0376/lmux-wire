@@ -63,6 +63,9 @@ func TestMCPProcessIntegration(t *testing.T) {
 	if !hasTool(tools, "lmux_status") {
 		t.Fatalf("tools/list missing lmux_status: %+v", tools.Tools)
 	}
+	if !hasTool(tools, "command_list") {
+		t.Fatalf("tools/list missing command_list: %+v", tools.Tools)
+	}
 	if !hasTool(tools, "debug_capabilities") {
 		t.Fatalf("tools/list missing debug_capabilities: %+v", tools.Tools)
 	}
@@ -74,6 +77,25 @@ func TestMCPProcessIntegration(t *testing.T) {
 	status := callTool(t, mcpSession, "lmux_status", map[string]any{})
 	if !strings.Contains(mustJSON(status), "__exec") {
 		t.Fatalf("status missing __exec: %v", status)
+	}
+	observability, ok := status["observability"].(map[string]any)
+	if !ok || observability["supported"] != true {
+		t.Fatalf("status detail unavailable: %v", status)
+	}
+	connection, ok := observability["connection"].(map[string]any)
+	if !ok || connection["overall"] == "" || connection["lmux_state"] != "ESTABLISHED" ||
+		connection["outer_local_id"] == nil || connection["lmux_local_id"] == nil {
+		t.Fatalf("bad connection observability: %v", observability)
+	}
+	carrierStatus, ok := observability["carrier"].(map[string]any)
+	if !ok || carrierStatus["name"] == "" || carrierStatus["mode"] != "raw" ||
+		carrierStatus["generation"] == nil {
+		t.Fatalf("bad carrier observability: %v", observability)
+	}
+	endpoints, ok := observability["endpoints"].([]any)
+	if !ok || len(endpoints) != 1 ||
+		endpoints[0].(map[string]any)["target_administrative_confirmation"] != "unknown" {
+		t.Fatalf("bad endpoint observability: %v", observability)
 	}
 	caps := callTool(t, mcpSession, "debug_capabilities", map[string]any{})
 	if caps["target_exec_capacity"] == nil || caps["self_debug_lmux_supported"] != false {
@@ -117,6 +139,28 @@ func TestMCPProcessIntegration(t *testing.T) {
 	}
 	if stdout != "OUT" || stderr != "ERR" {
 		t.Fatalf("bad transcript stdout=%q stderr=%q", stdout, stderr)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	finalState := ""
+	for time.Now().Before(deadline) {
+		commandStatus := callTool(t, mcpSession, "command_status", map[string]any{"command_token": token})
+		finalState, _ = commandStatus["state"].(string)
+		if commandStatus["state"] == "DONE" || commandStatus["state"] == "START_FAILED" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if finalState != "DONE" && finalState != "START_FAILED" {
+		t.Fatalf("command did not reach a retained terminal state: %s", finalState)
+	}
+	listed := callTool(t, mcpSession, "command_list", map[string]any{"include_terminal": true})
+	if !strings.Contains(mustJSON(listed), token) || listed["scope"] != "mcp_session" {
+		t.Fatalf("command_list missing retained token %q: %v", token, listed)
+	}
+	callTool(t, mcpSession, "command_release", map[string]any{"command_token": token})
+	listed = callTool(t, mcpSession, "command_list", map[string]any{"include_terminal": true})
+	if strings.Contains(mustJSON(listed), token) {
+		t.Fatalf("released command remained listed: %v", listed)
 	}
 
 	localSrc := filepath.Join(dir, "put.bin")

@@ -1077,6 +1077,7 @@ file_operation_wait
 file_operation_cancel
 
 command_start
+command_list
 command_status
 command_read
 command_write_stdin
@@ -1246,18 +1247,29 @@ It must not pretend that missing transcript data is available.
 
 ## Observability
 
-`lmux_status` should return a structured subset of existing host status:
+`lmux_status` returns the compatible structured subset plus a capability-gated
+`observability` object:
 
 - carrier configured/open state;
 - OUTER enabled/state/counters;
 - LMUX established/recreation marker;
-- worker incarnation marker when available;
+- LMUX local/peer incarnation identity as precision-safe decimal strings;
 - service availability for `files` and `__exec`;
 - desired service reconciliation state;
-- active MCP sessions/commands count from `lmux-mcp`.
+- structured EXEC scheduler health;
+- current-session DIRTY counters, explicitly distinct from unavailable
+  process-lifetime DIRTY totals.
 
-It should not return only the human `lmux status` text blob. It also should not
-require new target wire solely for MCP observability.
+`command_list` enumerates only commands retained by the current MCP process
+session. It defaults to nonterminal commands and may include retained terminal
+commands on request. Cached live states are marked stale when target/worker
+availability cannot currently verify them. The list does not reconstruct old
+tokens from journals after MCP process restart and does not create a global
+command registry. Results are bounded to 128 entries; `truncated` and
+`total_matching` explicitly identify an incomplete result.
+
+It does not return the human `lmux status` text blob and does not require new
+target wire solely for MCP observability.
 
 Human observability is also a supported host-side feature. A user should be
 able to open `tail -F` or `lnav` on the current session journal before or

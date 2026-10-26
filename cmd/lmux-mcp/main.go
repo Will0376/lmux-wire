@@ -454,6 +454,14 @@ func (a *app) callTool(ctx context.Context, name string, args json.RawMessage) (
 	switch name {
 	case "lmux_status":
 		return a.toolStatus()
+	case "command_list":
+		var p struct {
+			IncludeTerminal bool `json:"include_terminal"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil {
+			return nil, err
+		}
+		return a.toolCommandList(p.IncludeTerminal)
 	case "command_start":
 		var p struct {
 			Argv []string `json:"argv"`
@@ -867,20 +875,136 @@ func (a *app) withDebug(token string, fn func(*debugmgr.Session) (any, error)) (
 }
 
 func (a *app) toolStatus() (any, error) {
-	c, caps, err := a.client()
+	st, c, caps, err := a.requestLegacyStatus()
 	if err != nil {
 		return nil, err
 	}
+	if caps&hc2.CapStatusDetail == 0 {
+		st.Observability = hc2.UnsupportedObservability(
+			"connected lmuxd does not advertise HC2 STATUS_DETAIL")
+		return st, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	fr, err := c.Request(ctx, hc2.TypeStatusDetailRequest, nil)
+	if err != nil {
+		return nil, err
+	}
+	if fr.Type != hc2.TypeStatusDetailReply {
+		return nil, fmt.Errorf("unexpected STATUS_DETAIL response frame %d", fr.Type)
+	}
+	st.Observability, err = hc2.DecodeStatusDetail(fr.Payload)
+	if err != nil {
+		return nil, fmt.Errorf("decode STATUS_DETAIL: %w", err)
+	}
+	return st, nil
+}
+
+func (a *app) requestLegacyStatus() (hc2.Status, *hc2.Client, uint32, error) {
+	c, caps, err := a.client()
+	if err != nil {
+		return hc2.Status{}, nil, 0, err
+	}
 	if caps&hc2.CapStatus == 0 {
-		return nil, errors.New("STATUS capability unavailable")
+		return hc2.Status{}, nil, caps, errors.New("STATUS capability unavailable")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	fr, err := c.Request(ctx, hc2.TypeStatusRequest, nil)
 	if err != nil {
-		return nil, err
+		return hc2.Status{}, nil, caps, err
 	}
-	return hc2.DecodeStatus(fr.Payload)
+	if fr.Type != hc2.TypeStatusReply {
+		return hc2.Status{}, nil, caps,
+			fmt.Errorf("unexpected STATUS response frame %d", fr.Type)
+	}
+	st, err := hc2.DecodeStatus(fr.Payload)
+	return st, c, caps, err
+}
+
+const (
+	commandListLimit = 128
+	commandFreshness = 5 * time.Second
+)
+
+func commandTerminalState(state string) bool {
+	switch state {
+	case "DONE", "FAILED", "START_FAILED", "LOST":
+		return true
+	default:
+		return false
+	}
+}
+
+func (a *app) commandTargetAvailability() string {
+	st, _, _, err := a.requestLegacyStatus()
+	if err != nil {
+		return "unknown"
+	}
+	// Standby endpoint health is intentionally irrelevant.
+	if st.Outer.State == hc2.OuterStateEstablished &&
+		st.LMUX.State == hc2.LMUXStateEstablished {
+		return "online"
+	}
+	return "offline"
+}
+
+func (a *app) toolCommandList(includeTerminal bool) (any, error) {
+	commands, total := a.session.ListCommands(includeTerminal, commandListLimit)
+	availability := "unknown"
+	if len(commands) != 0 {
+		availability = a.commandTargetAvailability()
+	}
+	return commandListResult(a.session.ID, commands, total, includeTerminal,
+		availability, time.Now()), nil
+}
+
+func commandListResult(sessionID string, commands []mcpapp.CommandSnapshot,
+	total int, includeTerminal bool, availability string, now time.Time) map[string]any {
+	items := make([]map[string]any, 0, len(commands))
+	for _, cmd := range commands {
+		terminal := commandTerminalState(cmd.State)
+		verified := !cmd.LastVerified.IsZero() &&
+			(terminal || (availability == "online" &&
+				now.Sub(cmd.LastVerified) <= commandFreshness))
+		verification := "unverified"
+		if terminal && verified {
+			verification = "terminal"
+		} else if verified {
+			verification = "current"
+		} else if !cmd.LastVerified.IsZero() {
+			verification = "stale"
+		}
+		item := map[string]any{
+			"token":                      cmd.Token,
+			"state":                      cmd.State,
+			"kind":                       cmd.Kind,
+			"execution_id":               strconv.FormatUint(cmd.TargetID, 10),
+			"exec_ref":                   strconv.FormatUint(cmd.ExecRef, 10),
+			"reattachable":               !terminal && cmd.ExecRef != 0,
+			"terminal":                   terminal,
+			"state_verified":             verified,
+			"verification":               verification,
+			"target_availability":        availability,
+			"process_identity_available": false,
+		}
+		if !cmd.LastVerified.IsZero() {
+			item["last_verified_at"] =
+				cmd.LastVerified.UTC().Format(time.RFC3339Nano)
+		}
+		if cmd.LostReason != "" {
+			item["lost_reason"] = cmd.LostReason
+		}
+		items = append(items, item)
+	}
+	return map[string]any{
+		"commands": items, "include_terminal": includeTerminal,
+		"scope": "mcp_session", "session_id": sessionID,
+		"target_availability": availability,
+		"bounded_limit":       commandListLimit, "total_matching": total,
+		"verification_freshness_ms": commandFreshness.Milliseconds(),
+		"truncated":                 total > len(items),
+	}
 }
 
 func (a *app) toolCommandStart(argv []string, cwd string, kind string) (any, error) {
@@ -1530,6 +1654,7 @@ func tools() []toolSpec {
 		tool("file_operation_wait", "Wait up to 20 seconds (15 seconds by default and less than the MCP context deadline) for a FILE operation to become terminal.", map[string]any{"type": "object", "properties": map[string]any{"operation_id": map[string]any{"type": "string", "description": "Opaque decimal operation ID"}, "timeout_ms": map[string]any{"type": "integer", "minimum": 0, "maximum": 20000}}, "required": []string{"operation_id"}}),
 		tool("file_operation_cancel", "Request cancellation of a FILE operation and return its authoritative resulting state.", map[string]any{"type": "object", "properties": map[string]any{"operation_id": map[string]any{"type": "string", "description": "Opaque decimal operation ID"}}, "required": []string{"operation_id"}}),
 		tool("command_start", "Start a private exec command with explicit argv.", map[string]any{"type": "object", "properties": map[string]any{"argv": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}, "cwd": map[string]any{"type": "string"}, "kind": map[string]any{"type": "string", "description": "oneshot (default) or session"}}, "required": []string{"argv"}}),
+		tool("command_list", "List retained commands owned by this MCP process session. Terminal commands are omitted by default.", map[string]any{"type": "object", "properties": map[string]any{"include_terminal": map[string]any{"type": "boolean"}}}),
 		tool("command_status", "Return current command status.", schemaProps("command_token")),
 		tool("command_read", "Read command transcript from an opaque cursor.", map[string]any{"type": "object", "properties": map[string]any{"command_token": map[string]any{"type": "string"}, "cursor": map[string]any{"type": "string"}, "max_bytes": map[string]any{"type": "integer"}, "max_events": map[string]any{"type": "integer"}}, "required": []string{"command_token"}}),
 		tool("command_write_stdin", "Write bytes to command stdin using text or base64.", map[string]any{"type": "object", "properties": map[string]any{"command_token": map[string]any{"type": "string"}, "text": map[string]any{"type": "string"}, "base64": map[string]any{"type": "string"}}, "required": []string{"command_token"}}),
